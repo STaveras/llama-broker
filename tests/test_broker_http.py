@@ -433,6 +433,7 @@ class BrokerHttpTests(unittest.TestCase):
         connection.close()
         self.assertEqual(response.status, 401)
         self.assertTrue(response.getheader("X-Request-ID"))
+        self.assertEqual(response.getheader("WWW-Authenticate"), "Bearer")
         self.assertEqual(payload["error"]["type"], "authentication_error")
 
         connection = http.client.HTTPConnection("127.0.0.1", self.broker.server_port, timeout=5)
@@ -440,6 +441,17 @@ class BrokerHttpTests(unittest.TestCase):
             "GET",
             "/v1/models",
             headers={"Authorization": "Bearer wrong-key", "Connection": "close"},
+        )
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+        self.assertEqual(response.status, 401)
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.broker.server_port, timeout=5)
+        connection.request(
+            "GET",
+            "/v1/models",
+            headers={"X-Api-Key": self.auth_key, "Connection": "close"},
         )
         response = connection.getresponse()
         response.read()
@@ -524,6 +536,12 @@ class BrokerHttpTests(unittest.TestCase):
         connection.close()
         self.assertEqual(response.status, 200)
         by_id = {item["id"]: item for item in payload["data"]}
+        for model in payload["data"]:
+            self.assertEqual(model["object"], "model")
+            self.assertIsInstance(model["id"], str)
+            self.assertIsInstance(model["created"], int)
+            self.assertIsInstance(model["owned_by"], str)
+            self.assertIsInstance(model["permission"], list)
         self.assertEqual(by_id["main-27b"]["context_length"], 65536)
         self.assertEqual(by_id["main-27b"]["max_output_tokens"], 16384)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["capabilities"], ["text", "vision"])

@@ -18,8 +18,11 @@ Consolidate into `brokerctl.py` as the main entry point, installable as `llm-bro
 
 | Command | Description |
 |---------|-------------|
-| `llm-broker setup` | Idempotent full setup (units, configs, verify) |
-| `llm-broker configure [tools]` | Configure AI coding tools |
+| `llm-broker setup` | First-time runtime/model discovery and profile selection |
+| `llm-broker integrate install` | Install broker-owned service units |
+| `llm-broker integrate configure [tools]` | Configure AI coding tools |
+| `llm-broker model list` | List profile-backed client model references |
+| `llm-broker runtime list` | List runtimes and their profile-backed models |
 | `llm-broker profiles list` | List all profiles + status |
 | `llm-broker profiles discover` | Port sweep with dirty tracking |
 | `llm-broker profiles edit MODEL` | Edit profile parameters |
@@ -50,7 +53,7 @@ Consolidate into `brokerctl.py` as the main entry point, installable as `llm-bro
 
 ### Configuration
 - Delegates to existing `configure/` package
-- `brokerctl configure` calls `configure.main()`
+- `brokerctl integrate configure` calls `configure.main()`
 
 ## Files to Create/Modify
 

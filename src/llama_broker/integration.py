@@ -43,8 +43,10 @@ def _verify(profile: Profile) -> str | None:
     return None
 
 
-def inspect_manifest(path: Path) -> tuple[dict[str, Any], tuple[ProfileInspection, ...]]:
-    """Parse and verify each profile independently without mutating state."""
+def inspect_manifest(
+    path: Path, *, verify_artifacts: bool = True
+) -> tuple[dict[str, Any], tuple[ProfileInspection, ...]]:
+    """Parse profiles independently, optionally verifying their artifacts."""
 
     payload = load_manifest(path)
     raw_profiles = payload.get("profiles")
@@ -57,11 +59,11 @@ def inspect_manifest(path: Path) -> tuple[dict[str, Any], tuple[ProfileInspectio
             continue
         profile_id = str(raw.get("id", f"<index:{index}>")).strip()
         try:
-            profile = _parse_profile(raw)
+            profile = _parse_profile(raw, allow_missing_artifacts=not verify_artifacts)
         except (ProfileError, ValueError, TypeError, OSError) as error:
             inspections.append(ProfileInspection(profile_id, "broken", record=raw, reason=str(error)))
             continue
-        failure = _verify(profile)
+        failure = _verify(profile) if verify_artifacts else None
         if failure is not None:
             inspections.append(ProfileInspection(profile.id, "unverified", profile, raw, failure))
         else:

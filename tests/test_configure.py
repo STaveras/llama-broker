@@ -75,10 +75,12 @@ class ConfigureSafetyTests(unittest.TestCase):
         args = argparse.Namespace(
             tool_names=["codex"],
             dry_run=True,
+            set_default=False,
+            integrate_command="configure",
             profiles=Path("/tmp/profiles.json"),
         )
         with patch("llama_broker.configure.main", return_value=0) as configure_main:
-            result = brokerctl._cmd_configure(args)
+            result = brokerctl._cmd_integrate_configure(args)
 
         self.assertEqual(result, 0)
         configure_main.assert_called_once_with(

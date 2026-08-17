@@ -37,7 +37,7 @@ provided unit listens with TLS on 11434 and owns one native TLS
 `llama-server` on 10000; both ports conflict with any legacy standalone
 server using the same port.
 
-`brokerctl.py install` renders one stable, disabled unit for every allowlisted
+`brokerctl.py integrate install` renders one stable, disabled unit for every allowlisted
 profile. The broker's transactional controller starts exactly one profile unit
 on native port 10000. A profile unit has `Restart=no`; a CUDA or model-load
 failure therefore remains visible. The broker daemon itself uses
@@ -59,11 +59,11 @@ During a change, `phase` becomes `switching` and includes the target. On broker
 startup, `reconcile()` detects an interrupted switch, stops the target, and
 attempts to restore the prior profile before serving traffic.
 
-The broker does not create a second inference API-key authority. `llama-server`
-validates the native key file, while the broker forwards `Authorization` and
-`X-Api-Key` headers. Broker administration (`/admin/*`) and the compatibility
-`/api/tags` route are loopback-only. Health and model-listing routes remain
-public, matching llama-server's public discovery behavior.
+The broker does not create a second inference API-key authority. OpenAI-compatible
+`/v1/*` routes, including `/v1/models`, require the standard
+`Authorization: Bearer $API_KEY` header. Broker administration (`/admin/*`)
+and the compatibility `/api/tags` route are loopback-only. Health endpoints
+remain minimal and unauthenticated.
 
 LAN mode requires both broker and backend certificate/key pairs plus the native
 API-key file. Startup rejects a non-loopback plaintext binding. The backend
@@ -229,29 +229,31 @@ The resulting path-only security configuration is:
 }
 ```
 
-`brokerctl setup` creates the API-key file if needed, reads the configured
-model catalog, and refreshes broker-owned provider listings. It preserves each
-tool's active provider, base URL, and selected model; use `--set-default` only
-to explicitly select the manifest default model/provider. It does not select,
-start, stop, or restart a backend. Unit regeneration is the default; use
-`--no-install-units` to skip it. It does not print the secret. Certificate
-private keys and the
-API-key file must be mode 600. Open the active llama-server UI at
-`https://<lan-host>:10000/`; its API calls require the native key.
+`brokerctl setup` is the first-time discovery wizard. It scans for existing
+runtimes and model artifacts, reports qualified candidates, and creates profiles
+only after explicit selection. It never downloads runtimes, copies models, or
+loads a backend implicitly. Use `--check` or `--dry-run` for non-mutating
+reports. After reviewing the resulting profile manifest, run
+`brokerctl integrate install` to install broker-owned units and
+`brokerctl integrate configure` to refresh coding-tool providers; use
+`--set-default` only with the latter for an explicit model/provider selection.
+Certificate private keys and the API-key file must be mode 600. Open the active
+llama-server UI at `https://<lan-host>:10000/`; its API calls require the native
+key.
 
 Use the drain-aware credential lifecycle commands for rotation:
 
 ```bash
-python3 brokerctl.py credentials rotate
-python3 brokerctl.py credentials rotate --replace
-python3 brokerctl.py credentials revoke '<old-key>'
+python3 brokerctl.py security rotate
+python3 brokerctl.py security rotate --replace
+python3 brokerctl.py security revoke '<old-key>'
 ```
 
 Normal rotation retains the old key until clients have been updated and then
 restarts the active profile once. `--replace` removes the overlap. The CLI
 refreshes broker-owned provider credentials without changing a tool's active
-endpoint or selected model; use `brokerctl configure --set-default` only for
-an explicit selection.
+endpoint or selected model; use `brokerctl integrate configure --set-default`
+only for an explicit selection.
 
 Run the offline checks and content verification first:
 
@@ -260,7 +262,7 @@ cd <repo>
 
 ./test-scripts.sh
 python3 brokerctl.py verify
-python3 brokerctl.py list
+python3 brokerctl.py model list
 python3 brokerctl.py render example-9b-v3 | less
 ```
 
@@ -292,7 +294,7 @@ Never enable the individual profile units. The controller owns them.
 ```bash
 cd <repo>
 
-python3 brokerctl.py list
+python3 brokerctl.py model list
 python3 brokerctl.py status
 python3 brokerctl.py verify
 python3 brokerctl.py verify example-9b-vision

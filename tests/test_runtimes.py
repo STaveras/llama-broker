@@ -240,9 +240,11 @@ class RuntimeDispatchTests(unittest.TestCase):
             )
 
         rendered = output.getvalue()
+        self.assertIn("RUNTIME", rendered)
+        self.assertIn("PROFILES", rendered)
         self.assertIn("llamacpp", rendered)
         self.assertIn("vllm", rendered)
-        self.assertIn("llama-server", rendered)
+        self.assertNotIn("llama-server", rendered)
         self.assertIn("vllm-main", rendered)
         self.assertIn("tensor-parallel", rendered)
 

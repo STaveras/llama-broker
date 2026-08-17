@@ -8,7 +8,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import llama_broker.cli as brokerctl
 from llama_broker.broker_profiles import ProfileRegistry
@@ -27,16 +27,15 @@ class BrokerctlStatusTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(json.loads(output.getvalue())["schema_version"], 1)
 
-    def test_list_json_has_schema_version(self) -> None:
+    def test_model_list_json_has_schema_version(self) -> None:
         registry = Mock()
         registry.profiles = []
         output = io.StringIO()
         with (
             patch.object(brokerctl.ProfileRegistry, "from_path", return_value=registry),
-            patch.object(brokerctl, "create_production_controller", return_value=Mock()),
             redirect_stdout(output),
         ):
-            result = brokerctl.main(["list", "--json"])
+            result = brokerctl.main(["model", "list", "--json"])
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue())["schema_version"], 1)
 
@@ -843,6 +842,96 @@ class BrokerctlProfileEditorTests(unittest.TestCase):
     def test_profiles_state_command_is_removed(self) -> None:
         with self.assertRaises(SystemExit):
             brokerctl.build_parser().parse_args(["profiles", "state"])
+
+
+class BrokerctlCommandLayoutTests(unittest.TestCase):
+    def test_explicit_command_namespaces_replace_ambiguous_top_level_commands(self) -> None:
+        model = brokerctl.build_parser().parse_args(["model", "list"])
+        self.assertEqual((model.command, model.model_command), ("model", "list"))
+
+        integrate_install = brokerctl.build_parser().parse_args(["integrate", "install"])
+        self.assertEqual(
+            (integrate_install.command, integrate_install.integrate_command),
+            ("integrate", "install"),
+        )
+        integrate_configure = brokerctl.build_parser().parse_args(
+            ["integrate", "configure", "--set-default"]
+        )
+        self.assertEqual(
+            (integrate_configure.command, integrate_configure.integrate_command),
+            ("integrate", "configure"),
+        )
+        self.assertTrue(integrate_configure.set_default)
+
+        rotate = brokerctl.build_parser().parse_args(["security", "rotate", "--replace"])
+        self.assertEqual((rotate.command, rotate.security_command), ("security", "rotate"))
+        self.assertTrue(rotate.replace)
+        revoke = brokerctl.build_parser().parse_args(["security", "revoke", "key-id"])
+        self.assertEqual((revoke.command, revoke.security_command), ("security", "revoke"))
+        self.assertEqual(revoke.key, "key-id")
+
+        for argv in (("list",), ("install",), ("configure",), ("credentials", "rotate")):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    brokerctl.build_parser().parse_args(list(argv))
+
+    def test_model_list_is_profile_centric_and_does_not_print_artifact_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = brokerctl.main(["--profiles", str(profiles), "model", "list"])
+
+        self.assertEqual(result, 0)
+        rendered = output.getvalue()
+        self.assertIn("MODEL", rendered)
+        self.assertIn("PROFILE", rendered)
+        self.assertIn("RUNTIME", rendered)
+        self.assertIn("fixture-text-7b", rendered)
+        self.assertIn("fixture-vision-12b", rendered)
+        self.assertIn("llamacpp", rendered)
+        self.assertNotIn("model_path", rendered)
+        self.assertNotIn(tempdir, rendered)
+
+    def test_runtime_list_is_profile_centric_and_does_not_print_binary_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = brokerctl.main(["--profiles", str(profiles), "runtime", "list"])
+
+        self.assertEqual(result, 0)
+        rendered = output.getvalue()
+        self.assertIn("RUNTIME", rendered)
+        self.assertIn("PROFILES", rendered)
+        self.assertIn("llamacpp", rendered)
+        self.assertIn("fixture-text-7b", rendered)
+        self.assertIn("fixture-vision-12b", rendered)
+        self.assertIn("vllm", rendered)
+        self.assertNotIn("binaries=[", rendered)
+        self.assertNotIn("capabilities=[", rendered)
+        self.assertNotIn(tempdir, rendered)
+
+    def test_security_rotate_and_revoke_use_the_security_namespace(self) -> None:
+        with (
+            patch.object(brokerctl, "_broker_admin", return_value={"status": "ok"}) as admin,
+            patch.object(brokerctl, "_configure_after_credential_change"),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(brokerctl.main(["security", "rotate", "--replace"]), 0)
+            self.assertEqual(brokerctl.main(["security", "revoke", "old-key"]), 0)
+
+        self.assertEqual(
+            admin.call_args_list,
+            [
+                call("/admin/credentials/rotate", {"replace": True}),
+                call("/admin/credentials/revoke", {"key": "old-key"}),
+            ],
+        )
 
 
 if __name__ == "__main__":

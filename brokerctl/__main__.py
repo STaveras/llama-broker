@@ -3,7 +3,7 @@
 
 Usage:
     python3 -m brokerctl [command] [args...]
-    python3 -m brokerctl list
+    python3 -m brokerctl model list
     python3 -m brokerctl profiles discover
 """
 import sys
