@@ -1164,10 +1164,52 @@ class BrokerApplication:
         self._artifact_verification_cache[profile.id] = (cache_key, verified)
         return verified
 
-    def model_listing(self) -> dict[str, Any]:
-        """List every configured model, enriching bounded backend metadata."""
+    def _openai_model_record(
+        self,
+        raw: Mapping[str, Any],
+        *,
+        profile: Profile | None = None,
+    ) -> dict[str, Any]:
+        """Normalize one model to the OpenAI model-object contract."""
 
-        models: list[dict[str, Any]] = []
+        raw_id = raw.get("id")
+        if profile is not None:
+            model_id = profile.alias
+        elif isinstance(raw_id, str) and raw_id.strip():
+            model_id = raw_id.strip()
+        else:
+            raise ValueError("model metadata has no valid id")
+
+        created = raw.get("created", 0)
+        if isinstance(created, bool) or not isinstance(created, int):
+            created = 0
+        owned_by = raw.get("owned_by")
+        if not isinstance(owned_by, str) or not owned_by.strip():
+            owned_by = "Llama-Broker" if profile is not None else "llama-server"
+
+        result: dict[str, Any] = {
+            "id": model_id,
+            "object": "model",
+            "created": created,
+            "owned_by": owned_by.strip(),
+            "permission": [],
+        }
+        if profile is not None:
+            result.update(
+                {
+                    "context_length": profile.context_size // profile.parallel,
+                    "parallel": profile.parallel,
+                    "slot_context_window": profile.context_size // profile.parallel,
+                    "max_output_tokens": self.max_output_tokens,
+                    "capabilities": sorted(profile.capabilities),
+                }
+            )
+        return result
+
+    def model_listing(self) -> dict[str, Any]:
+        """List visible models using normalized OpenAI-compatible objects."""
+
+        backend_models: list[Mapping[str, Any]] = []
         if self._backend_ready():
             metadata_client = BackendClient(
                 self._backend_url,
@@ -1182,7 +1224,7 @@ class BrokerApplication:
                     else []
                 )
                 if isinstance(candidate, list):
-                    models = [dict(item) for item in candidate if isinstance(item, Mapping)]
+                    backend_models = [item for item in candidate if isinstance(item, Mapping)]
             except (
                 OSError,
                 RuntimeError,
@@ -1204,37 +1246,33 @@ class BrokerApplication:
             if self._profile_artifacts_verified(profile) or profile.id == active_profile_id
         }
         configured_aliases = {profile.alias for profile in self.registry.profiles}
-        models = [
-            model
-            for model in models
-            if model.get("id") not in configured_aliases or model.get("id") in visible_profiles
-        ]
-        profile_map = visible_profiles
-        for model in models:
-            mid = model.get("id", "")
-            profile = profile_map.get(mid)
-            if profile:
-                model["parallel"] = profile.parallel
-                model["slot_context_window"] = profile.context_size // profile.parallel
-                model["context_length"] = profile.context_size // profile.parallel
-                model["max_output_tokens"] = self.max_output_tokens
-                model["capabilities"] = sorted(profile.capabilities)
+        models: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for backend_model in backend_models:
+            backend_id = backend_model.get("id")
+            if not isinstance(backend_id, str) or not backend_id.strip():
+                continue
+            backend_id = backend_id.strip()
+            if backend_id in configured_aliases and backend_id not in visible_profiles:
+                continue
+            try:
+                normalized = self._openai_model_record(
+                    backend_model,
+                    profile=visible_profiles.get(backend_id),
+                )
+            except ValueError:
+                continue
+            if normalized["id"] in seen_ids:
+                continue
+            models.append(normalized)
+            seen_ids.add(normalized["id"])
 
         # Include profiles not currently loaded in backend
-        seen_ids = {m.get("id") for m in models}
         for profile in visible_profiles.values():
-            models.append(
-                {
-                    "id": profile.alias,
-                    "object": "model",
-                    "owned_by": "Llama-Broker",
-                    "context_length": profile.context_size // profile.parallel,
-                    "parallel": profile.parallel,
-                    "slot_context_window": profile.context_size // profile.parallel,
-                    "max_output_tokens": self.max_output_tokens,
-                    "capabilities": sorted(profile.capabilities),
-                }
-            )
+            if profile.alias in seen_ids:
+                continue
+            models.append(self._openai_model_record({}, profile=profile))
+            seen_ids.add(profile.alias)
 
         return {"object": "list", "data": models}
 
@@ -1393,27 +1431,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
         )
         return False
 
-    def _has_backend_credentials(self) -> bool:
-        return any(
-            bool(self.headers.get(name))
-            for name in ("Authorization", "X-Api-Key")
-        )
-
     def _require_api_auth(self) -> bool:
-        """Require a configured deployment key for every OpenAI-compatible route."""
+        """Require the OpenAI-standard Bearer credential for every ``/v1`` route."""
 
-        candidates: list[str] = []
         authorization = self.headers.get("Authorization", "")
-        if authorization.casefold().startswith("bearer "):
-            candidates.append(authorization[7:].strip())
-        api_key = self.headers.get("X-Api-Key")
-        if api_key:
-            candidates.append(api_key.strip())
+        scheme, separator, credential = authorization.partition(" ")
+        candidate = credential.strip() if separator and scheme.casefold() == "bearer" else ""
         configured = self.application.authentication_keys()
-        if configured and any(
-            candidate and secrets.compare_digest(candidate, expected)
-            for candidate in candidates
-            for expected in configured
+        if configured and candidate and any(
+            secrets.compare_digest(candidate, expected) for expected in configured
         ):
             return True
         self._send_json(
@@ -1462,50 +1488,26 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     alias,
                     headers=self._request_headers(b""),
                 )
-                # Map llama-server format to OpenAI format
-                response = {
-                    "id": backend_info.get("id", alias),
-                    "object": "model",
-                    "created": backend_info.get("created", 0),
-                    "owned_by": backend_info.get("owned_by", "llama-server"),
-                    "details": backend_info.get("details", {}),
-                    "meta": backend_info.get("meta", {}),
-                    # Set context_length at top level for auto-detection
-                    "context_length": profile.context_size // profile.parallel,
-                }
-            except Exception as e:
+                response = self.application._openai_model_record(
+                    backend_info,
+                    profile=profile,
+                )
+            except Exception as error:
                 if self.application.security.api_key_file is not None:
-                    if not self._has_backend_credentials():
-                        self._send_json(
-                            HTTPStatus.UNAUTHORIZED,
-                            {
-                                "error": {
-                                    "message": "missing backend API key",
-                                    "type": "authentication_error",
-                                }
-                            },
-                        )
-                    else:
-                        self._send_json(
-                            HTTPStatus.BAD_GATEWAY,
-                            {
-                                "error": {
-                                    "message": "backend model metadata unavailable",
-                                    "type": "broker_proxy_error",
-                                }
-                            },
-                        )
+                    self._send_json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {
+                            "error": {
+                                "message": "backend model metadata unavailable",
+                                "type": "broker_proxy_error",
+                            }
+                        },
+                    )
                     return
                 # Preserve the profile-only compatibility fallback when native
                 # backend authentication is not enabled.
-                _log(f"[broker] backend model info failed for {alias}: {e}")
-                response = {
-                    "id": profile.alias,
-                    "object": "model",
-                    "owned_by": "Llama-Broker",
-                    "context_length": profile.context_size // profile.parallel,
-                    "capabilities": sorted(profile.capabilities),
-                }
+                _log(f"[broker] backend model info failed for {alias}: {error}")
+                response = self.application._openai_model_record({}, profile=profile)
             finally:
                 client.close()
             self._send_json(HTTPStatus.OK, response)

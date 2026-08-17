@@ -2,25 +2,25 @@
 """Administrative CLI for broker-owned immutable backend profiles.
 
 Usage:
-    brokerctl list                         List profiles
+    brokerctl model list                   List client-facing model references
     brokerctl status                       Show broker state
-    brokerctl install                      Install systemd units
     brokerctl render MODEL                 Render a profile unit
     brokerctl load MODEL                   Load model profile
     brokerctl unload                       Unload the backend
     brokerctl verify [MODEL]               Verify SHA-256 hashes
     brokerctl setup [--clean]              Regenerate units and optionally remove stale units
     brokerctl security init --ip IP        Create local CA and TLS certificates
-    brokerctl configure [TOOLS...]         Configure AI coding tools
-    brokerctl credentials rotate            Rotate native API keys
-    brokerctl credentials revoke KEY        Revoke a native API key
+    brokerctl integrate install             Install broker-owned units
+    brokerctl integrate configure [TOOLS]   Configure AI coding tools
+    brokerctl security rotate               Rotate native API keys
+    brokerctl security revoke KEY           Revoke a native API key
     brokerctl profiles list                List profiles with status
     brokerctl profiles show ID             Show one complete profile as JSON
     brokerctl profiles add ID --model PATH Add a complete profile
     brokerctl profiles discover            Discover backends via port sweep
     brokerctl profiles edit [MODEL]        Open the field-oriented profile editor
     brokerctl profiles add MODEL           Inspect a candidate (non-mutating)
-    brokerctl runtime list                 List registered serving runtimes
+    brokerctl runtime list                 List runtimes and their profiles
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import sys
 import tempfile
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from . import daemon as broker_runtime
@@ -195,32 +195,6 @@ def _service_exec_start() -> str:
     return f"{sys.executable} {BROKER_DIR / 'llama_broker.py'}"
 
 
-def _profile_payload(profile: Profile) -> dict[str, object]:
-    return {
-        "id": profile.id,
-        "runtime": profile.runtime,
-        "alias": profile.alias,
-        "aliases": list(profile.aliases),
-        "role": profile.role,
-        "capabilities": sorted(profile.capabilities),
-        "native_vision": profile.native_vision,
-        "model_path": str(profile.model_path),
-        "model_sha256": profile.model_sha256,
-        "mmproj_path": str(profile.mmproj_path) if profile.mmproj_path else None,
-        "context_size": profile.context_size,
-        "parallel": profile.parallel,
-        "tensor_parallel_size": profile.tensor_parallel_size,
-        "gpu_memory_utilization": profile.gpu_memory_utilization,
-        "kv_cache_dtype": profile.kv_cache_dtype,
-        "tool_call_parser": profile.tool_call_parser,
-        "cache_type_k": profile.cache_type_k,
-        "cache_type_v": profile.cache_type_v,
-        "fit": profile.fit,
-        "fit_target_mib": profile.fit_target_mib,
-        "restore_profile": profile.restore_profile,
-    }
-
-
 def _verify_profile(profile: Profile) -> list[str]:
     failures: list[str] = []
     checks = [
@@ -244,7 +218,7 @@ def _verify_profile(profile: Profile) -> list[str]:
 
 PROFILE_MUTATION_REMINDER = (
     "Reminder: profile edits do not install units or change the running broker; "
-    "run `brokerctl install` or `brokerctl setup` when ready."
+    "run `brokerctl integrate install` or `brokerctl setup` when ready."
 )
 CLI_CACHE_TYPES = ("f16", "kvarn4", "turbo4")
 KNOWN_CACHE_TYPES = ALLOWED_CACHE_TYPES
@@ -702,14 +676,38 @@ def _coerce_value(raw: str, target_type: type) -> Any:
 
 # ── Subcommand: setup ───────────────────────────────────────────────────────
 
+def _cmd_integrate_configure(args: argparse.Namespace) -> int:
+    """Configure coding tools through the established provider adapter."""
+
+    from .configure import main as configure_main
+
+    configure_args: list[str] = []
+    if getattr(args, "tool_names", None):
+        configure_args.extend(["--tools", *args.tool_names])
+    if getattr(args, "dry_run", False):
+        configure_args.append("--dry-run")
+    if getattr(args, "set_default", False):
+        configure_args.append("--set-default")
+    configure_args.extend(["--profiles", str(args.profiles)])
+    return configure_main(configure_args)
+
+
 def _cmd_integrate(args: argparse.Namespace) -> int:
-    """Apply service/provider integration independently for each verified profile."""
+    """Apply selected unit/provider integration independently for each profile."""
 
     if getattr(args, "dry_run", False) and getattr(args, "json", False):
         print("integrate --dry-run is interactive and cannot be combined with --json", file=sys.stderr)
         return 2
+    mode = getattr(args, "integrate_command", None)
+    if mode == "configure":
+        return _cmd_integrate_configure(args)
+    install_requested = mode in (None, "install")
+    configure_requested = mode is None
     try:
-        payload, inspections = inspect_manifest(args.profiles)
+        payload, inspections = inspect_manifest(
+            args.profiles,
+            verify_artifacts=bool(getattr(args, "full_verify", False)),
+        )
     except (OSError, ProfileError, ValueError) as error:
         print(f"ERROR: integration cannot read profiles: {error}", file=sys.stderr)
         return 1
@@ -746,56 +744,62 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             default_profile = profiles[0].id
         return ProfileRegistry(profiles, default_profile)
 
-    registry = registry_for(valid_ids)
-
-    try:
-        controller = create_production_controller(registry)
-    except (BackendControllerError, ProfileError, ValueError, OSError) as error:
-        print(f"ERROR: integration controller unavailable: {error}", file=sys.stderr)
-        return 1
-
     planned = list(inspections)
-    for item in ready:
-        path = controller.unit_path(item.profile.id)
+    controller = None
+    if install_requested:
+        registry = registry_for(valid_ids)
         try:
-            rendered = controller.render_unit(item.profile.id)
-            if path.is_file() and path.read_text(encoding="utf-8") == rendered:
-                status = "unchanged"
-            elif path.exists() or path.is_symlink():
-                status = "updated"
-            else:
-                status = "installed"
-        except (BackendControllerError, OSError, ValueError) as error:
-            status = "broken"
-            item = replace(item, reason=f"cannot render unit: {error}")
-        for index, original in enumerate(planned):
-            if original.profile_id == item.profile_id:
-                planned[index] = replace(item, status=status)
-                break
+            controller = create_production_controller(registry)
+        except (BackendControllerError, ProfileError, ValueError, OSError) as error:
+            print(f"ERROR: integration controller unavailable: {error}", file=sys.stderr)
+            return 1
+        assert controller is not None
 
-    renderable_ids = {
-        item.profile_id
-        for item in planned
-        if item.status in {"installed", "updated", "unchanged"}
-    }
-    if renderable_ids != valid_ids:
-        valid_ids = renderable_ids
-        if valid_ids:
+        for item in ready:
+            path = controller.unit_path(item.profile.id)
             try:
-                controller = create_production_controller(registry_for(valid_ids))
-            except (BackendControllerError, ProfileError, ValueError, OSError) as error:
-                print(f"ERROR: integration controller unavailable: {error}", file=sys.stderr)
-                return 1
-        else:
-            controller = None
+                rendered = controller.render_unit(item.profile.id)
+                if path.is_file() and path.read_text(encoding="utf-8") == rendered:
+                    status = "unchanged"
+                elif path.exists() or path.is_symlink():
+                    status = "updated"
+                else:
+                    status = "installed"
+            except (BackendControllerError, OSError, ValueError) as error:
+                status = "broken"
+                item = replace(item, reason=f"cannot render unit: {error}")
+            for index, original in enumerate(planned):
+                if original.profile_id == item.profile_id:
+                    planned[index] = replace(item, status=status)
+                    break
+
+        renderable_ids = {
+            item.profile_id
+            for item in planned
+            if item.status in {"installed", "updated", "unchanged"}
+        }
+        if renderable_ids != valid_ids:
+            valid_ids = renderable_ids
+            if valid_ids:
+                try:
+                    controller = create_production_controller(registry_for(valid_ids))
+                except (BackendControllerError, ProfileError, ValueError, OSError) as error:
+                    print(f"ERROR: integration controller unavailable: {error}", file=sys.stderr)
+                    return 1
+            else:
+                controller = None
 
     provider_inspections = tuple(
         replace(item, status="ready")
         for item in planned
-        if item.status in {"installed", "updated", "unchanged"}
+        if item.status in (
+            {"installed", "updated", "unchanged"}
+            if install_requested
+            else {"ready"}
+        )
     )
-    systemd_ready = bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
-    if not systemd_ready:
+    systemd_ready = install_requested and bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
+    if install_requested and not systemd_ready:
         planned = [
             replace(item, status="skipped", reason="systemd user session unavailable")
             if item.status in {"installed", "updated", "unchanged"}
@@ -806,27 +810,30 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
     plan_errors: list[str] = []
     broker_unit_path = broker_runtime.SYSTEMD_USER_DIR / "llama-broker.service"
     broker_unit_text: str | None = None
-    broker_unit_status = "broken"
-    try:
-        template = _service_template_path()
-        if not template.is_file():
-            raise FileNotFoundError(f"service template not found: {template}")
-        broker_unit_text = template.read_text(encoding="utf-8")
-        broker_unit_text = broker_unit_text.replace("{{REPO_DIR}}", str(BROKER_DIR))
-        broker_unit_text = broker_unit_text.replace("{{USER_HOME}}", str(Path.home()))
-        broker_unit_text = broker_unit_text.replace("{{EXEC_START}}", _service_exec_start())
-        if broker_unit_path.is_file() and broker_unit_path.read_text(encoding="utf-8") == broker_unit_text:
-            broker_unit_status = "unchanged"
-        elif broker_unit_path.exists() or broker_unit_path.is_symlink():
-            broker_unit_status = "updated"
-        else:
-            broker_unit_status = "installed"
-    except OSError as error:
-        plan_errors.append(f"broker unit integration failed: {error}")
+    broker_unit_status = "skipped"
+    if install_requested:
+        try:
+            template = _service_template_path()
+            if not template.is_file():
+                raise FileNotFoundError(f"service template not found: {template}")
+            broker_unit_text = template.read_text(encoding="utf-8")
+            broker_unit_text = broker_unit_text.replace("{{REPO_DIR}}", str(BROKER_DIR))
+            broker_unit_text = broker_unit_text.replace("{{USER_HOME}}", str(Path.home()))
+            broker_unit_text = broker_unit_text.replace("{{EXEC_START}}", _service_exec_start())
+            if broker_unit_path.is_file() and broker_unit_path.read_text(encoding="utf-8") == broker_unit_text:
+                broker_unit_status = "unchanged"
+            elif broker_unit_path.exists() or broker_unit_path.is_symlink():
+                broker_unit_status = "updated"
+            else:
+                broker_unit_status = "installed"
+        except OSError as error:
+            plan_errors.append(f"broker unit integration failed: {error}")
 
-    provider_manifest = filtered_manifest(payload, provider_inspections)
+    provider_manifest = (
+        filtered_manifest(payload, provider_inspections) if configure_requested else None
+    )
     provider_status = "planned" if provider_manifest is not None else "skipped"
-    operations = [
+    operations: list[dict[str, object]] = [
         {
             "action": "profile_unit",
             "profile_id": item.profile_id,
@@ -835,22 +842,28 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         }
         for item in planned
     ]
-    operations.extend(
-        [
+    if not install_requested:
+        operations = []
+    if install_requested:
+        operations.append(
             {
                 "action": "broker_unit",
                 "status": broker_unit_status,
                 "path": str(broker_unit_path),
-            },
+            }
+        )
+    if configure_requested:
+        operations.append(
             {
                 "action": "client/provider",
                 "status": provider_status,
                 "profiles": sorted(valid_ids),
-            },
-        ]
-    )
+            }
+        )
     plan_report = report_for(tuple(planned))
-    plan_report["systemd"] = "available" if systemd_ready else "unavailable"
+    plan_report["systemd"] = (
+        "available" if systemd_ready else "unavailable"
+    ) if install_requested else "not requested"
     plan_report["operations"] = operations
     plan_report["broker_unit"] = broker_unit_status
     plan_report["client_provider"] = provider_status
@@ -871,19 +884,20 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         apply_confirmed = True
 
     applied_errors: list[str] = list(plan_errors)
-    if systemd_ready and getattr(args, "install_units", True) and controller is not None:
-        try:
-            controller.install_units()
-        except (BackendControllerError, OSError, ValueError) as error:
-            applied_errors.append(f"systemd unit integration failed: {error}")
-    elif not systemd_ready:
-        applied_errors.append("systemd user session unavailable; unit files were left untouched")
-    elif controller is None:
-        applied_errors.append("no profile rendered successfully; profile units were left untouched")
+    if install_requested:
+        if systemd_ready and getattr(args, "install_units", True) and controller is not None:
+            try:
+                controller.install_units()
+            except (BackendControllerError, OSError, ValueError) as error:
+                applied_errors.append(f"systemd unit integration failed: {error}")
+        elif not systemd_ready:
+            applied_errors.append("systemd user session unavailable; unit files were left untouched")
+        elif controller is None:
+            applied_errors.append("no profile rendered successfully; profile units were left untouched")
 
     # The broker unit is lightweight control-plane integration.  It is written
     # independently of profile units and never starts a backend.
-    if broker_unit_text is not None:
+    if install_requested and broker_unit_text is not None:
         try:
             broker_unit_path.parent.mkdir(parents=True, exist_ok=True)
             if broker_unit_status != "unchanged":
@@ -895,7 +909,7 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
     # Provider configuration receives a temporary filtered manifest so broken
     # profiles never block valid providers and the temporary file is removed
     # after the adapter run.
-    if provider_manifest is not None:
+    if configure_requested and provider_manifest is not None:
         try:
             with tempfile.TemporaryDirectory(prefix="llama-broker-integrate-") as temp:
                 temp_profiles = Path(temp) / "profiles.json"
@@ -903,6 +917,9 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
                 from .configure import main as configure_main
 
                 configure_args = ["--profiles", str(temp_profiles)]
+                tool_names = list(getattr(args, "tool_names", ()))
+                if tool_names:
+                    configure_args[0:0] = ["--tools", *tool_names]
                 if getattr(args, "set_default", False):
                     configure_args.insert(0, "--set-default")
                 if apply_confirmed:
@@ -912,7 +929,7 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
                 plan_report["client_provider"] = "applied" if not applied_errors else "partial"
         except (OSError, ValueError, RuntimeError) as error:
             applied_errors.append(f"provider integration failed: {error}")
-    else:
+    elif configure_requested:
         applied_errors.append("no verified profiles available for provider integration")
 
     if applied_errors:
@@ -1315,23 +1332,78 @@ def _cmd_security_init(args: argparse.Namespace) -> int:
     return 0
 
 
-# ── Subcommand: configure ───────────────────────────────────────────────────
+# ── Subcommands: model list and profiles list ───────────────────────────────
 
-def _cmd_configure(args: argparse.Namespace) -> int:
-    """Configure AI coding tools."""
-    from .configure import main as configure_main
-    configure_args = []
-    if args.tool_names:
-        configure_args.extend(["--tools", *args.tool_names])
-    if args.dry_run:
-        configure_args.append("--dry-run")
-    if getattr(args, "set_default", False):
-        configure_args.append("--set-default")
-    configure_args.extend(["--profiles", str(args.profiles)])
-    return configure_main(configure_args)
+def _render_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
+    """Render a small dependency-free table for human-facing CLI output."""
+
+    rendered_rows = [[str(value) for value in row] for row in rows]
+    rendered_headers = [str(header) for header in headers]
+    widths = [len(header) for header in rendered_headers]
+    for row in rendered_rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    def render_row(row: Sequence[str]) -> str:
+        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+
+    lines = [render_row(rendered_headers), render_row(["-" * width for width in widths])]
+    lines.extend(render_row(row) for row in rendered_rows)
+    return "\n".join(lines)
 
 
-# ── Subcommand: profiles list ───────────────────────────────────────────────
+def _model_payload(profile: Profile) -> dict[str, object]:
+    """Return the profile-backed model fields intended for CLI consumers."""
+
+    return {
+        "id": profile.alias,
+        "profile": profile.id,
+        "display_name": profile.display_name,
+        "runtime": profile.runtime,
+        "capabilities": sorted(profile.capabilities),
+        "context_size": profile.context_size,
+        "parallel": profile.parallel,
+        "aliases": [alias for alias in profile.aliases if alias != profile.alias],
+    }
+
+
+def _cmd_model_list(args: argparse.Namespace) -> int:
+    """List client-facing model references backed by canonical profiles."""
+
+    registry = ProfileRegistry.from_path(args.profiles)
+    models = [_model_payload(profile) for profile in registry.profiles]
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {"schema_version": 1, "object": "model_list", "data": models},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if not models:
+        print("No models configured.")
+        return 0
+
+    rows = [
+        (
+            profile.alias,
+            profile.id,
+            profile.runtime,
+            ", ".join(sorted(profile.capabilities)),
+            f"{profile.context_size:,}",
+            profile.parallel,
+        )
+        for profile in registry.profiles
+    ]
+    print(
+        _render_table(
+            ("MODEL", "PROFILE", "RUNTIME", "CAPABILITIES", "CONTEXT", "SLOTS"),
+            rows,
+        )
+    )
+    return 0
 
 def _cmd_profiles_list(args: argparse.Namespace) -> int:
     """List profiles with status."""
@@ -1547,28 +1619,61 @@ def _cmd_profiles_template(args: argparse.Namespace) -> int:
 
 
 def _cmd_runtime_list(args: argparse.Namespace) -> int:
-    """List registered runtimes and the profiles selecting each one."""
+    """List registered runtimes and the profile-backed models selecting each."""
 
     registry = ProfileRegistry.from_path(args.profiles)
+    runtime_rows: list[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]]] = []
     for runtime in list_runtimes():
-        profiles = [profile for profile in registry.profiles if profile.runtime == runtime.name]
-        binaries = list(runtime.binaries)
-        binaries.extend(
-            sorted(
-                {
-                    str(profile.server_binary)
-                    for profile in profiles
-                    if str(profile.server_binary) not in binaries
-                }
+        profiles = [
+            profile
+            for profile in registry.profiles
+            if profile.runtime == runtime.name
+        ]
+        runtime_rows.append(
+            (
+                runtime.name,
+                runtime.capabilities,
+                tuple((profile.id, profile.alias) for profile in profiles),
             )
         )
-        profile_names = ",".join(profile.id for profile in profiles) or "(none)"
+
+    if getattr(args, "json", False):
         print(
-            f"{runtime.name:<10} "
-            f"binaries=[{', '.join(binaries)}] "
-            f"capabilities=[{', '.join(runtime.capabilities)}] "
-            f"profiles=[{profile_names}]"
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "object": "runtime_list",
+                    "data": [
+                        {
+                            "name": name,
+                            "capabilities": list(capabilities),
+                            "profiles": [
+                                {"id": profile_id, "model": model_id}
+                                for profile_id, model_id in profiles
+                            ],
+                        }
+                        for name, capabilities, profiles in runtime_rows
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
         )
+        return 0
+
+    if not runtime_rows:
+        print("No runtimes registered.")
+        return 0
+
+    rows = [
+        (
+            name,
+            ", ".join(model_id for _profile_id, model_id in profiles) or "(none)",
+            ", ".join(capabilities),
+        )
+        for name, capabilities, profiles in runtime_rows
+    ]
+    print(_render_table(("RUNTIME", "PROFILES", "CAPABILITIES"), rows))
     return 0
 
 
@@ -1582,7 +1687,7 @@ def _configure_after_credential_change(args: argparse.Namespace) -> None:
         raise BackendControllerError("tool configuration failed after credential change")
 
 
-def _cmd_credentials_rotate(args: argparse.Namespace) -> int:
+def _cmd_security_rotate(args: argparse.Namespace) -> int:
     result = _broker_admin(
         "/admin/credentials/rotate",
         {"replace": bool(args.replace)},
@@ -1592,7 +1697,7 @@ def _cmd_credentials_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_credentials_revoke(args: argparse.Namespace) -> int:
+def _cmd_security_revoke(args: argparse.Namespace) -> int:
     result = _broker_admin(
         "/admin/credentials/revoke",
         {"key": args.key},
@@ -1825,6 +1930,45 @@ def _apply_profile_configuration(
 
 # ── Argument parser ─────────────────────────────────────────────────────────
 
+def _add_integrate_options(
+    parser: argparse.ArgumentParser,
+    *,
+    nested: bool = False,
+    allow_clean: bool = True,
+    allow_set_default: bool = True,
+    allow_install_units: bool = True,
+) -> None:
+    """Add integration options to the combined and explicit integration modes."""
+
+    default = argparse.SUPPRESS if nested else False
+    parser.add_argument("--dry-run", action="store_true", default=default, help="show the plan and ask before applying")
+    parser.add_argument("--json", action="store_true", default=default, help="emit a versioned noninteractive report")
+    parser.add_argument(
+        "--full-verify",
+        "--verify",
+        dest="full_verify",
+        action="store_true",
+        default=default,
+        help="verify artifact paths and hashes before applying (slow)",
+    )
+    if allow_clean:
+        parser.add_argument("--clean", action="store_true", default=default, help="remove only stale broker-owned units")
+    if allow_set_default:
+        parser.add_argument(
+            "--set-default",
+            action="store_true",
+            default=default,
+            help="explicitly select the configured default in providers",
+        )
+    if allow_install_units:
+        parser.add_argument(
+            "--no-install-units",
+            dest="install_units",
+            action="store_false",
+            default=argparse.SUPPRESS if nested else True,
+            help=argparse.SUPPRESS,
+        )
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="brokerctl",
@@ -1833,18 +1977,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiles", type=Path, default=PROFILES_PATH)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Existing commands
-    subparsers.add_parser("list", help="list allowlisted execution profiles; use --raw for JSON output")
-    # Add --raw flag to the list subcommand
-    list_action = subparsers._name_parser_map.get("list")
-    if list_action:
-        list_action.add_argument("--raw", action="store_true", help="output raw JSON (original default behavior)")
-        list_action.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    model = subparsers.add_parser(
+        "model", help="inspect profile-backed client-facing models"
+    )
+    model_sub = model.add_subparsers(dest="model_command", required=True)
+    model_list = model_sub.add_parser(
+        "list", help="list canonical model references from the profile manifest"
+    )
+    model_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+
     status = subparsers.add_parser("status", help="show durable backend state")
     status.add_argument("-v", "--verbose", action="store_true", help="show full JSON state")
     status.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
-    subparsers.add_parser("install", help="atomically install immutable profile units")
-
     render = subparsers.add_parser("render", help="render a profile unit without installing it")
     render.add_argument("model")
 
@@ -1890,22 +2034,46 @@ def build_parser() -> argparse.ArgumentParser:
 
     integrate = subparsers.add_parser(
         "integrate",
-        help="generate service units and configure external providers for valid profiles",
+        help="install broker units and configure external providers",
     )
-    integrate.add_argument("--dry-run", action="store_true", help="show the plan and ask before applying")
-    integrate.add_argument("--json", action="store_true", help="emit a versioned noninteractive report")
-    integrate.add_argument("--verify", action="store_true", help="verify artifact hashes before applying")
-    integrate.add_argument("--clean", action="store_true", help="remove only stale broker-owned units")
-    integrate.add_argument("--set-default", action="store_true", help="explicitly select the configured default in providers")
+    _add_integrate_options(integrate)
+    integrate_sub = integrate.add_subparsers(dest="integrate_command")
 
-    integrate.add_argument("--no-install-units", dest="install_units", action="store_false", default=True, help=argparse.SUPPRESS)
+    integrate_install = integrate_sub.add_parser(
+        "install", help="install broker-owned units without configuring providers"
+    )
+    _add_integrate_options(
+        integrate_install,
+        nested=True,
+        allow_set_default=False,
+    )
+
+    integrate_configure = integrate_sub.add_parser(
+        "configure", help="configure coding tools without installing units"
+    )
+    integrate_configure.add_argument(
+        "tool_names",
+        nargs="*",
+        help="tools to configure (default: all except Codex; name codex explicitly to opt in)",
+    )
+    integrate_configure.add_argument("--dry-run", action="store_true", help="preview without writing")
+    integrate_configure.add_argument(
+        "--set-default",
+        "--set-default-model",
+        dest="set_default",
+        action="store_true",
+        help="explicitly select the broker default model/provider",
+    )
 
     runtime = subparsers.add_parser("runtime", help="inspect registered serving runtimes")
     runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
-    runtime_sub.add_parser("list", help="list runtimes, capabilities, and profiles")
+    runtime_list = runtime_sub.add_parser(
+        "list", help="list runtimes and the profile-backed models selecting each"
+    )
+    runtime_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
 
     security = subparsers.add_parser(
-        "security", help="provision deployment-owned API-key and TLS material"
+        "security", help="provision and rotate deployment-owned API-key and TLS material"
     )
     security_sub = security.add_subparsers(dest="security_command", required=True)
     security_init = security_sub.add_parser(
@@ -1949,43 +2117,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace existing generated TLS material",
     )
 
-    # New: configure
-    configure = subparsers.add_parser("configure", help="configure AI coding tools")
-    configure.add_argument(
-        "tool_names",
-        nargs="*",
-        help="tools to configure (default: all except Codex; name codex explicitly to opt in)",
-    )
-    configure.add_argument("--dry-run", action="store_true", help="preview without writing")
-    configure.add_argument(
-        "--set-default",
-        "--set-default-model",
-        dest="set_default",
-        action="store_true",
-        help="explicitly select the broker default model/provider",
-    )
-
-    credentials = subparsers.add_parser(
-        "credentials",
-        help="rotate or revoke native llama-server API keys",
-    )
-    credentials_sub = credentials.add_subparsers(
-        dest="credentials_command", required=True
-    )
-    rotate_credentials = credentials_sub.add_parser(
+    rotate_security = security_sub.add_parser(
         "rotate", help="generate a new key and restart the active backend"
     )
-    rotate_credentials.add_argument(
+    rotate_security.add_argument(
         "--replace",
         action="store_true",
         help="revoke existing keys immediately instead of retaining overlap",
     )
-    revoke_credentials = credentials_sub.add_parser(
+    revoke_security = security_sub.add_parser(
         "revoke", help="revoke one native backend API key"
     )
-    revoke_credentials.add_argument("key")
+    revoke_security.add_argument("key")
 
-    # New: profiles
+    # Profiles remain the authoritative model-to-runtime binding manifest.
     profiles = subparsers.add_parser("profiles", help="profile manifest management")
     profiles_sub = profiles.add_subparsers(dest="profiles_command", required=True)
 
@@ -2097,78 +2242,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 
-# ── Subcommand: list (top-level) ───────────────────────────────────────────────
-
-def _cmd_list(args: argparse.Namespace) -> int:
-    """List profiles with optional --raw flag.
-
-    Default: pretty-printed table (new behavior)
-    --raw: raw JSON (preserves original behavior)
-    """
-    registry = ProfileRegistry.from_path(args.profiles)
-    profiles = registry.profiles
-
-    if args.raw:
-        # Raw JSON output (preserves original default behavior)
-        print(json.dumps([_profile_payload(p) for p in profiles], indent=2))
-        return 0
-    if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "object": "list",
-                    "data": [_profile_payload(p) for p in profiles],
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return 0
-
-    # Pretty-printed table (new default behavior)
-    if not profiles:
-        print("No profiles configured.")
-        return 0
-
-    # Build and print table with proper column widths
-    # Each column is left-aligned with no extra spaces between format specs
-    header = (
-        f"{'Alias':<25}"
-        f"{'ID':<25}"
-        f"{'Display Name':<32}"
-        f"{'Role':<12}"
-        f"{'Context':<10}"
-        f"{'Parallel':<10}"
-        f"{'Capabilities':<30}"
-    )
-    print(header)
-    print("-" * 144)
-
-    for p in profiles:
-        caps = ",".join(sorted(p.capabilities))[:27]
-        # Truncate display name if too long to prevent overflow (max 30 chars including space before ...)
-        if len(p.display_name) > 28:
-            display = p.display_name[:27] + "..."  # 27 chars + 3 dots = 30 chars
-        else:
-            display = p.display_name
-        # Build row without extra spaces between format specs
-        row = (
-            f"{p.alias:<25}"
-            f"{p.id:<25}"
-            f"{display:<32}"
-            f"{p.role:<12}"
-            f"{p.context_size:<10}"
-            f"{str(p.parallel or 1):<10}"
-            f"{caps:<30}"
-        )
-        print(row)
-
-    print(f"\nTotal: {len(profiles)} profile(s)")
-
-    return 0
-
-
 def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
     """Print an admin response as JSON or a concise human-readable summary."""
     if raw:
@@ -2230,13 +2303,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "security":
             if args.security_command == "init":
                 return _cmd_security_init(args)
-        if args.command == "configure":
-            return _cmd_configure(args)
-        if args.command == "credentials":
-            if args.credentials_command == "rotate":
-                return _cmd_credentials_rotate(args)
-            if args.credentials_command == "revoke":
-                return _cmd_credentials_revoke(args)
+            if args.security_command == "rotate":
+                return _cmd_security_rotate(args)
+            if args.security_command == "revoke":
+                return _cmd_security_revoke(args)
+        if args.command == "model" and args.model_command == "list":
+            return _cmd_model_list(args)
         if args.command == "runtime" and args.runtime_command == "list":
             return _cmd_runtime_list(args)
         if args.command == "profiles":
@@ -2273,9 +2345,6 @@ def main(argv: list[str] | None = None) -> int:
         registry = ProfileRegistry.from_path(args.profiles)
         controller = create_production_controller(registry)
 
-        if args.command == "list":
-            # Use _cmd_list with --raw flag support
-            return _cmd_list(args)
         if args.command == "status":
             state = controller.state()
             phase = state.get("phase", "unknown")
@@ -2365,12 +2434,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "render":
             profile = registry.resolve(args.model)
             print(controller.render_unit(profile.id), end="")
-            return 0
-        if args.command == "install":
-            with _operation_lock(LOCK_PATH):
-                installed = controller.install_units()
-            for profile_id, path in installed.items():
-                print(f"{profile_id}\t{path}")
             return 0
         if args.command in ("load", "start", "restart"):
             if args.command == "restart":

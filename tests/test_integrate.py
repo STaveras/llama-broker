@@ -16,6 +16,44 @@ from llama_broker.setup_wizard import build_setup_plan, discover_candidates
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_integrate_parser_exposes_full_verify(self) -> None:
+        args = brokerctl.build_parser().parse_args(["integrate", "--full-verify"])
+        self.assertTrue(args.full_verify)
+
+    def test_fast_inspection_skips_artifact_checks_but_full_verify_keeps_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = root / "llama-server"
+            runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            runtime.chmod(0o755)
+            model = root / "demo.gguf"
+            model.write_bytes(b"demo")
+            plan = build_setup_plan(
+                discover_candidates([root]),
+                runtime_path=runtime,
+                model_path=model,
+            )
+            path = root / "profiles.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "default_profile": plan.profile_record["id"],
+                        "profiles": [plan.profile_record],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            model.unlink()
+
+            with patch("llama_broker.integration.sha256_file") as hash_file:
+                _, fast = inspect_manifest(path, verify_artifacts=False)
+                hash_file.assert_not_called()
+
+            self.assertEqual(fast[0].status, "ready")
+            _, full = inspect_manifest(path, verify_artifacts=True)
+            self.assertEqual(full[0].status, "broken")
+
     def test_interactive_dry_run_rejects_json(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stderr(output):
@@ -88,6 +126,96 @@ class IntegrationTests(unittest.TestCase):
             statuses = {item.profile_id: item.status for item in inspections}
             self.assertEqual(statuses, {parent["id"]: "ready", "child": "ready"})
 
+    def test_integrate_install_only_installs_units_without_configuring_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = root / "llama-server"
+            runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            runtime.chmod(0o755)
+            model = root / "demo.gguf"
+            model.write_bytes(b"demo")
+            plan = build_setup_plan(
+                discover_candidates([root]), runtime_path=runtime, model_path=model
+            )
+            path = root / "profiles.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "default_profile": plan.profile_record["id"],
+                        "profiles": [plan.profile_record],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            systemd_dir = root / "systemd"
+
+            class FakeController:
+                def unit_path(self, profile_id: str) -> Path:
+                    return systemd_dir / f"llama-broker-profile-{profile_id}.service"
+
+                def render_unit(self, profile_id: str) -> str:
+                    return f"[Unit]\nDescription={profile_id}\n"
+
+                def install_units(self) -> None:
+                    return None
+
+            args = argparse.Namespace(
+                profiles=path,
+                integrate_command="install",
+                dry_run=False,
+                json=True,
+                full_verify=False,
+                clean=False,
+                set_default=False,
+                install_units=True,
+                tool_names=(),
+            )
+            output = io.StringIO()
+            controller = FakeController()
+            with (
+                contextlib.redirect_stdout(output),
+                patch.object(brokerctl, "create_production_controller", return_value=controller) as create,
+                patch.object(brokerctl.broker_runtime, "SYSTEMD_USER_DIR", systemd_dir),
+                patch("llama_broker.configure.main", return_value=0) as configure_main,
+                patch.dict(
+                    os.environ,
+                    {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"},
+                    clear=False,
+                ),
+            ):
+                result = brokerctl._cmd_integrate(args)
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(result, 0)
+            self.assertEqual(payload["client_provider"], "skipped")
+            self.assertEqual(payload["systemd"], "available")
+            create.assert_called_once()
+            configure_main.assert_not_called()
+
+    def test_integrate_configure_only_configures_selected_tools_without_touching_units(self) -> None:
+        args = argparse.Namespace(
+            profiles=Path("/tmp/profiles.json"),
+            integrate_command="configure",
+            dry_run=True,
+            set_default=True,
+            tool_names=["codex"],
+        )
+        with patch("llama_broker.configure.main", return_value=0) as configure_main:
+            result = brokerctl._cmd_integrate_configure(args)
+
+        self.assertEqual(result, 0)
+        configure_main.assert_called_once_with(
+            [
+                "--tools",
+                "codex",
+                "--dry-run",
+                "--set-default",
+                "--profiles",
+                "/tmp/profiles.json",
+            ]
+        )
+
     def test_integrate_reports_partial_success_without_calling_systemd(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -125,7 +253,7 @@ class IntegrationTests(unittest.TestCase):
                 profiles=path,
                 dry_run=False,
                 json=True,
-                verify=True,
+                full_verify=True,
                 clean=False,
                 set_default=False,
                 yes=False,

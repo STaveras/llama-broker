@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.1.0
+## Retrospective version: 0.2.0
 
-**Initial source snapshot** — source checkpoint 81661c4765c0 (2026-08-17).
+**Command organization** — source checkpoint e3b72a41be3d (2026-08-17).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
@@ -113,23 +113,23 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 | Command | Purpose |
 | --- | --- |
 | `brokerctl` (bare) | (planned) launches the interactive TUI |
-| `brokerctl list` | list allowlisted profiles; `--raw` for JSON |
+| `brokerctl model list` | list client-facing model references from canonical profiles (`--json` for a schema-versioned report) |
 | `brokerctl status` | show durable/live backend state (`--json` for schema-versioned JSON) |
-| `brokerctl install` | atomically install immutable profile units |
 | `brokerctl render <model>` | render a profile unit without installing |
 | `brokerctl load <model>` | queue a profile load (`start` is an alias) |
 | `brokerctl restart` | reload the active model or start a new one |
 | `brokerctl unload` | stop the current backing backend |
 | `brokerctl verify` | verify pinned runtime/model/projector SHA-256 |
-| `brokerctl setup` | discovery wizard; `--check`/`--dry-run` are non-mutating |
-| `brokerctl runtime list` | inspect registered serving runtimes |
+| `brokerctl setup` | first-time discovery wizard; `--check`/`--dry-run` are non-mutating |
+| `brokerctl runtime list` | list registered runtimes and the profiles selecting each (`--json` for a schema-versioned report) |
 | `brokerctl security init` | provision TLS + API-key material |
-| `brokerctl configure` | configure AI coding tools |
-| `brokerctl integrate` | refresh broker units and supported provider integrations; partial success is reported |
-| `brokerctl integrate --dry-run` | show the plan and ask before applying it |
+| `brokerctl security rotate\|revoke` | rotate or revoke native API keys |
+| `brokerctl integrate` | install broker units and configure supported provider integrations; partial success is reported |
+| `brokerctl integrate install` | install broker-owned units only |
+| `brokerctl integrate configure [TOOLS...]` | configure coding tools only |
+| `brokerctl integrate --dry-run` | show the combined integration plan and ask before applying it |
 | `brokerctl update` | deferred from 0.1.0; runtime acquisition is never automatic |
-| `brokerctl credentials rotate\|revoke` | rotate/revoke native API keys |
-| `brokerctl profiles list\|discover\|edit\|add` | profile management; `profiles discover --json` is a noninteractive schema-versioned report |
+| `brokerctl profiles list\|discover\|edit\|add` | profile management; profiles remain the canonical model-to-runtime binding and client naming source |
 | `brokerctl profiles calibrate ... --autotemp` | (planned) hardware calibration with optional model-keyed behavioral evaluation |
 
 ## API and security
@@ -143,7 +143,7 @@ The stable additive OpenAI-compatible subset is under `/v1`:
 | `POST /v1/chat/completions` | Authenticated chat request; the explicit `model` id/alias is routed to the matching profile. `stream: true` preserves SSE streaming. |
 | `POST /v1/completions` | Authenticated completion request with the same explicit model routing and streaming behavior. |
 
-Requests must provide `Authorization: Bearer ***` or `X-Api-Key: ***`.
+Requests must provide the OpenAI-standard `Authorization: Bearer $API_KEY` header.
 The credential order is raw `LLAMA_BROKER_API_KEY` first, then
 `LLAMA_BROKER_API_KEY_FILE`, then locally generated credentials. Missing/invalid
 credentials fail closed. `/health` and `/healthz` remain minimal

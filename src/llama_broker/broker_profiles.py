@@ -259,13 +259,17 @@ def _parse_extra_args(
 
 
 def _absolute_existing_path(
-    record: Mapping[str, Any], key: str, *, allow_directory: bool = False
+    record: Mapping[str, Any],
+    key: str,
+    *,
+    allow_directory: bool = False,
+    allow_missing: bool = False,
 ) -> Path:
     raw = str(_required(record, key)).strip()
     path = Path(raw).expanduser()
     if not path.is_absolute():
         raise ProfileError(f"{key} must be an absolute path: {raw!r}")
-    if not path.is_file() and not (allow_directory and path.is_dir()):
+    if not allow_missing and not path.is_file() and not (allow_directory and path.is_dir()):
         raise ProfileError(f"{key} does not exist or is not a file: {path}")
     return path
 
@@ -564,7 +568,7 @@ class ProfileRegistry:
         return profile
 
 
-def _parse_profile(raw: object) -> Profile:
+def _parse_profile(raw: object, *, allow_missing_artifacts: bool = False) -> Profile:
     if not isinstance(raw, dict):
         raise ProfileError("every profile must be a JSON object")
     record: Mapping[str, Any] = raw
@@ -613,14 +617,21 @@ def _parse_profile(raw: object) -> Profile:
     if not capabilities or not capabilities <= ALLOWED_CAPABILITIES:
         raise ProfileError(f"invalid capabilities for {profile_id!r}: {sorted(capabilities)!r}")
 
-    server_binary = _absolute_existing_path(record, "server_binary")
+    server_binary = _absolute_existing_path(
+        record, "server_binary", allow_missing=allow_missing_artifacts
+    )
     model_path = _absolute_existing_path(
-        record, "model_path", allow_directory=runtime == "vllm"
+        record,
+        "model_path",
+        allow_directory=runtime == "vllm",
+        allow_missing=allow_missing_artifacts,
     )
     mmproj_path: Path | None = None
     mmproj_sha256: str | None = None
     if record.get("mmproj_path"):
-        mmproj_path = _absolute_existing_path(record, "mmproj_path")
+        mmproj_path = _absolute_existing_path(
+            record, "mmproj_path", allow_missing=allow_missing_artifacts
+        )
         mmproj_sha256 = _sha256(record, "mmproj_sha256")
     native_vision = record.get("native_vision", False)
     if not isinstance(native_vision, bool):
@@ -637,7 +648,9 @@ def _parse_profile(raw: object) -> Profile:
 
     model_draft: Path | None = None
     if record.get("model_draft"):
-        model_draft = _absolute_existing_path(record, "model_draft")
+        model_draft = _absolute_existing_path(
+            record, "model_draft", allow_missing=allow_missing_artifacts
+        )
 
     context_size = _positive_int(record, "context_size")
     if context_size > MAX_CONTEXT_SIZE:
