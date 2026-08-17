@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "default_profile": "example-llama",
+  "profiles": [
+    {
+      "id": "example-llama",
+      "alias": "example-llama",
+      "display_name": "Example Llama.cpp profile",
+      "role": "primary",
+      "capabilities": ["chat"],
+      "server_binary": "/path/to/llama-server",
+      "server_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_path": "/path/to/model.gguf",
+      "model_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "context_size": 4096,
+      "parallel": 1,
+      "batch_size": 512,
+      "ubatch_size": 128,
+      "cache_type_k": "f16",
+      "cache_type_v": "f16",
+      "flash_attention": true,
+      "gpu_layers": 999,
+      "startup_timeout": 180,
+      "safety": {
+        "min_free_ram_mib": 1024,
+        "min_free_vram_mib": 0,
+        "max_context_size": 32768,
+        "max_parallel": 4,
+        "max_batch_size": 4096,
+        "max_ubatch_size": 1024
+      },
+      "environment": {},
+      "extra_args": []
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Runtime state (machine-specific, regenerated)
+state.json
+.model-switch.lock
+security.json
+api-keys
+*.crt
+*.key
+profiles.json
+generated/
+llama-broker.service
+
+# MTP downloaded tensors (too large for git)
+mtp-tools/models/
+
+# Local tooling / agent configs
+.vscode/
+.codebuddy/
+.claude/
+.cursorrules
+.hermes.md
+AGENTS.md
+LEAN-CTX.md
+
+# Private planning artifacts
+.hermes/
+
+# Local-only docs (not shipped with the public release)
+QUICK_START.md
+docs/kvarn-upstream-sync-ledger-*.md
+test-scripts.sh
+benchmark.sh
+quick-test.sh
+tests/test_local_production_manifest.py
+# CI/release workflows are public release inputs.
+!.github/
+!.github/workflows/

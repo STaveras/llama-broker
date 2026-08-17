@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "default_profile": "example-model-7b",
+  "profiles": [
+    {
+      "id": "example-model-7b",
+      "alias": "example-model-7b",
+      "aliases": [
+        "example-model-7b",
+        "example-7b"
+      ],
+      "display_name": "Example 7B Instruct (Q4_K_M)",
+      "role": "persistent",
+      "capabilities": [
+        "text"
+      ],
+      "server_binary": "~/builds/llama.cpp/build/bin/llama-server",
+      "server_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_path": "~/models/example/example-7b-instruct-Q4_K_M.gguf",
+      "model_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "context_size": 32768,
+      "parallel": 1,
+      "batch_size": 512,
+      "ubatch_size": 128,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attention": "on",
+      "gpu_layers": "auto",
+      "startup_timeout": 300,
+      "safety": {
+        "service": {
+          "type": "exec",
+          "memory_max_mib": 20480,
+          "memory_swap_max_mib": 1024,
+          "tasks_max": 512,
+          "kill_signal": "SIGINT",
+          "timeout_stop_sec": 20
+        },
+        "admission": {
+          "min_ram_available_mib": 8192,
+          "max_swap_used_mib": 1024,
+          "max_swap_growth_mib": 128,
+          "min_total_vram_mib": 12000,
+          "min_free_vram_before_start_mib": 8192,
+          "driver_vram_reserve_mib": 512,
+          "vision_vram_reserve_mib": 1536,
+          "safety_vram_reserve_mib": 1024
+        }
+      },
+      "environment": {
+        "GGML_CUDA_DISABLE_GRAPHS": "1",
+        "GGML_CUDA_GRAPH_OPT": "0",
+        "GGML_CUDA_PDL": "0"
+      },
+      "extra_args": [
+        "--no-warmup",
+        "--reasoning",
+        "off"
+      ]
+    },
+    {
+      "id": "example-vision-12b",
+      "alias": "example-vision-12b",
+      "aliases": [
+        "example-vision-12b",
+        "example-vision"
+      ],
+      "display_name": "Example Vision 12B (Q4_K_M)",
+      "role": "persistent",
+      "capabilities": [
+        "text",
+        "vision"
+      ],
+      "server_binary": "~/builds/llama.cpp/build/bin/llama-server",
+      "server_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_path": "~/models/example/example-vision-12b-Q4_K_M.gguf",
+      "model_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "mmproj_path": "~/models/example/mmproj-F16.gguf",
+      "mmproj_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "context_size": 32768,
+      "parallel": 1,
+      "batch_size": 512,
+      "ubatch_size": 128,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attention": "on",
+      "gpu_layers": "auto",
+      "startup_timeout": 300,
+      "safety": {
+        "service": {
+          "type": "exec",
+          "memory_max_mib": 20480,
+          "memory_swap_max_mib": 1024,
+          "tasks_max": 512,
+          "kill_signal": "SIGINT",
+          "timeout_stop_sec": 20
+        },
+        "admission": {
+          "min_ram_available_mib": 8192,
+          "max_swap_used_mib": 1024,
+          "max_swap_growth_mib": 128,
+          "min_total_vram_mib": 12000,
+          "min_free_vram_before_start_mib": 8192,
+          "driver_vram_reserve_mib": 512,
+          "vision_vram_reserve_mib": 1536,
+          "safety_vram_reserve_mib": 1024
+        }
+      },
+      "environment": {
+        "GGML_CUDA_DISABLE_GRAPHS": "1",
+        "GGML_CUDA_GRAPH_OPT": "0",
+        "GGML_CUDA_PDL": "0"
+      },
+      "extra_args": [
+        "--no-warmup",
+        "--reasoning",
+        "off"
+      ]
+    }
+  ]
+}

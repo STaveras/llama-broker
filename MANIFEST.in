@@ -1,0 +1,16 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include pyproject.toml
+recursive-include src/llama_broker/data *.json *.service.in
+prune docs/plans
+exclude docs/broker-autotune-workstream.md
+exclude DESIGN.md
+exclude profiles.json
+exclude profiles.json.bak-*
+exclude state.json
+exclude security.json
+exclude api-keys
+recursive-exclude .git *
+recursive-exclude __pycache__ *
+recursive-exclude tests *.pyc

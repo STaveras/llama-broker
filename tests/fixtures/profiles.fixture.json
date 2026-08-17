@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "default_profile": "fixture-text-7b",
+  "profiles": [
+    {
+      "id": "fixture-text-7b",
+      "alias": "fixture-text-7b",
+      "aliases": [
+        "fixture-text-7b",
+        "fixture-7b"
+      ],
+      "display_name": "Fixture Text 7B (Q4_K_M)",
+      "role": "persistent",
+      "capabilities": [
+        "text"
+      ],
+      "server_binary": "__FIXTURE_ROOT__/bin/llama-server",
+      "server_sha256": "__FIXTURE_SHA256_SERVER__",
+      "model_path": "__FIXTURE_ROOT__/models/fixture-text-7b-Q4_K_M.gguf",
+      "model_sha256": "__FIXTURE_SHA256_MODEL__",
+      "context_size": 32768,
+      "parallel": 1,
+      "batch_size": 512,
+      "ubatch_size": 128,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attention": "on",
+      "gpu_layers": "auto",
+      "startup_timeout": 300,
+      "safety": {
+        "service": {
+          "type": "exec",
+          "memory_max_mib": 20480,
+          "memory_swap_max_mib": 1024,
+          "tasks_max": 512,
+          "kill_signal": "SIGINT",
+          "timeout_stop_sec": 20
+        },
+        "admission": {
+          "min_ram_available_mib": 8192,
+          "max_swap_used_mib": 1024,
+          "max_swap_growth_mib": 128,
+          "min_total_vram_mib": 12000,
+          "min_free_vram_before_start_mib": 8192,
+          "driver_vram_reserve_mib": 512,
+          "vision_vram_reserve_mib": 1536,
+          "safety_vram_reserve_mib": 1024
+        }
+      },
+      "environment": {
+        "GGML_CUDA_DISABLE_GRAPHS": "1",
+        "GGML_CUDA_GRAPH_OPT": "0",
+        "GGML_CUDA_PDL": "0"
+      },
+      "extra_args": [
+        "--no-warmup",
+        "--reasoning",
+        "off"
+      ]
+    },
+    {
+      "id": "fixture-vision-12b",
+      "alias": "fixture-vision-12b",
+      "aliases": [
+        "fixture-vision-12b",
+        "fixture-vision"
+      ],
+      "display_name": "Fixture Vision 12B (Q4_K_M)",
+      "role": "persistent",
+      "capabilities": [
+        "text",
+        "vision"
+      ],
+      "server_binary": "__FIXTURE_ROOT__/bin/llama-server",
+      "server_sha256": "__FIXTURE_SHA256_SERVER__",
+      "model_path": "__FIXTURE_ROOT__/models/fixture-vision-12b-Q4_K_M.gguf",
+      "model_sha256": "__FIXTURE_SHA256_MODEL__",
+      "mmproj_path": "__FIXTURE_ROOT__/models/mmproj-F16.gguf",
+      "mmproj_sha256": "__FIXTURE_SHA256_MMPROJ__",
+      "context_size": 32768,
+      "parallel": 1,
+      "batch_size": 512,
+      "ubatch_size": 128,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attention": "on",
+      "gpu_layers": "auto",
+      "startup_timeout": 300,
+      "safety": {
+        "service": {
+          "type": "exec",
+          "memory_max_mib": 20480,
+          "memory_swap_max_mib": 1024,
+          "tasks_max": 512,
+          "kill_signal": "SIGINT",
+          "timeout_stop_sec": 20
+        },
+        "admission": {
+          "min_ram_available_mib": 8192,
+          "max_swap_used_mib": 1024,
+          "max_swap_growth_mib": 128,
+          "min_total_vram_mib": 12000,
+          "min_free_vram_before_start_mib": 8192,
+          "driver_vram_reserve_mib": 512,
+          "vision_vram_reserve_mib": 1536,
+          "safety_vram_reserve_mib": 1024
+        }
+      },
+      "environment": {
+        "GGML_CUDA_DISABLE_GRAPHS": "1",
+        "GGML_CUDA_GRAPH_OPT": "0",
+        "GGML_CUDA_PDL": "0"
+      },
+      "extra_args": [
+        "--no-warmup",
+        "--reasoning",
+        "off"
+      ]
+    }
+  ]
+}
