@@ -1,0 +1,2435 @@
+#!/usr/bin/env python3
+"""Administrative CLI for broker-owned immutable backend profiles.
+
+Usage:
+    brokerctl list                         List profiles
+    brokerctl status                       Show broker state
+    brokerctl install                      Install systemd units
+    brokerctl render MODEL                 Render a profile unit
+    brokerctl load MODEL                   Load model profile
+    brokerctl unload                       Unload the backend
+    brokerctl verify [MODEL]               Verify SHA-256 hashes
+    brokerctl setup [--clean]              Regenerate units and optionally remove stale units
+    brokerctl security init --ip IP        Create local CA and TLS certificates
+    brokerctl configure [TOOLS...]         Configure AI coding tools
+    brokerctl credentials rotate            Rotate native API keys
+    brokerctl credentials revoke KEY        Revoke a native API key
+    brokerctl profiles list                List profiles with status
+    brokerctl profiles show ID             Show one complete profile as JSON
+    brokerctl profiles add ID --model PATH Add a complete profile
+    brokerctl profiles discover            Discover backends via port sweep
+    brokerctl profiles edit [MODEL]        Open the field-oriented profile editor
+    brokerctl profiles add MODEL           Inspect a candidate (non-mutating)
+    brokerctl runtime list                 List registered serving runtimes
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import http.client
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, replace
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from . import daemon as broker_runtime
+from .backend_controller import BackendControllerError, _atomic_write
+from .broker_security import (
+    ensure_security_material,
+    initialize_security_material,
+    load_security_config,
+)
+from .broker_profiles import (
+    ALLOWED_CACHE_TYPES,
+    ALLOWED_ROLES,
+    PROFILE_ID_RE,
+    Profile,
+    ProfileError,
+    ProfileRegistry,
+)
+from .discovery import discover_backends
+from .profile_config import (
+    ApplyError,
+    apply_manifest_transaction,
+    load_manifest_source,
+    sha256_file,
+    write_manifest_atomically,
+)
+from .runtimes import get_runtime_info, list_runtimes, runtime_names
+from .integration import filtered_manifest, inspect_manifest, report_for
+from .paths import MODELS_DIR
+from .setup_wizard import (
+    apply_profile_plan,
+    build_setup_plan,
+    discover_candidates,
+    render_report,
+)
+from .daemon import (
+    LOCK_PATH,
+    PROFILES_PATH,
+    _operation_lock,
+    backend_endpoint_ready,
+    create_production_controller,
+    effective_backend_url,
+)
+
+
+BROKER_ADMIN_URL = "http://127.0.0.1:11434"
+PACKAGE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = PACKAGE_DIR.parents[1]
+# Source checkouts keep templates and example manifests at the repository root.
+# Installed wheels fall back to package data, which later helpers may resolve
+# through importlib.resources.
+BROKER_DIR = PROJECT_ROOT if (PROJECT_ROOT / "docs").is_dir() else PACKAGE_DIR
+BIN_DIR = Path.home() / "bin"
+
+
+def _broker_admin_url() -> str:
+    explicit = os.environ.get("LLAMA_BROKER_ADMIN_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    client_url = os.environ.get("LLAMA_BROKER_CLIENT_URL")
+    if client_url:
+        return client_url.rstrip("/").removesuffix("/v1")
+    security = load_security_config()
+    scheme = "https" if security.broker_tls_cert_file else "http"
+    return f"{scheme}://127.0.0.1:11434"
+
+
+def _broker_admin(path: str, payload: dict[str, object]) -> dict[str, object]:
+    """Use the live broker's drain coordinator; never bypass its lease gate."""
+    parts = urlsplit(_broker_admin_url())
+    security = load_security_config()
+    if parts.scheme == "https":
+        connection = http.client.HTTPSConnection(
+            parts.hostname,
+            parts.port or 443,
+            timeout=3600,
+            context=security.broker_client_context(),
+        )
+    else:
+        connection = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=3600)
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    try:
+        connection.request(
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Type": "application/json", "Connection": "close"},
+        )
+        response = connection.getresponse()
+        raw = response.read()
+    except OSError as error:
+        raise BackendControllerError(
+            "live Llama-Broker is unavailable; direct lifecycle fallback is disabled "
+            "because it could bypass active request leases"
+        ) from error
+    finally:
+        connection.close()
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise BackendControllerError("live broker returned invalid admin JSON") from error
+    if response.status not in {200, 202}:
+        raise BackendControllerError(
+            f"live broker admin request failed with HTTP {response.status}: {decoded}"
+        )
+    return decoded
+
+
+def _broker_admin_get(path: str) -> dict[str, object]:
+    """Read live broker context without taking a lifecycle lock or lease."""
+    parts = urlsplit(_broker_admin_url())
+    security = load_security_config()
+    if parts.scheme == "https":
+        connection = http.client.HTTPSConnection(
+            parts.hostname,
+            parts.port or 443,
+            timeout=2,
+            context=security.broker_client_context(),
+        )
+    else:
+        connection = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=2)
+    try:
+        connection.request("GET", path, headers={"Connection": "close"})
+        response = connection.getresponse()
+        raw = response.read()
+    except (OSError, http.client.HTTPException) as error:
+        raise BackendControllerError("live Llama-Broker status is unavailable") from error
+    finally:
+        connection.close()
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise BackendControllerError("live broker returned invalid status JSON") from error
+    if response.status != 200 or not isinstance(decoded, dict):
+        raise BackendControllerError(
+            f"live broker status failed with HTTP {response.status}: {decoded}"
+        )
+    return decoded
+
+
+def _hash_file(path: Path) -> str:
+    return sha256_file(path)
+
+
+def _service_template_path() -> Path:
+    source_template = PROJECT_ROOT / "docs/examples/llama-broker.service.in"
+    if source_template.exists():
+        return source_template
+    return PACKAGE_DIR / "data/llama-broker.service.in"
+
+
+def _service_exec_start() -> str:
+    installed = shutil.which("llama-broker")
+    if installed:
+        return installed
+    return f"{sys.executable} {BROKER_DIR / 'llama_broker.py'}"
+
+
+def _profile_payload(profile: Profile) -> dict[str, object]:
+    return {
+        "id": profile.id,
+        "runtime": profile.runtime,
+        "alias": profile.alias,
+        "aliases": list(profile.aliases),
+        "role": profile.role,
+        "capabilities": sorted(profile.capabilities),
+        "native_vision": profile.native_vision,
+        "model_path": str(profile.model_path),
+        "model_sha256": profile.model_sha256,
+        "mmproj_path": str(profile.mmproj_path) if profile.mmproj_path else None,
+        "context_size": profile.context_size,
+        "parallel": profile.parallel,
+        "tensor_parallel_size": profile.tensor_parallel_size,
+        "gpu_memory_utilization": profile.gpu_memory_utilization,
+        "kv_cache_dtype": profile.kv_cache_dtype,
+        "tool_call_parser": profile.tool_call_parser,
+        "cache_type_k": profile.cache_type_k,
+        "cache_type_v": profile.cache_type_v,
+        "fit": profile.fit,
+        "fit_target_mib": profile.fit_target_mib,
+        "restore_profile": profile.restore_profile,
+    }
+
+
+def _verify_profile(profile: Profile) -> list[str]:
+    failures: list[str] = []
+    checks = [
+        (profile.server_binary, profile.server_sha256, "server_binary"),
+        (profile.model_path, profile.model_sha256, "model"),
+    ]
+    if profile.mmproj_path is not None and profile.mmproj_sha256 is not None:
+        checks.append((profile.mmproj_path, profile.mmproj_sha256, "mmproj"))
+    for path, expected, kind in checks:
+        try:
+            actual = _hash_file(path)
+        except OSError as error:
+            failures.append(f"{profile.id} {kind} unavailable: {error}")
+            continue
+        if actual != expected:
+            failures.append(
+                f"{profile.id} {kind} SHA mismatch: expected {expected}, got {actual} ({path})"
+            )
+    return failures
+
+
+PROFILE_MUTATION_REMINDER = (
+    "Reminder: profile edits do not install units or change the running broker; "
+    "run `brokerctl install` or `brokerctl setup` when ready."
+)
+CLI_CACHE_TYPES = ("f16", "kvarn4", "turbo4")
+KNOWN_CACHE_TYPES = ALLOWED_CACHE_TYPES
+ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+REQUIRED_LLAMACPP_ENVIRONMENT = frozenset(
+    {"GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_OPT", "GGML_CUDA_PDL"}
+)
+
+
+def _load_editable_manifest(profiles_path: Path) -> tuple[ProfileRegistry, dict[str, object]]:
+    """Load raw records only after the authoritative registry accepts the manifest."""
+
+    registry = ProfileRegistry.from_path(profiles_path)
+    return registry, load_manifest_source(profiles_path)
+
+
+def _write_validated_manifest(profiles_path: Path, data: dict[str, object]) -> None:
+    """Validate and durably publish a replacement manifest."""
+
+    write_manifest_atomically(profiles_path, data)
+
+
+def _record_for_selector(
+    registry: ProfileRegistry,
+    data: dict[str, object],
+    selector: str,
+) -> tuple[Profile, dict[str, object]]:
+    try:
+        profile = registry.get(selector)
+    except ProfileError:
+        profile = registry.resolve(selector)
+    records = data.get("profiles")
+    if not isinstance(records, list):
+        raise ProfileError("profile manifest must contain a profiles list")
+    for record in records:
+        if isinstance(record, dict) and record.get("id") == profile.id:
+            return profile, record
+    raise ProfileError(f"profile record not found: {profile.id}")
+
+
+def _publish_profile_change(
+    profiles_path: Path,
+    data: dict[str, object],
+    description: str,
+) -> int:
+    _write_validated_manifest(profiles_path, data)
+    print(f"{description} in {profiles_path}")
+    print(PROFILE_MUTATION_REMINDER)
+    return 0
+
+
+def _parse_env_assignment(raw: str) -> tuple[str, str]:
+    key, separator, value = raw.partition("=")
+    key = key.strip()
+    if not separator or not ENVIRONMENT_NAME_RE.fullmatch(key):
+        raise ProfileError(f"environment assignment must be KEY=VALUE: {raw!r}")
+    if any(character in value for character in ("\x00", "\n", "\r")):
+        raise ProfileError(f"environment value contains a forbidden control character: {key}")
+    return key, value
+
+
+def _normalise_existing_path(raw: str, field: str) -> Path:
+    value = Path(raw).expanduser()
+    if not value.is_absolute():
+        raise ProfileError(f"{field} must be an absolute path: {raw!r}")
+    if not value.exists():
+        raise ProfileError(f"{field} does not exist: {value}")
+    return value.resolve()
+
+
+def _validate_cache_type(value: str, field: str) -> str:
+    normalised = value.strip().lower()
+    if normalised not in KNOWN_CACHE_TYPES:
+        supported = ", ".join(sorted(KNOWN_CACHE_TYPES))
+        raise ProfileError(f"invalid {field} {value!r}; supported cache types: {supported}")
+    return normalised
+
+
+def _validate_gpu_layers(value: str) -> str:
+    normalised = value.strip().lower()
+    if normalised in {"all", "auto"} or normalised.isdigit():
+        return normalised
+    raise ProfileError("gpu-layers must be 'all', 'auto', or a non-negative integer")
+
+
+def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> None:
+    field_map = {
+        "display-name": "display_name",
+        "role": "role",
+        "alias": "alias",
+        "server-binary": "server_binary",
+        "model": "model_path",
+        "model-sha256": "model_sha256",
+        "context": "context_size",
+        "parallel": "parallel",
+        "batch": "batch_size",
+        "ubatch": "ubatch_size",
+        "cache-k": "cache_type_k",
+        "cache-v": "cache_type_v",
+        "flash": "flash_attention",
+        "gpu-layers": "gpu_layers",
+        "mmproj": "mmproj_path",
+        "restore": "restore_profile",
+        "startup-timeout": "startup_timeout",
+    }
+    if field not in field_map:
+        supported = ", ".join(sorted(field_map))
+        raise ProfileError(f"unknown profile field {field!r}; supported fields: {supported}")
+
+    key = field_map[field]
+    if field == "role":
+        if raw_value not in ALLOWED_ROLES:
+            raise ProfileError(
+                f"invalid role {raw_value!r}; expected one of: "
+                + ", ".join(sorted(ALLOWED_ROLES))
+            )
+        record[key] = raw_value
+    elif field == "alias":
+        value = raw_value.strip()
+        if not value:
+            raise ProfileError("alias must not be empty")
+        record[key] = value
+    elif field in {"context", "parallel", "batch", "ubatch", "startup-timeout"}:
+        try:
+            value = int(raw_value, 10)
+        except ValueError as error:
+            raise ProfileError(f"{field} must be an integer: {raw_value!r}") from error
+        record[key] = value
+    elif field in {"cache-k", "cache-v"}:
+        record[key] = _validate_cache_type(raw_value, field)
+    elif field == "flash":
+        value = raw_value.strip().lower()
+        if value not in {"auto", "on", "off"}:
+            raise ProfileError("flash must be one of: auto, on, off")
+        record[key] = value
+    elif field == "gpu-layers":
+        record[key] = _validate_gpu_layers(raw_value)
+    elif field in {"server-binary", "model", "mmproj"}:
+        value = raw_value.strip()
+        if field == "mmproj" and not value:
+            record.pop("mmproj_path", None)
+            record.pop("mmproj_sha256", None)
+            if not record.get("native_vision"):
+                capabilities = [
+                    item for item in record.get("capabilities", []) if item != "vision"
+                ]
+                record["capabilities"] = capabilities or ["text"]
+            return
+        path = _normalise_existing_path(value, key)
+        record[key] = str(path)
+        if field == "server-binary":
+            record["server_sha256"] = sha256_file(path)
+        elif field == "model":
+            record["model_sha256"] = sha256_file(path)
+        else:
+            record["mmproj_sha256"] = sha256_file(path)
+            capabilities = set(record.get("capabilities", ["text"]))
+            capabilities.add("vision")
+            record["capabilities"] = sorted(capabilities)
+    elif field == "model-sha256":
+        value = raw_value.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ProfileError("model-sha256 must be a lowercase 64-character SHA-256")
+        record[key] = value
+    elif field == "restore":
+        if raw_value.strip():
+            record[key] = raw_value.strip()
+        else:
+            record.pop(key, None)
+    else:
+        record[key] = raw_value
+
+
+def _remove_optional_field(record: dict[str, object], field: str) -> None:
+    if field == "mmproj":
+        record.pop("mmproj_path", None)
+        record.pop("mmproj_sha256", None)
+        if not record.get("native_vision"):
+            capabilities = [
+                item for item in record.get("capabilities", []) if item != "vision"
+            ]
+            record["capabilities"] = capabilities or ["text"]
+        return
+    if field == "restore":
+        record.pop("restore_profile", None)
+        return
+    if field == "model-draft":
+        record.pop("model_draft", None)
+        return
+    if field in {"environment", "env"}:
+        environment = dict(record.get("environment", {}))
+        if str(record.get("runtime", "llamacpp")) == "llamacpp":
+            environment = {
+                key: value
+                for key, value in environment.items()
+                if key in REQUIRED_LLAMACPP_ENVIRONMENT
+            }
+        else:
+            environment.clear()
+        record["environment"] = environment
+        return
+    if field in {"extra-args", "args"}:
+        record["extra_args"] = []
+        return
+    if field == "aliases":
+        record.pop("aliases", None)
+        return
+    if field == "fit":
+        for key in ("fit", "fit_target_mib", "fit_ctx", "ctx_checkpoints", "cache_ram_mib"):
+            record.pop(key, None)
+        return
+    supported = "mmproj, restore, model-draft, environment, extra-args, aliases, fit"
+    raise ProfileError(f"unknown optional field {field!r}; supported fields: {supported}")
+
+
+def _template_profile_record(data: dict[str, object]) -> dict[str, object]:
+    records = data.get("profiles")
+    if not isinstance(records, list) or not records:
+        raise ProfileError("cannot add a profile without an existing template profile")
+    for record in records:
+        if isinstance(record, dict) and record.get("role") == "primary":
+            return copy.deepcopy(record)
+    for record in records:
+        if isinstance(record, dict):
+            return copy.deepcopy(record)
+    raise ProfileError("profile template is not an object")
+
+
+def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> dict[str, object]:
+    profile_id = args.profile_id.strip()
+    if not PROFILE_ID_RE.fullmatch(profile_id):
+        raise ProfileError(f"invalid profile id: {profile_id!r}")
+    record = _template_profile_record(data)
+    model_path = _normalise_existing_path(args.model, "model")
+    server_path = _normalise_existing_path(
+        args.server_binary or str(record.get("server_binary", "")), "server-binary"
+    )
+    aliases = [item.strip() for item in (args.alias or [profile_id]) if item.strip()]
+    if not aliases:
+        raise ProfileError("at least one non-empty alias is required")
+
+    record["id"] = profile_id
+    record["alias"] = aliases[0]
+    record["aliases"] = aliases
+    record["display_name"] = args.display_name or profile_id
+    record["role"] = args.role or "persistent"
+    record["capabilities"] = ["text"]
+    record["native_vision"] = False
+    record.pop("restore_profile", None)
+    record.pop("model_draft", None)
+    record.pop("fit", None)
+    for key in ("fit_target_mib", "fit_ctx", "ctx_checkpoints", "cache_ram_mib"):
+        record.pop(key, None)
+    record["server_binary"] = str(server_path)
+    record["server_sha256"] = sha256_file(server_path)
+    record["model_path"] = str(model_path)
+    record["model_sha256"] = sha256_file(model_path)
+
+    if args.context is not None:
+        record["context_size"] = args.context
+    if args.parallel is not None:
+        record["parallel"] = args.parallel
+    if args.batch is not None:
+        record["batch_size"] = args.batch
+    if args.ubatch is not None:
+        record["ubatch_size"] = args.ubatch
+    if args.cache_k is not None:
+        record["cache_type_k"] = args.cache_k
+    if args.cache_v is not None:
+        record["cache_type_v"] = args.cache_v
+    if args.flash is not None:
+        record["flash_attention"] = args.flash
+    if args.gpu_layers is not None:
+        record["gpu_layers"] = _validate_gpu_layers(args.gpu_layers)
+    if args.mmproj:
+        mmproj_path = _normalise_existing_path(args.mmproj, "mmproj")
+        record["mmproj_path"] = str(mmproj_path)
+        record["mmproj_sha256"] = sha256_file(mmproj_path)
+        record["capabilities"] = ["text", "vision"]
+    else:
+        record.pop("mmproj_path", None)
+        record.pop("mmproj_sha256", None)
+    if args.restore:
+        record["restore_profile"] = args.restore
+    if args.env:
+        environment = dict(record.get("environment", {}))
+        for assignment in args.env:
+            key, value = _parse_env_assignment(assignment)
+            environment[key] = value
+        record["environment"] = environment
+    if args.extra_args:
+        record["extra_args"] = list(args.extra_args)
+    return record
+
+
+# ── Interactive profile editing ──────────────────────────────────────────────
+
+EDITABLE_FIELDS = [
+    ("runtime", "Serving runtime", str),
+    ("context_size", "Context window size", int),
+    ("parallel", "Parallel requests (slots)", int),
+    ("tensor_parallel_size", "vLLM tensor parallel size", int),
+    ("gpu_memory_utilization", "vLLM GPU memory utilization", float),
+    ("kv_cache_dtype", "vLLM KV cache dtype", str),
+    ("tool_call_parser", "vLLM tool-call parser", str),
+    ("tool_parser_plugin", "vLLM tool parser plugin", str),
+    ("chat_template", "vLLM chat template", str),
+    ("batch_size", "Batch size", int),
+    ("ubatch_size", "Micro-batch size", int),
+    ("cache_type_k", "KV cache type (k)", str),
+    ("cache_type_v", "KV cache type (v)", str),
+    ("fit", "Auto-fit to VRAM", bool),
+    ("fit_target_mib", "Fit target MiB", int),
+    ("fit_ctx", "Fit context size", int),
+]
+
+FIT_ONLY_FIELDS = (
+    "fit_target_mib",
+    "fit_ctx",
+    "ctx_checkpoints",
+    "cache_ram_mib",
+)
+
+
+def _interactive_edit(
+    profile_id: str,
+    profiles_path: Path,
+    flags: dict[str, str | None],
+    *,
+    flag_mode: bool = False,
+) -> int:
+    """Interactively edit a profile's parameters."""
+    data = json.loads(profiles_path.read_text(encoding="utf-8"))
+    profile_idx = None
+    profile_data = None
+    for i, p in enumerate(data.get("profiles", [])):
+        if p.get("id") == profile_id or p.get("alias") == profile_id:
+            profile_idx = i
+            profile_data = p
+            break
+
+    if profile_idx is None:
+        print(f"Profile not found: {profile_id}", file=sys.stderr)
+        return 1
+
+    selected_runtime = str(
+        flags.get("runtime") or profile_data.get("runtime", "llamacpp")
+    ).strip().lower()
+    runtime_info = get_runtime_info(selected_runtime)
+    unsupported = sorted(
+        field
+        for field, value in flags.items()
+        if value is not None and field not in runtime_info.editable_fields
+    )
+    if unsupported:
+        raise ProfileError(
+            f"runtime {selected_runtime!r} does not support edit fields: "
+            + ", ".join(unsupported)
+        )
+
+    display_name = profile_data.get("display_name", profile_data.get("alias", profile_id))
+    print(f"\nEditing: {profile_data['id']} ({display_name})\n")
+
+    changed = False
+    for field_key, field_label, field_type in EDITABLE_FIELDS:
+        current = profile_data.get(field_key)
+        flag_value = flags.get(field_key)
+
+        if flag_mode and flag_value is None:
+            continue
+
+        if flag_value is not None:
+            # Flag-based: convert and apply
+            if field_key == "fit" and flag_value.strip().lower() in {
+                "off",
+                "false",
+                "0",
+                "no",
+                "unset",
+                "native",
+                "omit",
+            }:
+                removed = [key for key in ("fit", *FIT_ONLY_FIELDS) if key in profile_data]
+                for key in removed:
+                    profile_data.pop(key, None)
+                if removed:
+                    changed = True
+                    print(f"  {field_label}: removed ({', '.join(removed)})")
+                continue
+            new_value = _coerce_value(flag_value, field_type)
+            if new_value != current:
+                profile_data[field_key] = new_value
+                changed = True
+                print(f"  {field_label}: {current} -> {new_value}")
+            continue
+
+        # Interactive mode
+        if field_type == bool:
+            prompt = f"  {field_label} [{'on' if current else 'off'}]: "
+            raw = input(prompt).strip().lower()
+            if raw in ("on", "true", "1", "yes"):
+                new_value = True
+            elif raw in ("off", "false", "0", "no", "unset", "native", "omit"):
+                removed = [key for key in ("fit", *FIT_ONLY_FIELDS) if key in profile_data]
+                for key in removed:
+                    profile_data.pop(key, None)
+                if removed:
+                    changed = True
+                    print(f"  {field_label}: removed ({', '.join(removed)})")
+                continue
+            elif not raw:
+                continue
+            else:
+                print(f"    (skipped, invalid boolean)")
+                continue
+        else:
+            current_str = str(current) if current is not None else ""
+            prompt = f"  {field_label} [{current_str}]: "
+            raw = input(prompt).strip()
+            if not raw:
+                continue
+            new_value = _coerce_value(raw, field_type)
+
+        if new_value != current:
+            profile_data[field_key] = new_value
+            changed = True
+            print(f"  {field_label}: {current} -> {new_value}")
+
+    if changed:
+        _write_validated_manifest(profiles_path, data)
+        print(f"\nUpdated {profile_id} in {profiles_path}")
+        print(PROFILE_MUTATION_REMINDER)
+    else:
+        print("\nNo changes.")
+
+    return 0
+
+
+def _coerce_value(raw: str, target_type: type) -> Any:
+    """Coerce a string value to the target type."""
+    if target_type == bool:
+        return raw.lower() in ("on", "true", "1", "yes")
+    if target_type == int:
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(f"expected integer, got: {raw!r}")
+    if target_type == float:
+        try:
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"expected number, got: {raw!r}")
+    return raw
+
+
+# ── Subcommand: setup ───────────────────────────────────────────────────────
+
+def _cmd_integrate(args: argparse.Namespace) -> int:
+    """Apply service/provider integration independently for each verified profile."""
+
+    if getattr(args, "dry_run", False) and getattr(args, "json", False):
+        print("integrate --dry-run is interactive and cannot be combined with --json", file=sys.stderr)
+        return 2
+    try:
+        payload, inspections = inspect_manifest(args.profiles)
+    except (OSError, ProfileError, ValueError) as error:
+        print(f"ERROR: integration cannot read profiles: {error}", file=sys.stderr)
+        return 1
+
+    ready = [item for item in inspections if item.status == "ready" and item.profile is not None]
+    if not ready:
+        result = report_for(inspections)
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            for item in inspections:
+                print(f"{item.profile_id}: {item.status} ({item.reason})")
+        return 1
+
+    # A filtered registry lets valid profiles render independently.  Restore
+    # targets that point at skipped profiles are removed rather than guessed.
+    valid_ids = {item.profile.id for item in ready if item.profile is not None}
+
+    def registry_for(profile_ids: set[str]) -> ProfileRegistry:
+        profiles = tuple(
+            replace(
+                item.profile,
+                restore_profile=(
+                    item.profile.restore_profile
+                    if item.profile.restore_profile in profile_ids
+                    else None
+                ),
+            )
+            for item in ready
+            if item.profile is not None and item.profile.id in profile_ids
+        )
+        default_profile = str(payload.get("default_profile", ""))
+        if default_profile not in profile_ids:
+            default_profile = profiles[0].id
+        return ProfileRegistry(profiles, default_profile)
+
+    registry = registry_for(valid_ids)
+
+    try:
+        controller = create_production_controller(registry)
+    except (BackendControllerError, ProfileError, ValueError, OSError) as error:
+        print(f"ERROR: integration controller unavailable: {error}", file=sys.stderr)
+        return 1
+
+    planned = list(inspections)
+    for item in ready:
+        path = controller.unit_path(item.profile.id)
+        try:
+            rendered = controller.render_unit(item.profile.id)
+            if path.is_file() and path.read_text(encoding="utf-8") == rendered:
+                status = "unchanged"
+            elif path.exists() or path.is_symlink():
+                status = "updated"
+            else:
+                status = "installed"
+        except (BackendControllerError, OSError, ValueError) as error:
+            status = "broken"
+            item = replace(item, reason=f"cannot render unit: {error}")
+        for index, original in enumerate(planned):
+            if original.profile_id == item.profile_id:
+                planned[index] = replace(item, status=status)
+                break
+
+    renderable_ids = {
+        item.profile_id
+        for item in planned
+        if item.status in {"installed", "updated", "unchanged"}
+    }
+    if renderable_ids != valid_ids:
+        valid_ids = renderable_ids
+        if valid_ids:
+            try:
+                controller = create_production_controller(registry_for(valid_ids))
+            except (BackendControllerError, ProfileError, ValueError, OSError) as error:
+                print(f"ERROR: integration controller unavailable: {error}", file=sys.stderr)
+                return 1
+        else:
+            controller = None
+
+    provider_inspections = tuple(
+        replace(item, status="ready")
+        for item in planned
+        if item.status in {"installed", "updated", "unchanged"}
+    )
+    systemd_ready = bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
+    if not systemd_ready:
+        planned = [
+            replace(item, status="skipped", reason="systemd user session unavailable")
+            if item.status in {"installed", "updated", "unchanged"}
+            else item
+            for item in planned
+        ]
+
+    plan_errors: list[str] = []
+    broker_unit_path = broker_runtime.SYSTEMD_USER_DIR / "llama-broker.service"
+    broker_unit_text: str | None = None
+    broker_unit_status = "broken"
+    try:
+        template = _service_template_path()
+        if not template.is_file():
+            raise FileNotFoundError(f"service template not found: {template}")
+        broker_unit_text = template.read_text(encoding="utf-8")
+        broker_unit_text = broker_unit_text.replace("{{REPO_DIR}}", str(BROKER_DIR))
+        broker_unit_text = broker_unit_text.replace("{{USER_HOME}}", str(Path.home()))
+        broker_unit_text = broker_unit_text.replace("{{EXEC_START}}", _service_exec_start())
+        if broker_unit_path.is_file() and broker_unit_path.read_text(encoding="utf-8") == broker_unit_text:
+            broker_unit_status = "unchanged"
+        elif broker_unit_path.exists() or broker_unit_path.is_symlink():
+            broker_unit_status = "updated"
+        else:
+            broker_unit_status = "installed"
+    except OSError as error:
+        plan_errors.append(f"broker unit integration failed: {error}")
+
+    provider_manifest = filtered_manifest(payload, provider_inspections)
+    provider_status = "planned" if provider_manifest is not None else "skipped"
+    operations = [
+        {
+            "action": "profile_unit",
+            "profile_id": item.profile_id,
+            "status": item.status,
+            "reason": item.reason,
+        }
+        for item in planned
+    ]
+    operations.extend(
+        [
+            {
+                "action": "broker_unit",
+                "status": broker_unit_status,
+                "path": str(broker_unit_path),
+            },
+            {
+                "action": "client/provider",
+                "status": provider_status,
+                "profiles": sorted(valid_ids),
+            },
+        ]
+    )
+    plan_report = report_for(tuple(planned))
+    plan_report["systemd"] = "available" if systemd_ready else "unavailable"
+    plan_report["operations"] = operations
+    plan_report["broker_unit"] = broker_unit_status
+    plan_report["client_provider"] = provider_status
+    if plan_errors:
+        plan_report["errors"] = list(plan_errors)
+    apply_confirmed = not getattr(args, "dry_run", False)
+    if getattr(args, "dry_run", False):
+        print("Proposed integration plan:")
+        for operation in operations:
+            print(f"  - {operation['action']}: {operation}")
+        try:
+            answer = input("Apply this integration plan? [y/N] ").strip().casefold()
+        except EOFError:
+            answer = ""
+        if answer not in {"y", "yes"}:
+            print("Integration cancelled; no changes applied.")
+            return 0
+        apply_confirmed = True
+
+    applied_errors: list[str] = list(plan_errors)
+    if systemd_ready and getattr(args, "install_units", True) and controller is not None:
+        try:
+            controller.install_units()
+        except (BackendControllerError, OSError, ValueError) as error:
+            applied_errors.append(f"systemd unit integration failed: {error}")
+    elif not systemd_ready:
+        applied_errors.append("systemd user session unavailable; unit files were left untouched")
+    elif controller is None:
+        applied_errors.append("no profile rendered successfully; profile units were left untouched")
+
+    # The broker unit is lightweight control-plane integration.  It is written
+    # independently of profile units and never starts a backend.
+    if broker_unit_text is not None:
+        try:
+            broker_unit_path.parent.mkdir(parents=True, exist_ok=True)
+            if broker_unit_status != "unchanged":
+                _atomic_write(broker_unit_path, broker_unit_text)
+            plan_report["broker_unit"] = broker_unit_status
+        except OSError as error:
+            applied_errors.append(f"broker unit integration failed: {error}")
+
+    # Provider configuration receives a temporary filtered manifest so broken
+    # profiles never block valid providers and the temporary file is removed
+    # after the adapter run.
+    if provider_manifest is not None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="llama-broker-integrate-") as temp:
+                temp_profiles = Path(temp) / "profiles.json"
+                temp_profiles.write_text(json.dumps(provider_manifest), encoding="utf-8")
+                from .configure import main as configure_main
+
+                configure_args = ["--profiles", str(temp_profiles)]
+                if getattr(args, "set_default", False):
+                    configure_args.insert(0, "--set-default")
+                if apply_confirmed:
+                    provider_exit = configure_main(configure_args, indent=True)
+                    if provider_exit != 0:
+                        applied_errors.append(f"provider integration returned exit code {provider_exit}")
+                plan_report["client_provider"] = "applied" if not applied_errors else "partial"
+        except (OSError, ValueError, RuntimeError) as error:
+            applied_errors.append(f"provider integration failed: {error}")
+    else:
+        applied_errors.append("no verified profiles available for provider integration")
+
+    if applied_errors:
+        plan_report["errors"] = applied_errors
+    partial = bool(applied_errors) or any(
+        item.status in {"broken", "unverified", "skipped"} for item in planned
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(plan_report, indent=2, sort_keys=True))
+    else:
+        print("Integration summary:")
+        for key, value in plan_report.get("counts", {}).items():
+            if value:
+                print(f"  {key}: {value}")
+        if plan_report.get("broker_unit"):
+            print(f"  broker unit: {plan_report['broker_unit']}")
+        if plan_report.get("client_provider"):
+            print(f"  client/provider: {plan_report['client_provider']}")
+        for error in applied_errors:
+            print(f"  ERROR: {error}", file=sys.stderr)
+    return 3 if partial else 0
+
+
+def _enable_broker_startup() -> tuple[bool, str]:
+    """Enable only the lightweight control-plane unit, never a model unit."""
+
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return False, "systemd user session unavailable (DBUS_SESSION_BUS_ADDRESS is unset)"
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "enable", "llama-broker.service"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f"could not enable broker startup: {error}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "systemctl failed").strip()
+        return False, f"could not enable broker startup: {detail}"
+    return True, "broker startup enabled at user login"
+
+
+def _render_setup_plan(plan: object) -> str:
+    """Render every setup mutation that may be applied after confirmation."""
+
+    lines = ["Proposed setup plan:"]
+    operations = getattr(plan, "operations", ())
+    if not operations:
+        lines.append("  (no changes; select a runtime and model explicitly)")
+    for operation in operations:
+        action = operation.get("action", "unknown")
+        details = ", ".join(
+            f"{key}={value}"
+            for key, value in operation.items()
+            if key != "action"
+        )
+        lines.append(f"  - {action}" + (f" ({details})" if details else ""))
+    return "\n".join(lines)
+
+
+def _confirm_setup_plan(plan: object) -> bool:
+    """Ask for the final human confirmation required by setup."""
+
+    print("\n" + _render_setup_plan(plan))
+    try:
+        answer = input("\nApply this plan? [y/N] ").strip().casefold()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _cmd_setup_wizard(args: argparse.Namespace) -> int:
+    """Discover existing artifacts and apply only an explicitly reviewed plan."""
+
+    scan_paths = [Path(item).expanduser() for item in getattr(args, "scan_path", [])]
+    runtime_path = getattr(args, "runtime_path", None)
+    model_path = getattr(args, "model_path", None)
+    if runtime_path is not None:
+        scan_paths.append(Path(runtime_path).expanduser().parent)
+    if model_path is not None:
+        scan_paths.append(Path(model_path).expanduser().parent)
+    if not scan_paths:
+        scan_paths = [
+            Path.home() / "bin",
+            Path.home() / ".local" / "bin",
+            Path.home() / ".local" / "share" / "runtimes",
+            MODELS_DIR,
+        ]
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            print("Enter additional scan paths one at a time; press Enter when finished.")
+            while True:
+                try:
+                    value = input("Scan path (blank to continue): ").strip()
+                except EOFError:
+                    break
+                if not value:
+                    break
+                scan_paths.append(Path(value).expanduser())
+
+    report = discover_candidates(scan_paths)
+    if getattr(args, "check", False):
+        print(render_report(report, json_output=bool(getattr(args, "json", False))))
+        return 0
+
+    if runtime_path is None and model_path is None and sys.stdin.isatty() and sys.stdout.isatty():
+        print(render_report(report))
+        qualified = [item for item in report.runtimes if item.qualified]
+        choices = qualified or list(report.runtimes)
+        if choices:
+            for index, item in enumerate(choices, start=1):
+                label = "qualified" if item.qualified else "experimental"
+                print(f"  {index}. [{label}] {item.runtime}: {item.path}")
+            selected = input("Select runtime number (blank to cancel): ").strip()
+            if selected.isdigit() and 1 <= int(selected) <= len(choices):
+                runtime_path = choices[int(selected) - 1].path
+                if not choices[int(selected) - 1].qualified:
+                    allow = input("Use experimental runtime? [y/N] ").strip().casefold()
+                    if allow not in {"y", "yes"}:
+                        runtime_path = None
+        if report.models and runtime_path is not None:
+            for index, item in enumerate(report.models, start=1):
+                print(f"  {index}. {item.path}")
+            selected = input("Select model number (blank to cancel): ").strip()
+            if selected.isdigit() and 1 <= int(selected) <= len(report.models):
+                model_path = report.models[int(selected) - 1].path
+
+    startup = getattr(args, "enable_startup", None)
+    if startup is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            startup = input("Enable broker startup at login? [Y/n] ").strip().casefold() not in {"n", "no"}
+        else:
+            startup = True
+
+    plan = build_setup_plan(
+        report,
+        runtime_path=runtime_path,
+        model_path=model_path,
+        allow_experimental=bool(getattr(args, "allow_experimental", False)),
+        create_model_link=bool(getattr(args, "link_model", False)),
+        enable_startup=bool(startup),
+        offer_integrate=bool(getattr(args, "integrate", False)),
+    )
+    if getattr(args, "dry_run", False):
+        print(render_report(report))
+        print("\n" + _render_setup_plan(plan))
+        return 1 if plan.errors else 0
+    if plan.errors:
+        for error in plan.errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    if plan.profile_record is None:
+        print(render_report(report))
+        print("\n" + _render_setup_plan(plan))
+        print("No profile was selected. Setup never chooses a model implicitly.", file=sys.stderr)
+        return 2
+
+    if not _confirm_setup_plan(plan):
+        print("Setup cancelled; no changes applied.")
+        return 0
+
+    try:
+        applied = apply_profile_plan(
+            plan,
+            args.profiles,
+            models_dir=MODELS_DIR,
+            create_model_link=bool(getattr(args, "link_model", False)),
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"ERROR: setup apply failed: {error}", file=sys.stderr)
+        return 1
+
+    partial = False
+    startup_result = "not requested"
+    if plan.enable_startup:
+        ok, startup_result = _enable_broker_startup()
+        partial = not ok
+        print(("OK: " if ok else "PARTIAL: ") + startup_result)
+    print("Setup applied: " + ", ".join(applied.get("applied", [])))
+    if not getattr(args, "integrate", False):
+        print("Run `brokerctl integrate` to generate service/provider integration.")
+    if getattr(args, "integrate", False):
+        integration_result = _cmd_integrate(args)
+        if partial or integration_result == 3:
+            return 3
+        return integration_result
+    return 3 if partial else 0
+
+
+def _cmd_setup(args: argparse.Namespace) -> int:
+    """Regenerate units and configure providers without selecting a tool model."""
+    clean = bool(getattr(args, "clean", False))
+    if clean and not getattr(args, "install_units", True):
+        print("brokerctl setup --clean requires unit installation; remove --no-install-units", file=sys.stderr)
+        return 2
+    print("Running idempotent setup...\n")
+    errors = 0
+    registry: ProfileRegistry | None = None
+
+    # 0. Seed the default profiles path from the checked-in example when the
+    # user has not created one yet (default path only; explicit --profiles
+    # pointing at a missing file is an error).
+    if not args.profiles.exists() and args.profiles == PROFILES_PATH:
+        example = BROKER_DIR / "profiles.example.json"
+        if example.is_file():
+            try:
+                args.profiles.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(example, args.profiles)
+                print(
+                    f"  Seeded {args.profiles} from profiles.example.json "
+                    "(edit paths before loading profiles)"
+                )
+            except OSError as error:
+                print(f"  ERROR: could not seed profiles: {error}", file=sys.stderr)
+                errors += 1
+        else:
+            print(
+                "  WARN: profiles.example.json not found; skipping seed",
+                file=sys.stderr,
+            )
+
+    # 0. Ensure native llama-server credentials exist before providers are
+    # configured. The key itself is never printed; providers read it from the
+    # path-only security configuration.
+    print("[0/4] Preparing native llama-server API key...")
+    try:
+        security, _api_key = ensure_security_material()
+        _apply_setup_network_defaults(security)
+        print(f"  API-key file: {security.api_key_file}")
+        print("  Native key ready (value redacted)")
+    except (OSError, ValueError) as error:
+        print(f"  ERROR: {error}", file=sys.stderr)
+        errors += 1
+
+    # 1. Read the catalog without touching the currently selected backend.
+    print("[1/4] Reading available models (catalog-only)...")
+    try:
+        registry = ProfileRegistry.from_path(args.profiles)
+        default_id = registry.default_profile
+        print(f"  Catalog default: {default_id} (not loaded or selected)")
+        if getattr(args, "set_default", False):
+            print("  Tool default selection: explicit opt-in requested")
+        else:
+            print("  Tool defaults preserved (use --set-default to select this profile)")
+    except (ProfileError, OSError, ValueError) as e:
+        print(f"  ERROR: {e}", file=sys.stderr)
+        errors += 1
+
+    if getattr(args, "install_units", True):
+        print("  Regenerating broker-owned units...")
+        if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            print("  SKIPPED: DBUS_SESSION_BUS_ADDRESS not set")
+            print("  (run with DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus)")
+            if clean:
+                print("  ERROR: --clean requires a user systemd session", file=sys.stderr)
+                errors += 1
+        else:
+            try:
+                if registry is None:
+                    registry = ProfileRegistry.from_path(args.profiles)
+                controller = create_production_controller(registry)
+                installed = controller.install_units()
+                for profile_id, path in installed.items():
+                    print(f"  {profile_id} -> {path}")
+                if not installed:
+                    print("  (already up to date)")
+                if clean:
+                    removed = controller.cleanup_stale_units()
+                    if removed:
+                        for path in removed:
+                            print(f"  removed stale unit {path}")
+                    else:
+                        print("  no stale broker-owned units")
+            except (ProfileError, BackendControllerError, OSError, ValueError) as e:
+                print(f"  ERROR: {e}", file=sys.stderr)
+                errors += 1
+            except Exception as e:
+                print(f"  WARN: systemd units skipped ({e})")
+    else:
+        print("  Broker-owned units unchanged (--no-install-units was supplied).")
+
+    # 1.5 Render + install the broker daemon unit from the checked-in template.
+    if getattr(args, "install_units", True):
+        print("  Installing broker daemon unit...")
+        template = _service_template_path()
+        unit_text = template.read_text(encoding="utf-8")
+        unit_text = unit_text.replace("{{REPO_DIR}}", str(BROKER_DIR))
+        unit_text = unit_text.replace("{{USER_HOME}}", str(Path.home()))
+        unit_text = unit_text.replace("{{EXEC_START}}", _service_exec_start())
+        unit_path = broker_runtime.SYSTEMD_USER_DIR / "llama-broker.service"
+        try:
+            unit_path.parent.mkdir(parents=True, exist_ok=True)
+            unit_path.write_text(unit_text, encoding="utf-8")
+            print(f"  {unit_path} <- {template.name}")
+        except OSError as error:
+            print(f"  ERROR: could not write unit: {error}", file=sys.stderr)
+            errors += 1
+
+    # 2. Configure tools
+    print("\n[2/4] Configuring tools...")
+    try:
+        from .configure import main as configure_main
+        configure_args = ["--profiles", str(args.profiles)]
+        if getattr(args, "set_default", False):
+            configure_args.insert(0, "--set-default")
+        configure_exit = configure_main(configure_args, indent=True)
+        if configure_exit != 0:
+            errors += 1
+    except Exception as e:
+        print(f"  ERROR: {e}", file=sys.stderr)
+        errors += 1
+
+    # 3. Verify profiles
+    if args.verify:
+        print("\n[3/4] Verifying profiles...")
+        try:
+            if registry is None:
+                registry = ProfileRegistry.from_path(args.profiles)
+            all_failures = []
+            for profile in registry.profiles:
+                failures = _verify_profile(profile)
+                if failures:
+                    all_failures.extend(failures)
+                else:
+                    print(f"  {profile.id}: OK")
+            if all_failures:
+                for f in all_failures:
+                    print(f"  FAIL: {f}", file=sys.stderr)
+                errors += 1
+        except (ProfileError, OSError) as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            errors += 1
+    else:
+        print("\n[3/4] Verifying profiles... SKIPPED (use --verify to check)")
+
+    # 4. Create symlinks
+    print("\n[4/4] Creating symlinks...")
+    brokerctl_path = BROKER_DIR / "brokerctl.py"
+    target = BIN_DIR / "brokerctl"
+    try:
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(brokerctl_path)
+        target.chmod(0o755)
+        print(f"  {target} -> {brokerctl_path}")
+    except OSError as e:
+        print(f"  ERROR: {e}", file=sys.stderr)
+        errors += 1
+
+    print(f"\n{'Setup complete.' if errors == 0 else f'Setup finished with {errors} error(s).'}")
+    return errors
+
+
+def _apply_setup_network_defaults(security: Any) -> None:
+    """Make offline unit generation match the TLS-enabled service template."""
+
+    if getattr(security, "broker_tls_cert_file", None) is not None and not any(
+        name in os.environ for name in ("LLAMA_BROKER_HOST", "LLM_BROKER_HOST")
+    ):
+        broker_runtime.BROKER_HOST = "0.0.0.0"
+    if (
+        getattr(security, "backend_tls_cert_file", None) is not None
+        and not any(
+            name in os.environ
+            for name in (
+                "LLAMA_BROKER_BACKEND_LISTEN_HOST",
+                "LLM_BROKER_BACKEND_LISTEN_HOST",
+            )
+        )
+    ):
+        broker_runtime.BACKEND_LISTEN_HOST = "0.0.0.0"
+
+
+def _cmd_security_init(args: argparse.Namespace) -> int:
+    """Create local TLS material and the path-only security configuration."""
+
+    result = initialize_security_material(
+        ip_addresses=args.ip,
+        hostnames=args.hostname,
+        security_path=args.security_file,
+        api_key_path=args.api_key_file,
+        days=args.days,
+        force=args.force,
+    )
+    action = "created" if result.created else "already present"
+    print(f"Security material {action}.")
+    print(f"  Security config: {result.config.source_path}")
+    print(f"  API-key file:    {result.config.api_key_file}")
+    print(f"  CA certificate:  {result.config.broker_tls_ca_file}")
+    print(f"  Broker cert:     {result.config.broker_tls_cert_file}")
+    print(f"  Backend cert:    {result.config.backend_tls_cert_file}")
+    print(f"  SANs:            {', '.join(result.sans)}")
+    print(
+        "  API-key value is redacted; brokerctl setup refreshes broker-owned "
+        "provider credentials."
+    )
+    print("Next: brokerctl setup; use --no-install-units only to skip unit regeneration.")
+    return 0
+
+
+# ── Subcommand: configure ───────────────────────────────────────────────────
+
+def _cmd_configure(args: argparse.Namespace) -> int:
+    """Configure AI coding tools."""
+    from .configure import main as configure_main
+    configure_args = []
+    if args.tool_names:
+        configure_args.extend(["--tools", *args.tool_names])
+    if args.dry_run:
+        configure_args.append("--dry-run")
+    if getattr(args, "set_default", False):
+        configure_args.append("--set-default")
+    configure_args.extend(["--profiles", str(args.profiles)])
+    return configure_main(configure_args)
+
+
+# ── Subcommand: profiles list ───────────────────────────────────────────────
+
+def _cmd_profiles_list(args: argparse.Namespace) -> int:
+    """List profiles with status."""
+    registry = ProfileRegistry.from_path(args.profiles)
+    for profile in registry.profiles:
+        caps = ",".join(sorted(profile.capabilities))
+        ctx_k = profile.context_size // profile.parallel if profile.parallel else profile.context_size
+        print(f"{profile.alias:<30} role={profile.role:<12} ctx={ctx_k:<8} parallel={profile.parallel} caps=[{caps}]")
+    return 0
+
+
+def _cmd_profiles_show(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    _profile, record = _record_for_selector(registry, data, args.profile_id)
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_profiles_add_entry(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    records = data.get("profiles")
+    if not isinstance(records, list):
+        raise ProfileError("profile manifest must contain a profiles list")
+    if any(isinstance(record, dict) and record.get("id") == args.profile_id for record in records):
+        raise ProfileError(f"duplicate profile id: {args.profile_id}")
+    records.append(_build_added_profile(args, data))
+    del registry
+    return _publish_profile_change(args.profiles, data, f"Added profile {args.profile_id}")
+
+
+def _cmd_profiles_remove(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    profile, record = _record_for_selector(registry, data, args.profile_id)
+    records = data.get("profiles")
+    if not isinstance(records, list) or len(records) <= 1:
+        raise ProfileError("cannot remove the only profile in a manifest")
+    records.remove(record)
+    for other in records:
+        if isinstance(other, dict) and other.get("restore_profile") == profile.id:
+            other.pop("restore_profile", None)
+    default_changed = data.get("default_profile") == profile.id
+    if default_changed:
+        replacement = next(
+            (
+                item.get("id")
+                for item in records
+                if isinstance(item, dict) and item.get("role") == "primary"
+            ),
+            records[0].get("id") if isinstance(records[0], dict) else None,
+        )
+        if not isinstance(replacement, str) or not replacement:
+            raise ProfileError("cannot select a replacement default profile")
+        data["default_profile"] = replacement
+    suffix = " (default moved)" if default_changed else ""
+    return _publish_profile_change(args.profiles, data, f"Removed profile {profile.id}{suffix}")
+
+
+def _cmd_profiles_rename(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    profile, record = _record_for_selector(registry, data, args.profile_id)
+    new_id = args.new_id.strip()
+    if not PROFILE_ID_RE.fullmatch(new_id):
+        raise ProfileError(f"invalid profile id: {new_id!r}")
+    records = data.get("profiles")
+    if not isinstance(records, list):
+        raise ProfileError("profile manifest must contain a profiles list")
+    if new_id != profile.id and any(
+        isinstance(item, dict) and item.get("id") == new_id for item in records
+    ):
+        raise ProfileError(f"duplicate profile id: {new_id}")
+    if new_id == profile.id:
+        print("No changes.")
+        return 0
+    record["id"] = new_id
+    if data.get("default_profile") == profile.id:
+        data["default_profile"] = new_id
+    for item in records:
+        if isinstance(item, dict) and item.get("restore_profile") == profile.id:
+            item["restore_profile"] = new_id
+    return _publish_profile_change(args.profiles, data, f"Renamed profile {profile.id} to {new_id}")
+
+
+def _cmd_profiles_set(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    _profile, record = _record_for_selector(registry, data, args.profile_id)
+    before = copy.deepcopy(record)
+    _set_scalar_field(record, args.field, args.value)
+    if record == before:
+        print("No changes.")
+        return 0
+    return _publish_profile_change(
+        args.profiles, data, f"Updated {args.field} for profile {args.profile_id}"
+    )
+
+
+def _cmd_profiles_unset(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    _profile, record = _record_for_selector(registry, data, args.profile_id)
+    before = copy.deepcopy(record)
+    _remove_optional_field(record, args.field)
+    if record == before:
+        print("No changes.")
+        return 0
+    return _publish_profile_change(
+        args.profiles, data, f"Cleared {args.field} for profile {args.profile_id}"
+    )
+
+
+def _cmd_profiles_alias(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    profile, record = _record_for_selector(registry, data, args.profile_id)
+    aliases = record.setdefault("aliases", [])
+    if not isinstance(aliases, list):
+        raise ProfileError(f"aliases must be a list for {profile.id!r}")
+    alias = args.alias.strip()
+    if not alias:
+        raise ProfileError("alias must not be empty")
+    if args.alias_command == "add":
+        if any(str(item).casefold() == alias.casefold() for item in [record.get("alias"), *aliases]):
+            print("No changes.")
+            return 0
+        aliases.append(alias)
+        return _publish_profile_change(
+            args.profiles, data, f"Added alias {alias!r} to profile {profile.id}"
+        )
+    if alias.casefold() == str(record.get("alias", "")).casefold():
+        raise ProfileError("cannot remove the primary alias; set alias first")
+    kept = [item for item in aliases if str(item).casefold() != alias.casefold()]
+    if len(kept) == len(aliases):
+        raise ProfileError(f"alias not found for profile {profile.id}: {alias}")
+    record["aliases"] = kept
+    return _publish_profile_change(
+        args.profiles, data, f"Removed alias {alias!r} from profile {profile.id}"
+    )
+
+
+def _cmd_profiles_env(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    profile, record = _record_for_selector(registry, data, args.profile_id)
+    environment = record.setdefault("environment", {})
+    if not isinstance(environment, dict):
+        raise ProfileError(f"environment must be a mapping for {profile.id!r}")
+    if args.env_command == "set":
+        key, value = _parse_env_assignment(args.assignment)
+        if environment.get(key) == value:
+            print("No changes.")
+            return 0
+        environment[key] = value
+        return _publish_profile_change(
+            args.profiles, data, f"Set environment {key} for profile {profile.id}"
+        )
+    key = args.key.strip()
+    if not ENVIRONMENT_NAME_RE.fullmatch(key):
+        raise ProfileError(f"invalid environment name: {key!r}")
+    if key in REQUIRED_LLAMACPP_ENVIRONMENT and profile.runtime == "llamacpp":
+        raise ProfileError(f"cannot unset required safety environment variable: {key}")
+    if key not in environment:
+        raise ProfileError(f"environment variable not found for profile {profile.id}: {key}")
+    del environment[key]
+    return _publish_profile_change(
+        args.profiles, data, f"Unset environment {key} for profile {profile.id}"
+    )
+
+
+def _cmd_profiles_args(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    profile, record = _record_for_selector(registry, data, args.profile_id)
+    extra_args = record.setdefault("extra_args", [])
+    if not isinstance(extra_args, list):
+        raise ProfileError(f"extra_args must be a list for {profile.id!r}")
+    if args.args_command == "add":
+        values = list(args.flags)
+        if values and values[0] == "--":
+            values = values[1:]
+        if not values or any(not value for value in values):
+            raise ProfileError("args add requires at least one non-empty flag")
+        extra_args.extend(values)
+        return _publish_profile_change(
+            args.profiles, data, f"Added arguments to profile {profile.id}"
+        )
+    flag = args.flag
+    try:
+        index = extra_args.index(flag)
+    except ValueError as error:
+        raise ProfileError(f"argument not found for profile {profile.id}: {flag}") from error
+    del extra_args[index]
+    if index < len(extra_args) and not str(extra_args[index]).startswith("--"):
+        del extra_args[index]
+    return _publish_profile_change(
+        args.profiles, data, f"Removed argument {flag!r} from profile {profile.id}"
+    )
+
+
+def _cmd_profiles_set_default(args: argparse.Namespace) -> int:
+    registry, data = _load_editable_manifest(args.profiles)
+    profile, _record = _record_for_selector(registry, data, args.profile_id)
+    if data.get("default_profile") == profile.id:
+        print("No changes.")
+        return 0
+    data["default_profile"] = profile.id
+    return _publish_profile_change(args.profiles, data, f"Set default profile to {profile.id}")
+
+
+def _cmd_profiles_template(args: argparse.Namespace) -> int:
+    ProfileRegistry.from_path(args.profiles)
+    source = args.profiles.resolve()
+    destination = (BROKER_DIR / "profiles.json").resolve()
+    if source == destination:
+        raise ProfileError("authoritative manifest and repository template are the same file")
+    _atomic_write(destination, args.profiles.read_text(encoding="utf-8"))
+    print(f"Synced repository template {destination} from {source}")
+    return 0
+
+
+def _cmd_runtime_list(args: argparse.Namespace) -> int:
+    """List registered runtimes and the profiles selecting each one."""
+
+    registry = ProfileRegistry.from_path(args.profiles)
+    for runtime in list_runtimes():
+        profiles = [profile for profile in registry.profiles if profile.runtime == runtime.name]
+        binaries = list(runtime.binaries)
+        binaries.extend(
+            sorted(
+                {
+                    str(profile.server_binary)
+                    for profile in profiles
+                    if str(profile.server_binary) not in binaries
+                }
+            )
+        )
+        profile_names = ",".join(profile.id for profile in profiles) or "(none)"
+        print(
+            f"{runtime.name:<10} "
+            f"binaries=[{', '.join(binaries)}] "
+            f"capabilities=[{', '.join(runtime.capabilities)}] "
+            f"profiles=[{profile_names}]"
+        )
+    return 0
+
+
+def _configure_after_credential_change(args: argparse.Namespace) -> None:
+    """Refresh configured tools after the native key file has changed."""
+
+    from .configure import main as configure_main
+
+    result = configure_main(["--profiles", str(args.profiles)])
+    if result != 0:
+        raise BackendControllerError("tool configuration failed after credential change")
+
+
+def _cmd_credentials_rotate(args: argparse.Namespace) -> int:
+    result = _broker_admin(
+        "/admin/credentials/rotate",
+        {"replace": bool(args.replace)},
+    )
+    _configure_after_credential_change(args)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_credentials_revoke(args: argparse.Namespace) -> int:
+    result = _broker_admin(
+        "/admin/credentials/revoke",
+        {"key": args.key},
+    )
+    _configure_after_credential_change(args)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+# ── Subcommand: profiles discover ───────────────────────────────────────────
+
+def _cmd_profiles_discover(args: argparse.Namespace) -> int:
+    """Discover backends via port sweep."""
+    result = discover_backends(
+        sweep_range=args.sweep,
+        dirty_only=args.dirty_only,
+        timeout=args.timeout,
+    )
+
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "object": "discovery",
+                    "data": asdict(result),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0 if result.endpoints else 1
+
+    if not result.endpoints:
+        print("No backends discovered.")
+        if result.failed_ports:
+            print(f"Failed ports: {', '.join(map(str, result.failed_ports))}")
+        return 1
+
+    print(f"Discovered {len(result.endpoints)} backend(s) in {result.duration_ms:.0f}ms:\n")
+    for ep in result.endpoints:
+        print(f"  {ep.label}")
+        for model in ep.models:
+            ctx = f"ctx={model.context_length}" if model.context_length else ""
+            par = f"parallel={model.parallel}" if model.parallel else ""
+            slot = f"slot_ctx={model.slot_context_window}" if model.slot_context_window else ""
+            parts = " ".join(filter(None, [ctx, par, slot]))
+            print(f"    {model.id}  {parts}")
+
+    if args.save:
+        print(f"\nSaved state to port_state.json")
+
+    return 0
+
+
+# ── Subcommand: profiles edit ───────────────────────────────────────────────
+
+def _cmd_profiles_edit(args: argparse.Namespace) -> int:
+    """Open the field-oriented editor or apply a compatibility flag edit."""
+    flags = {
+        "runtime": args.runtime,
+        "context_size": args.context_size,
+        "parallel": args.parallel,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "tool_call_parser": args.tool_call_parser,
+        "tool_parser_plugin": args.tool_parser_plugin,
+        "chat_template": args.chat_template,
+        "batch_size": args.batch_size,
+        "ubatch_size": args.ubatch_size,
+        "cache_type_k": args.cache_type_k,
+        "cache_type_v": args.cache_type_v,
+        "fit": args.fit,
+        "fit_target_mib": args.fit_target_mib,
+        "fit_ctx": args.fit_ctx,
+    }
+    # If any flags were provided, skip interactive mode
+    has_flags = any(v is not None for v in flags.values())
+    if has_flags:
+        if not args.model:
+            print("profiles edit flags require a profile id or alias", file=sys.stderr)
+            return 2
+        return _interactive_edit(args.model, args.profiles, flags, flag_mode=True)
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(
+            "profiles edit requires an interactive terminal; use the field editor from a TTY "
+            "or provide explicit edit flags",
+            file=sys.stderr,
+        )
+        return 2
+
+    from .broker_tui import run_tui
+
+    def apply_callback(updated: dict[str, object], changed_ids: set[str]) -> object:
+        return _apply_profile_configuration(args.profiles, updated, changed_ids)
+
+    return run_tui(args.profiles, args.model, apply_callback=apply_callback)
+
+
+# ── Subcommand: profiles add ────────────────────────────────────────────────
+
+def _cmd_profiles_add(args: argparse.Namespace) -> int:
+    """Add a complete profile, retaining the legacy discovery-only form."""
+    if args.model is not None:
+        return _cmd_profiles_add_entry(args)
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        from .broker_tui import run_guided_wizard
+
+        def apply_callback(updated: dict[str, object], changed_ids: set[str]) -> object:
+            return _apply_profile_configuration(args.profiles, updated, changed_ids)
+
+        return run_guided_wizard(args.profiles, args.profile_id, apply_callback=apply_callback)
+    # Discover backends to find the model
+    result = discover_backends(timeout=args.timeout)
+    if not result.endpoints:
+        print("No backends discovered. Start a backend first.", file=sys.stderr)
+        return 1
+
+    # Find matching model
+    target = args.profile_id
+    found = None
+    for ep in result.endpoints:
+        for model in ep.models:
+            if model.id == target or target in model.id:
+                found = (ep, model)
+                break
+        if found:
+            break
+
+    if not found:
+        print(f"Model '{target}' not found on any discovered backend.")
+        print("Available models:")
+        for ep in result.endpoints:
+            for model in ep.models:
+                print(f"  {model.id} @ {ep.label}")
+        return 1
+
+    ep, model = found
+
+    # Check if already in profiles
+    data = json.loads(args.profiles.read_text(encoding="utf-8"))
+    for p in data.get("profiles", []):
+        if p.get("id") == model.id or p.get("alias") == model.id:
+            print(f"Profile already exists: {model.id}")
+            return 0
+
+    print(
+        "Refusing to auto-add an execution profile: discovery cannot prove the "
+        "executable/model paths, SHA-256 identities, cgroup limits, CUDA safety "
+        "environment, or native device-placement policy.",
+        file=sys.stderr,
+    )
+    print("Discovery hints (not a valid execution profile):", file=sys.stderr)
+    print(
+        json.dumps(
+            {
+                "id": model.id,
+                "alias": model.id,
+                "context_size": model.context_length,
+                "parallel": model.parallel,
+                "source": ep.label,
+            },
+            indent=2,
+        ),
+        file=sys.stderr,
+    )
+    print("Review profiles.json and add a complete pinned profile manually.", file=sys.stderr)
+    return 2
+
+
+def _restart_broker_control_plane() -> None:
+    """Restart the broker service so it reloads the authoritative manifest.
+
+    Profile units are broker-owned; restarting a profile unit directly would
+    bypass the coordinator's request leases and can strand a live request.
+    """
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", "llama-broker.service"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            env=os.environ.copy(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise BackendControllerError(f"failed to restart Llama-Broker control plane: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "systemctl returned a failure").strip()
+        raise BackendControllerError(f"Llama-Broker restart failed: {detail}")
+
+
+def _apply_profile_configuration(
+    profiles_path: Path,
+    updated_manifest: dict[str, object],
+    changed_ids: set[str],
+) -> object:
+    """Apply a wizard/TUI draft under the same lifecycle lock as model switches."""
+
+    with _operation_lock(LOCK_PATH):
+        before_registry = ProfileRegistry.from_path(profiles_path)
+        active_profile: str | None = None
+        try:
+            state = create_production_controller(before_registry).state()
+            if state.get("phase") == "active":
+                raw_active = state.get("profile")
+                active_profile = str(raw_active) if raw_active else None
+        except (BackendControllerError, OSError, KeyError):
+            # A stopped broker has no active lease; edits remain safe and units
+            # can be installed for the next controlled start.
+            active_profile = None
+
+        def install_units() -> object:
+            registry = ProfileRegistry.from_path(profiles_path)
+            return create_production_controller(registry).install_units()
+
+        try:
+            return apply_manifest_transaction(
+                profiles_path,
+                updated_manifest,
+                active_profile=active_profile,
+                install_units=install_units,
+                restart_broker=_restart_broker_control_plane,
+            )
+        except ApplyError:
+            raise
+
+
+# ── Argument parser ─────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="brokerctl",
+        description="Administrative CLI for broker-owned immutable backend profiles.",
+    )
+    parser.add_argument("--profiles", type=Path, default=PROFILES_PATH)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Existing commands
+    subparsers.add_parser("list", help="list allowlisted execution profiles; use --raw for JSON output")
+    # Add --raw flag to the list subcommand
+    list_action = subparsers._name_parser_map.get("list")
+    if list_action:
+        list_action.add_argument("--raw", action="store_true", help="output raw JSON (original default behavior)")
+        list_action.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    status = subparsers.add_parser("status", help="show durable backend state")
+    status.add_argument("-v", "--verbose", action="store_true", help="show full JSON state")
+    status.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    subparsers.add_parser("install", help="atomically install immutable profile units")
+
+    render = subparsers.add_parser("render", help="render a profile unit without installing it")
+    render.add_argument("model")
+
+    load = subparsers.add_parser("load", help="queue a model profile load")
+    load.add_argument("model")
+    load.add_argument("--raw", action="store_true", help="output raw JSON")
+    start = subparsers.add_parser("start", help="alias for load (queue a profile load)")
+    start.add_argument("model")
+    start.add_argument("--raw", action="store_true", help="output raw JSON")
+    restart = subparsers.add_parser("restart", help="reload active model or start a new one")
+    restart.add_argument("model", nargs="?")
+
+    unload = subparsers.add_parser("unload", help="unload the active model (stop the backend)")
+    unload.add_argument("--raw", action="store_true", help="output raw JSON")
+
+    verify = subparsers.add_parser("verify", help="verify pinned runtime/model/projector SHA-256")
+    verify.add_argument("model", nargs="?")
+    verify.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+
+    # Public setup is the discovery wizard.  The legacy flags remain accepted
+    # so older in-place callers can still parse their namespaces; they are not
+    # used by the wizard unless explicitly mapped by a future migration.
+    setup = subparsers.add_parser(
+        "setup",
+        help="discover existing runtimes/models and create explicitly selected profiles",
+    )
+    setup.add_argument("--scan-path", action="append", default=[], type=Path)
+    setup.add_argument("--runtime-path", "--select-runtime", dest="runtime_path", type=Path)
+    setup.add_argument("--model-path", "--select-model", dest="model_path", type=Path)
+    setup.add_argument("--allow-experimental", action="store_true")
+    setup.add_argument("--link-model", action="store_true", help="create a reversible model symlink")
+    setup.add_argument("--check", action="store_true", help="discover and report without mutating")
+    setup.add_argument("--dry-run", action="store_true", help="show the discovery/apply plan without mutating")
+    startup_group = setup.add_mutually_exclusive_group()
+    startup_group.add_argument("--enable-startup", dest="enable_startup", action="store_true")
+    startup_group.add_argument("--no-enable-startup", dest="enable_startup", action="store_false")
+    setup.set_defaults(enable_startup=None)
+    setup.add_argument("--integrate", action="store_true", help="run integrate after applying setup")
+    setup.add_argument("--verify", action="store_true", help=argparse.SUPPRESS)
+    setup.add_argument("--clean", action="store_true", help=argparse.SUPPRESS)
+    setup.add_argument("--no-install-units", dest="install_units", action="store_false", default=True, help=argparse.SUPPRESS)
+    setup.add_argument("--set-default", "--set-default-model", dest="set_default", action="store_true", help=argparse.SUPPRESS)
+
+    integrate = subparsers.add_parser(
+        "integrate",
+        help="generate service units and configure external providers for valid profiles",
+    )
+    integrate.add_argument("--dry-run", action="store_true", help="show the plan and ask before applying")
+    integrate.add_argument("--json", action="store_true", help="emit a versioned noninteractive report")
+    integrate.add_argument("--verify", action="store_true", help="verify artifact hashes before applying")
+    integrate.add_argument("--clean", action="store_true", help="remove only stale broker-owned units")
+    integrate.add_argument("--set-default", action="store_true", help="explicitly select the configured default in providers")
+
+    integrate.add_argument("--no-install-units", dest="install_units", action="store_false", default=True, help=argparse.SUPPRESS)
+
+    runtime = subparsers.add_parser("runtime", help="inspect registered serving runtimes")
+    runtime_sub = runtime.add_subparsers(dest="runtime_command", required=True)
+    runtime_sub.add_parser("list", help="list runtimes, capabilities, and profiles")
+
+    security = subparsers.add_parser(
+        "security", help="provision deployment-owned API-key and TLS material"
+    )
+    security_sub = security.add_subparsers(dest="security_command", required=True)
+    security_init = security_sub.add_parser(
+        "init", help="create a local CA and broker/backend TLS certificates"
+    )
+    security_init.add_argument(
+        "--ip",
+        "--lan-ip",
+        dest="ip",
+        action="append",
+        required=True,
+        help="LAN IP to include in the certificate SAN; repeat for multiple addresses",
+    )
+    security_init.add_argument(
+        "--hostname",
+        action="append",
+        default=[],
+        help="DNS name to include in the certificate SAN; repeat as needed",
+    )
+    security_init.add_argument(
+        "--security-file",
+        type=Path,
+        default=None,
+        help="security.json path (default: configured/default user path)",
+    )
+    security_init.add_argument(
+        "--api-key-file",
+        type=Path,
+        default=None,
+        help="native API-key path (default: configured/default user path)",
+    )
+    security_init.add_argument(
+        "--days",
+        type=int,
+        default=825,
+        help="certificate lifetime in days (default: 825)",
+    )
+    security_init.add_argument(
+        "--force",
+        action="store_true",
+        help="replace existing generated TLS material",
+    )
+
+    # New: configure
+    configure = subparsers.add_parser("configure", help="configure AI coding tools")
+    configure.add_argument(
+        "tool_names",
+        nargs="*",
+        help="tools to configure (default: all except Codex; name codex explicitly to opt in)",
+    )
+    configure.add_argument("--dry-run", action="store_true", help="preview without writing")
+    configure.add_argument(
+        "--set-default",
+        "--set-default-model",
+        dest="set_default",
+        action="store_true",
+        help="explicitly select the broker default model/provider",
+    )
+
+    credentials = subparsers.add_parser(
+        "credentials",
+        help="rotate or revoke native llama-server API keys",
+    )
+    credentials_sub = credentials.add_subparsers(
+        dest="credentials_command", required=True
+    )
+    rotate_credentials = credentials_sub.add_parser(
+        "rotate", help="generate a new key and restart the active backend"
+    )
+    rotate_credentials.add_argument(
+        "--replace",
+        action="store_true",
+        help="revoke existing keys immediately instead of retaining overlap",
+    )
+    revoke_credentials = credentials_sub.add_parser(
+        "revoke", help="revoke one native backend API key"
+    )
+    revoke_credentials.add_argument("key")
+
+    # New: profiles
+    profiles = subparsers.add_parser("profiles", help="profile manifest management")
+    profiles_sub = profiles.add_subparsers(dest="profiles_command", required=True)
+
+    profiles_sub.add_parser("list", help="list profiles with status")
+    show = profiles_sub.add_parser("show", help="show one complete profile as JSON")
+    show.add_argument("profile_id")
+
+    discover = profiles_sub.add_parser("discover", help="discover backends via port sweep")
+    discover.add_argument("--dirty-only", action="store_true", help="only recheck stale ports")
+    discover.add_argument("--sweep", help="port range to scan (e.g. 8000-12000)")
+    discover.add_argument("--timeout", type=float, default=2.0, help="probe timeout in seconds")
+    discover.add_argument("--save", action="store_true", help="persist results")
+    discover.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+
+    edit = profiles_sub.add_parser("edit", help="open the field-oriented profile editor")
+    edit.add_argument("model", nargs="?", help="profile id or alias (default: first profile)")
+    edit.add_argument("--runtime", choices=runtime_names(), help="set serving runtime")
+    edit.add_argument("--context-size", help="set context_size")
+    edit.add_argument("--parallel", help="set parallel requests")
+    edit.add_argument("--tensor-parallel-size", help="set vLLM tensor parallel size")
+    edit.add_argument("--gpu-memory-utilization", help="set vLLM GPU memory utilization")
+    edit.add_argument("--kv-cache-dtype", help="set vLLM KV cache dtype")
+    edit.add_argument("--tool-call-parser", help="set vLLM tool-call parser")
+    edit.add_argument("--tool-parser-plugin", help="set vLLM tool parser plugin")
+    edit.add_argument("--chat-template", help="set vLLM chat template")
+    edit.add_argument("--batch-size", help="set batch_size")
+    edit.add_argument("--ubatch-size", help="set micro-batch size")
+    edit.add_argument("--cache-type-k", help="set KV cache type (k)")
+    edit.add_argument("--cache-type-v", help="set KV cache type (v)")
+    edit.add_argument(
+        "--fit",
+        help="set auto-fit on, or remove all fit-family arguments with off/unset/native",
+    )
+    edit.add_argument("--fit-target-mib", help="set fit target MiB")
+    edit.add_argument("--fit-ctx", help="set fit context size")
+
+    add = profiles_sub.add_parser(
+        "add",
+        help="add a complete profile, or inspect a legacy discovered candidate",
+    )
+    add.add_argument("profile_id", help="new profile id (or legacy discovered model id)")
+    add.add_argument("--model", help="absolute local model path")
+    add.add_argument("--alias", action="append", help="profile alias; repeat for more aliases")
+    add.add_argument("--display-name", help="human-readable display name")
+    add.add_argument("--role", choices=sorted(ALLOWED_ROLES), default=None)
+    add.add_argument("--server-binary", help="absolute llama-server binary path")
+    add.add_argument("--context", type=int, help="context size")
+    add.add_argument("--parallel", type=int, help="parallel slots")
+    add.add_argument("--batch", type=int, help="batch size")
+    add.add_argument("--ubatch", type=int, help="micro-batch size")
+    add.add_argument("--cache-k", choices=CLI_CACHE_TYPES, help="K cache type")
+    add.add_argument("--cache-v", choices=CLI_CACHE_TYPES, help="V cache type")
+    add.add_argument("--flash", choices=("on", "off"), help="flash attention")
+    add.add_argument("--gpu-layers", help="all, auto, or a non-negative layer count")
+    add.add_argument("--mmproj", help="absolute vision projector path")
+    add.add_argument("--restore", help="profile id to restore after this profile")
+    add.add_argument("--env", action="append", help="environment assignment KEY=VALUE")
+    add.add_argument("--arg", dest="extra_args", action="append", help="one extra server argument")
+    add.add_argument("--timeout", type=float, default=2.0, help="probe timeout in seconds")
+
+    remove = profiles_sub.add_parser("remove", help="remove a profile by id or alias")
+    remove.add_argument("profile_id")
+
+    rename = profiles_sub.add_parser("rename", help="rename a profile id")
+    rename.add_argument("profile_id")
+    rename.add_argument("new_id")
+
+    set_field = profiles_sub.add_parser("set", help="set one scalar profile field")
+    set_field.add_argument("profile_id")
+    set_field.add_argument("field")
+    set_field.add_argument("value")
+
+    unset = profiles_sub.add_parser("unset", help="clear one optional profile field")
+    unset.add_argument("profile_id")
+    unset.add_argument("field")
+
+    alias = profiles_sub.add_parser("alias", help="manage additional aliases")
+    alias_sub = alias.add_subparsers(dest="alias_command", required=True)
+    alias_add = alias_sub.add_parser("add", help="add an alias")
+    alias_add.add_argument("profile_id")
+    alias_add.add_argument("alias")
+    alias_remove = alias_sub.add_parser("remove", help="remove an alias")
+    alias_remove.add_argument("profile_id")
+    alias_remove.add_argument("alias")
+
+    environment = profiles_sub.add_parser("env", help="manage profile environment variables")
+    env_sub = environment.add_subparsers(dest="env_command", required=True)
+    env_set = env_sub.add_parser("set", help="set KEY=VALUE")
+    env_set.add_argument("profile_id")
+    env_set.add_argument("assignment")
+    env_unset = env_sub.add_parser("unset", help="remove KEY")
+    env_unset.add_argument("profile_id")
+    env_unset.add_argument("key")
+
+    profile_args = profiles_sub.add_parser("args", help="manage extra server arguments")
+    args_sub = profile_args.add_subparsers(dest="args_command", required=True)
+    args_add = args_sub.add_parser("add", help="append one or more arguments")
+    args_add.add_argument("profile_id")
+    args_add.add_argument("flags", nargs=argparse.REMAINDER)
+    args_remove = args_sub.add_parser("remove", help="remove one argument and its value")
+    args_remove.add_argument("profile_id")
+    args_remove.add_argument("flag")
+
+    set_default = profiles_sub.add_parser("set-default", help="set the manifest default profile")
+    set_default.add_argument("profile_id")
+    profiles_sub.add_parser("template", help="sync the repository profiles.json template")
+
+    return parser
+
+
+
+# ── Subcommand: list (top-level) ───────────────────────────────────────────────
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    """List profiles with optional --raw flag.
+
+    Default: pretty-printed table (new behavior)
+    --raw: raw JSON (preserves original behavior)
+    """
+    registry = ProfileRegistry.from_path(args.profiles)
+    profiles = registry.profiles
+
+    if args.raw:
+        # Raw JSON output (preserves original default behavior)
+        print(json.dumps([_profile_payload(p) for p in profiles], indent=2))
+        return 0
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "object": "list",
+                    "data": [_profile_payload(p) for p in profiles],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    # Pretty-printed table (new default behavior)
+    if not profiles:
+        print("No profiles configured.")
+        return 0
+
+    # Build and print table with proper column widths
+    # Each column is left-aligned with no extra spaces between format specs
+    header = (
+        f"{'Alias':<25}"
+        f"{'ID':<25}"
+        f"{'Display Name':<32}"
+        f"{'Role':<12}"
+        f"{'Context':<10}"
+        f"{'Parallel':<10}"
+        f"{'Capabilities':<30}"
+    )
+    print(header)
+    print("-" * 144)
+
+    for p in profiles:
+        caps = ",".join(sorted(p.capabilities))[:27]
+        # Truncate display name if too long to prevent overflow (max 30 chars including space before ...)
+        if len(p.display_name) > 28:
+            display = p.display_name[:27] + "..."  # 27 chars + 3 dots = 30 chars
+        else:
+            display = p.display_name
+        # Build row without extra spaces between format specs
+        row = (
+            f"{p.alias:<25}"
+            f"{p.id:<25}"
+            f"{display:<32}"
+            f"{p.role:<12}"
+            f"{p.context_size:<10}"
+            f"{str(p.parallel or 1):<10}"
+            f"{caps:<30}"
+        )
+        print(row)
+
+    print(f"\nTotal: {len(profiles)} profile(s)")
+
+    return 0
+
+
+def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
+    """Print an admin response as JSON or a concise human-readable summary."""
+    if raw:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return
+
+    operation = state.get("operation")
+    if isinstance(operation, dict):
+        print(f"Request:   {operation.get('status', 'unknown')}")
+        if "target" in operation:
+            print(f"Target:    {operation['target']}")
+    print(f"Broker:    {state.get('status', 'unknown')}")
+    backend = state.get("backend")
+    if not isinstance(backend, dict):
+        print(f"Backend:   {backend if backend is not None else '(unknown)'}")
+        return
+
+    profile = backend.get("profile")
+    phase = backend.get("phase", "unknown")
+    print(f"Backend:   {profile if profile else phase}")
+    print(f"Phase:     {phase}")
+    if "ready" in backend:
+        print(f"Ready:     {'yes' if backend['ready'] else 'no'}")
+    if "generation" in backend:
+        print(f"Generation: {backend['generation']}")
+    if "host" in backend and "port" in backend:
+        print(f"Endpoint:  {backend['host']}:{backend['port']}")
+
+
+def _normalise_cli_argv(argv: list[str] | None) -> list[str] | None:
+    """Allow option-like values after repeated ``profiles add --arg`` flags."""
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    normalised: list[str] = []
+    index = 0
+    while index < len(raw):
+        token = raw[index]
+        if token == "--arg" and index + 1 < len(raw):
+            normalised.append(f"--arg={raw[index + 1]}")
+            index += 2
+            continue
+        normalised.append(token)
+        index += 1
+    return normalised
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(_normalise_cli_argv(argv))
+
+    try:
+        # New commands that don't need registry
+        if args.command == "setup":
+            return _cmd_setup_wizard(args)
+        if args.command == "integrate":
+            if args.dry_run and args.json:
+                print("integrate --dry-run is interactive and cannot be combined with --json", file=sys.stderr)
+                return 2
+            return _cmd_integrate(args)
+        if args.command == "security":
+            if args.security_command == "init":
+                return _cmd_security_init(args)
+        if args.command == "configure":
+            return _cmd_configure(args)
+        if args.command == "credentials":
+            if args.credentials_command == "rotate":
+                return _cmd_credentials_rotate(args)
+            if args.credentials_command == "revoke":
+                return _cmd_credentials_revoke(args)
+        if args.command == "runtime" and args.runtime_command == "list":
+            return _cmd_runtime_list(args)
+        if args.command == "profiles":
+            if args.profiles_command == "list":
+                return _cmd_profiles_list(args)
+            if args.profiles_command == "show":
+                return _cmd_profiles_show(args)
+            if args.profiles_command == "discover":
+                return _cmd_profiles_discover(args)
+            if args.profiles_command == "edit":
+                return _cmd_profiles_edit(args)
+            if args.profiles_command == "add":
+                return _cmd_profiles_add(args)
+            if args.profiles_command == "remove":
+                return _cmd_profiles_remove(args)
+            if args.profiles_command == "rename":
+                return _cmd_profiles_rename(args)
+            if args.profiles_command == "set":
+                return _cmd_profiles_set(args)
+            if args.profiles_command == "unset":
+                return _cmd_profiles_unset(args)
+            if args.profiles_command == "alias":
+                return _cmd_profiles_alias(args)
+            if args.profiles_command == "env":
+                return _cmd_profiles_env(args)
+            if args.profiles_command == "args":
+                return _cmd_profiles_args(args)
+            if args.profiles_command == "set-default":
+                return _cmd_profiles_set_default(args)
+            if args.profiles_command == "template":
+                return _cmd_profiles_template(args)
+
+        # Original commands
+        registry = ProfileRegistry.from_path(args.profiles)
+        controller = create_production_controller(registry)
+
+        if args.command == "list":
+            # Use _cmd_list with --raw flag support
+            return _cmd_list(args)
+        if args.command == "status":
+            state = controller.state()
+            phase = state.get("phase", "unknown")
+            profile_id = state.get("profile")
+            # Durable state is useful when the broker is stopped, but the live
+            # health snapshot is the source of truth for leases and transitions
+            # only when the private backend is reachable.
+            backend_parts = urlsplit(effective_backend_url(load_security_config()))
+            backend_host = backend_parts.hostname or "127.0.0.1"
+            backend_port = backend_parts.port or 10000
+            backend_ready = backend_endpoint_ready(
+                backend_host, backend_port, timeout=0.25
+            )
+            live_state: dict[str, object] = {}
+            try:
+                live_state = _broker_admin_get("/admin/status")
+            except BackendControllerError:
+                pass
+            live_backend = live_state.get("backend")
+            if isinstance(live_backend, dict) and backend_ready:
+                profile_id = live_backend.get("profile", profile_id)
+                phase = live_backend.get("phase", phase)
+                if "ready" in live_backend:
+                    backend_ready = bool(live_backend["ready"])
+            stale_active = phase == "active" and not backend_ready
+
+            if getattr(args, "json", False):
+                detail = dict(state)
+                detail["schema_version"] = 1
+                detail["observed_phase"] = "stale" if stale_active else phase
+                detail["backend_ready"] = backend_ready
+                if live_state:
+                    detail["live"] = live_state
+                print(json.dumps(detail, indent=2, sort_keys=True))
+                return 1 if stale_active or phase not in {"active", "inactive"} else 0
+
+            # Broker status
+            observed_phase = "stale" if stale_active else phase
+            broker_health = live_state.get("status", "unavailable")
+            print(f"Broker:    {observed_phase} (port 11434; health: {broker_health})")
+
+            # Backend status
+            if stale_active:
+                print(
+                    f"Backend:   unavailable (persisted profile: {profile_id}; "
+                    f"{backend_host}:{backend_port} is not accepting connections)"
+                )
+            elif profile_id and phase == "active":
+                profile = registry.try_resolve(str(profile_id))
+                display = profile.display_name if profile else profile_id
+                print(f"Model:     {profile_id} ({display})")
+                if profile is not None:
+                    runtime_info = get_runtime_info(profile.runtime)
+                    binary = profile.server_binary or runtime_info.binaries[0]
+                    print(f"Backend:   {runtime_info.name} ({binary})")
+                    print(f"Context:   {profile.context_size:,} tokens total; {profile.context_size // profile.parallel:,} per slot")
+                    leases = live_state.get("leases")
+                    leases = leases if isinstance(leases, dict) else {}
+                    active = int(leases.get("active_requests", 0) or 0)
+                    pending = int(leases.get("pending_requests", 0) or 0)
+                    pending_transitions = int(leases.get("queued_transitions", 0) or 0)
+                    utilisation = min(active / profile.parallel, 1.0) if profile.parallel else 0.0
+                    print(f"Requests:  active={active} pending={pending} (pending transitions={pending_transitions})")
+                    print(f"Slots:     {active}/{profile.parallel} in use ({utilisation:.0%})")
+                else:
+                    print("Backend:   (unknown)")
+                print(f"Port:      {backend_port}")
+
+                # Check alias symlink
+                alias_path = Path.home() / ".config/systemd/user/llama-server.service"
+                if alias_path.is_symlink():
+                    target = alias_path.readlink().name
+                    print(f"Alias:     llama-server.service -> {target}")
+            elif phase == "inactive":
+                print("Backend:   (none)")
+            else:
+                print(f"Backend:   {phase}")
+
+            # JSON detail if requested. Include the live snapshot when one was
+            # available so scripts can consume the same context shown above.
+            if args.verbose:
+                detail = dict(state)
+                if live_state:
+                    detail["live"] = live_state
+                print("\n" + json.dumps(detail, indent=2, sort_keys=True))
+            return 1 if stale_active or phase not in {"active", "inactive"} else 0
+        if args.command == "render":
+            profile = registry.resolve(args.model)
+            print(controller.render_unit(profile.id), end="")
+            return 0
+        if args.command == "install":
+            with _operation_lock(LOCK_PATH):
+                installed = controller.install_units()
+            for profile_id, path in installed.items():
+                print(f"{profile_id}\t{path}")
+            return 0
+        if args.command in ("load", "start", "restart"):
+            if args.command == "restart":
+                payload = (
+                    {}
+                    if args.model is None
+                    else {"model": registry.resolve(args.model).id}
+                )
+                state = _broker_admin("/admin/restart", payload)
+                print(json.dumps(state, indent=2, sort_keys=True))
+                return 0
+            profile = registry.resolve(args.model)
+            state = _broker_admin(
+                "/admin/switch",
+                {"model": profile.id, "wait": False},
+            )
+            _print_admin_state(state, raw=args.raw)
+            return 0
+        if args.command == "unload":
+            state = _broker_admin("/admin/stop", {})
+            _print_admin_state(state, raw=args.raw)
+            return 0
+        if args.command == "verify":
+            profiles = (
+                [registry.resolve(args.model)] if args.model else list(registry.profiles)
+            )
+            failures: list[str] = []
+            results: list[dict[str, object]] = []
+            for profile in profiles:
+                profile_failures = _verify_profile(profile)
+                failures.extend(profile_failures)
+                results.append(
+                    {
+                        "id": profile.id,
+                        "status": "ok" if not profile_failures else "unverified",
+                        "errors": profile_failures,
+                    }
+                )
+                if not profile_failures and not getattr(args, "json", False):
+                    print(f"verified: {profile.id}")
+            if getattr(args, "json", False):
+                print(
+                    json.dumps(
+                        {"schema_version": 1, "profiles": results},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            if failures:
+                if not getattr(args, "json", False):
+                    print("\n".join(failures), file=sys.stderr)
+                return 1
+            return 0
+
+    except (ProfileError, ApplyError, BackendControllerError, OSError, ValueError) as error:
+        print(f"brokerctl: {error}", file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

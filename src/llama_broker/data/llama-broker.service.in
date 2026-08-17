@@ -1,0 +1,41 @@
+# Llama Broker systemd user unit template
+# Rendered into ~/.config/systemd/user/llama-broker.service.
+
+[Unit]
+Description=Llama Broker control plane
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory={{REPO_DIR}}
+Environment=HOME={{USER_HOME}}
+Environment=PYTHONUNBUFFERED=1
+Environment=LLAMA_BROKER_HOST=127.0.0.1
+Environment=LLAMA_BROKER_PORT=11434
+Environment=LLAMA_BROKER_BACKEND_URL=https://127.0.0.1:10000
+Environment=LLAMA_BROKER_BACKEND_LISTEN_HOST=127.0.0.1
+Environment=LLAMA_BROKER_BACKEND_LISTEN_PORT=10000
+Environment=LLAMA_BROKER_SECURITY_FILE={{USER_HOME}}/.config/llama-broker/security.json
+Environment=LLAMA_BROKER_MAX_WORKERS=2
+Environment=LLAMA_BROKER_CONTROL_WORKERS=2
+Environment=LLAMA_BROKER_CONTROL_CLIENT_TIMEOUT=2
+Environment=LLAMA_BROKER_DRAIN_TIMEOUT=10
+Environment=LLAMA_BROKER_TRANSITION_TIMEOUT=360
+Environment=LLAMA_BROKER_STOP_TIMEOUT=90
+Environment=LLAMA_BROKER_MAX_BODY_BYTES=33554432
+Environment=LLAMA_BROKER_MAX_OUTPUT_TOKENS=16384
+ExecStart={{EXEC_START}}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=600
+KillSignal=SIGTERM
+KillMode=mixed
+SendSIGKILL=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

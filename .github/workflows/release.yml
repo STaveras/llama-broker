@@ -1,0 +1,10 @@
+name: Retrospective checkpoint (notes only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  notes-only:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Retrospective source checkpoint; no package publication workflow.'
