@@ -38,7 +38,6 @@ class IntegrationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "default_profile": plan.profile_record["id"],
                         "profiles": [plan.profile_record],
                     }
                 ),
@@ -82,7 +81,6 @@ class IntegrationTests(unittest.TestCase):
             )
             manifest = {
                 "schema_version": 1,
-                "default_profile": plan.profile_record["id"],
                 "profiles": [plan.profile_record, {"id": "broken"}],
             }
             path = root / "profiles.json"
@@ -114,7 +112,6 @@ class IntegrationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "default_profile": "child",
                         "profiles": [parent, child],
                     }
                 ),
@@ -142,7 +139,6 @@ class IntegrationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "default_profile": plan.profile_record["id"],
                         "profiles": [plan.profile_record],
                     }
                 ),
@@ -167,7 +163,6 @@ class IntegrationTests(unittest.TestCase):
                 json=True,
                 full_verify=False,
                 clean=False,
-                set_default=False,
                 install_units=True,
                 tool_names=(),
             )
@@ -198,7 +193,6 @@ class IntegrationTests(unittest.TestCase):
             profiles=Path("/tmp/profiles.json"),
             integrate_command="configure",
             dry_run=True,
-            set_default=True,
             tool_names=["codex"],
         )
         with patch("llama_broker.configure.main", return_value=0) as configure_main:
@@ -210,7 +204,6 @@ class IntegrationTests(unittest.TestCase):
                 "--tools",
                 "codex",
                 "--dry-run",
-                "--set-default",
                 "--profiles",
                 "/tmp/profiles.json",
             ]
@@ -231,7 +224,6 @@ class IntegrationTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "default_profile": plan.profile_record["id"],
                         "profiles": [plan.profile_record, {"id": "broken"}],
                     }
                 ),
@@ -255,7 +247,6 @@ class IntegrationTests(unittest.TestCase):
                 json=True,
                 full_verify=True,
                 clean=False,
-                set_default=False,
                 yes=False,
                 install_units=True,
             )

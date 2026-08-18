@@ -88,8 +88,4 @@ def filtered_manifest(payload: dict[str, Any], inspections: tuple[ProfileInspect
     records = [item.record for item in inspections if item.status == "ready" and item.record is not None]
     if not records:
         return None
-    selected = {str(record.get("id")) for record in records}
-    default = str(payload.get("default_profile", ""))
-    if default not in selected:
-        default = str(records[0]["id"])
-    return {"schema_version": 1, "default_profile": default, "profiles": records}
+    return {"schema_version": 1, "profiles": records}

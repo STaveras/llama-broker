@@ -28,7 +28,7 @@ class HermesProvider(ToolProvider):
         self,
         registry: ToolRegistry,
         dry_run: bool = False,
-        set_default: bool = False,
+        model: str | None = None,
     ) -> ConfigureResult:
         config_path = self.config_path
         if not config_path.is_file():
@@ -52,8 +52,8 @@ class HermesProvider(ToolProvider):
         elif field_status == "updated":
             changes.append("base_url: updated for llama-broker provider")
 
-        if set_default and registry.default_model:
-            default_model = registry.default_model
+        if model:
+            default_model = model
             for field, value in (
                 ("default", default_model),
                 ("provider", "llama-broker"),
@@ -68,7 +68,7 @@ class HermesProvider(ToolProvider):
                 default_model,
             )
             if provider_status in {"added", "updated"}:
-                changes.append("llama-broker.default_model: selected manifest default")
+                changes.append("llama-broker.default_model: selected explicit broker model")
 
         if registry.api_key:
             content, field_status = self._set_provider_field(

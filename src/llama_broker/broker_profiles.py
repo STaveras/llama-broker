@@ -470,6 +470,18 @@ class Profile:
         return self.role == "transient"
 
     @property
+    def slot_context_window(self) -> int:
+        """Return the context window available to one parallel slot."""
+
+        return self.context_size // self.parallel
+
+    @property
+    def default_max_output_tokens(self) -> int:
+        """Return the swarm-friendly inverse-scaled output budget."""
+
+        return max(1, self.slot_context_window // (self.parallel**2))
+
+    @property
     def args(self) -> tuple[str, ...]:
         """Controller-compatible arguments excluding controller-owned model/alias."""
         args = self.server_args(host="127.0.0.1", port=10000)
@@ -493,10 +505,8 @@ class Profile:
 
 
 class ProfileRegistry:
-    def __init__(self, profiles: tuple[Profile, ...], default_profile: str):
+    def __init__(self, profiles: tuple[Profile, ...]):
         by_id = {profile.id: profile for profile in profiles}
-        if default_profile not in by_id:
-            raise ProfileError(f"default_profile does not exist: {default_profile}")
 
         aliases: dict[str, Profile] = {}
         for profile in profiles:
@@ -519,7 +529,6 @@ class ProfileRegistry:
         self._profiles = profiles
         self._by_id = MappingProxyType(by_id)
         self._by_alias = MappingProxyType(aliases)
-        self.default_profile = default_profile
 
     @classmethod
     def from_path(cls, path: Path | str) -> "ProfileRegistry":
@@ -542,8 +551,7 @@ class ProfileRegistry:
         ids = [profile.id for profile in profiles]
         if len(ids) != len(set(ids)):
             raise ProfileError("duplicate profile id")
-        default_profile = str(payload.get("default_profile", "")).strip()
-        return cls(profiles, default_profile)
+        return cls(profiles)
 
     @property
     def profiles(self) -> tuple[Profile, ...]:

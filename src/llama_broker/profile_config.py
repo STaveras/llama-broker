@@ -105,8 +105,7 @@ class ApplyResult:
 
 def _legacy_manifest_candidate(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     profiles = payload.get("profiles")
-    default_profile = payload.get("default_profile")
-    if not isinstance(profiles, list) or not profiles or not isinstance(default_profile, str):
+    if not isinstance(profiles, list) or not profiles:
         return None
     ids: set[str] = set()
     for record in profiles:
@@ -121,10 +120,9 @@ def _legacy_manifest_candidate(payload: Mapping[str, Any]) -> dict[str, Any] | N
         for field in ("alias", "server_binary", "model_path", "server_sha256", "model_sha256"):
             if not record.get(field):
                 return None
-    if default_profile not in ids:
-        return None
     migrated = copy.deepcopy(dict(payload))
     migrated["schema_version"] = 1
+    migrated.pop("default_profile", None)
     return migrated
 
 
@@ -162,6 +160,8 @@ def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
         except Exception as error:
             raise ProfileError(f"profile manifest migration failed: {error}") from error
         payload = migrated
+    payload = copy.deepcopy(payload)
+    payload.pop("default_profile", None)
     return manifest_path, payload
 
 

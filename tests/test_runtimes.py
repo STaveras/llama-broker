@@ -80,7 +80,7 @@ class RuntimeDispatchTests(unittest.TestCase):
         path = self.root / "profiles.json"
         path.write_text(
             json.dumps(
-                {"schema_version": 1, "default_profile": profiles[0]["id"], "profiles": profiles},
+                {"schema_version": 1, "profiles": profiles},
                 indent=2,
             )
             + "\n",

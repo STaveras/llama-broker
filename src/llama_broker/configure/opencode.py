@@ -25,7 +25,7 @@ class OpenCodeProvider(ToolProvider):
         self,
         registry: ToolRegistry,
         dry_run: bool = False,
-        set_default: bool = False,
+        model: str | None = None,
     ) -> ConfigureResult:
         config_path = self.config_path
         if not config_path.is_file():
@@ -82,16 +82,16 @@ class OpenCodeProvider(ToolProvider):
                 }
                 changes.append(f"Added model: {alias}")
             else:
-                model = provider["models"][alias]
-                old_ctx = model.get("options", {}).get("num_ctx")
+                model_entry = provider["models"][alias]
+                old_ctx = model_entry.get("options", {}).get("num_ctx")
                 if old_ctx != slot_ctx:
-                    if "options" not in model:
-                        model["options"] = {}
-                    model["options"]["num_ctx"] = slot_ctx
+                    if "options" not in model_entry:
+                        model_entry["options"] = {}
+                    model_entry["options"]["num_ctx"] = slot_ctx
                     changes.append(f"{alias}: num_ctx {old_ctx} -> {slot_ctx}")
 
-        if set_default and registry.default_model:
-            selected = f"llamacpp/{registry.default_model}"
+        if model:
+            selected = f"llamacpp/{model}"
             if data.get("model") != selected:
                 data["model"] = selected
                 changes.append(f"model: selected {selected}")

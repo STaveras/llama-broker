@@ -109,6 +109,24 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.safety.admission.min_total_vram_mib, 12_000)
         self.assertEqual(profile.safety.admission.post_ready_min_free_vram_mib, 3_072)
 
+    def test_output_budget_scales_inverse_cubically_with_parallel_slots(self) -> None:
+        profile = ProfileRegistry.from_path(
+            self._write(
+                [
+                    self._profile(
+                        "main",
+                        "main-27b",
+                        self.main_model,
+                        context_size=262_144,
+                        parallel=2,
+                    )
+                ]
+            )
+        ).get("main")
+
+        self.assertEqual(profile.slot_context_window, 131_072)
+        self.assertEqual(profile.default_max_output_tokens, 32_768)
+
     def test_service_swap_budget_cannot_exceed_memory_budget(self) -> None:
         profile = self._profile("main", "main-27b", self.main_model)
         safety = dict(profile["safety"])  # type: ignore[arg-type]
@@ -182,7 +200,7 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertNotIn("--ctx-checkpoints", args)
 
         explicit_off = self._profile("off", "off", self.main_model, fit=False)
-        off_args = ProfileRegistry.from_path(self._write([explicit_off], default="off")).get(
+        off_args = ProfileRegistry.from_path(self._write([explicit_off])).get(
             "off"
         ).server_args(host="127.0.0.1", port=10000)
         self.assertNotIn("--fit", off_args)
@@ -197,7 +215,7 @@ class ProfileRegistryTests(unittest.TestCase):
         )
         text_profile = self._profile("text", "text", self.vision_model)
         registry = ProfileRegistry.from_path(
-            self._write([tool_profile, text_profile], default="tools")
+            self._write([tool_profile, text_profile])
         )
 
         tool_args = registry.get("tools").server_args(host="127.0.0.1", port=10000)
@@ -295,7 +313,7 @@ class ProfileRegistryTests(unittest.TestCase):
             capabilities=["text", "vision"],
             native_vision=True,
         )
-        parsed = ProfileRegistry.from_path(self._write([profile], default="gemma4")).get("gemma4")
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("gemma4")
         args = parsed.server_args(host="127.0.0.1", port=10000)
 
         self.assertTrue(parsed.native_vision)
@@ -396,13 +414,12 @@ class ProfileRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "min_free_vram_before_start_mib"):
             ProfileRegistry.from_path(self._write([profile]))
 
-    def _write(self, profiles: list[dict[str, object]], default: str = "main") -> Path:
+    def _write(self, profiles: list[dict[str, object]]) -> Path:
         path = self.root / "profiles.json"
         path.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
-                    "default_profile": default,
                     "profiles": profiles,
                 }
             ),
@@ -556,7 +573,7 @@ class ProfileRegistryTests(unittest.TestCase):
             mmproj_sha256="3" * 64,
         )
         with self.assertRaisesRegex(ProfileError, "mmproj"):
-            ProfileRegistry.from_path(self._write([vision], default="vision"))
+            ProfileRegistry.from_path(self._write([vision]))
 
     def test_fit_target_is_bounded_before_reaching_native_argument_parser(self) -> None:
         profile = self._profile(
@@ -595,12 +612,12 @@ class ProfileRegistryTests(unittest.TestCase):
             cache_type_v="kvarn4",
         )
         with self.assertRaisesRegex(ProfileError, "LLAMA_KVARN_MULTI_STREAM=1"):
-            ProfileRegistry.from_path(self._write([profile], default="kvarn"))
+            ProfileRegistry.from_path(self._write([profile]))
 
         environment = dict(profile["environment"])  # type: ignore[arg-type]
         environment["LLAMA_KVARN_MULTI_STREAM"] = "1"
         profile["environment"] = environment
-        parsed = ProfileRegistry.from_path(self._write([profile], default="kvarn")).get("kvarn")
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("kvarn")
         self.assertEqual(parsed.parallel, 2)
         self.assertEqual(parsed.environment["LLAMA_KVARN_MULTI_STREAM"], "1")
 

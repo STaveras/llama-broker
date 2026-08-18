@@ -173,7 +173,6 @@ class SetupWizardTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "default_profile": "base",
                         "profiles": [base, child],
                     }
                 ),

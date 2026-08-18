@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "default_profile": "fixture-text-7b",
   "profiles": [
     {
       "id": "fixture-text-7b",

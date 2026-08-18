@@ -686,8 +686,8 @@ def _cmd_integrate_configure(args: argparse.Namespace) -> int:
         configure_args.extend(["--tools", *args.tool_names])
     if getattr(args, "dry_run", False):
         configure_args.append("--dry-run")
-    if getattr(args, "set_default", False):
-        configure_args.append("--set-default")
+    if getattr(args, "model", None):
+        configure_args.extend(["--model", args.model])
     configure_args.extend(["--profiles", str(args.profiles)])
     return configure_main(configure_args)
 
@@ -739,10 +739,7 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             for item in ready
             if item.profile is not None and item.profile.id in profile_ids
         )
-        default_profile = str(payload.get("default_profile", ""))
-        if default_profile not in profile_ids:
-            default_profile = profiles[0].id
-        return ProfileRegistry(profiles, default_profile)
+        return ProfileRegistry(profiles)
 
     planned = list(inspections)
     controller = None
@@ -920,8 +917,8 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
                 tool_names = list(getattr(args, "tool_names", ()))
                 if tool_names:
                     configure_args[0:0] = ["--tools", *tool_names]
-                if getattr(args, "set_default", False):
-                    configure_args.insert(0, "--set-default")
+                if getattr(args, "model", None):
+                    configure_args.extend(["--model", args.model])
                 if apply_confirmed:
                     provider_exit = configure_main(configure_args, indent=True)
                     if provider_exit != 0:
@@ -1169,12 +1166,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     print("[1/4] Reading available models (catalog-only)...")
     try:
         registry = ProfileRegistry.from_path(args.profiles)
-        default_id = registry.default_profile
-        print(f"  Catalog default: {default_id} (not loaded or selected)")
-        if getattr(args, "set_default", False):
-            print("  Tool default selection: explicit opt-in requested")
-        else:
-            print("  Tool defaults preserved (use --set-default to select this profile)")
+        print(f"  Catalog profiles: {len(registry.profiles)} (none selected implicitly)")
     except (ProfileError, OSError, ValueError) as e:
         print(f"  ERROR: {e}", file=sys.stderr)
         errors += 1
@@ -1234,8 +1226,6 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     try:
         from .configure import main as configure_main
         configure_args = ["--profiles", str(args.profiles)]
-        if getattr(args, "set_default", False):
-            configure_args.insert(0, "--set-default")
         configure_exit = configure_main(configure_args, indent=True)
         if configure_exit != 0:
             errors += 1
@@ -1444,21 +1434,7 @@ def _cmd_profiles_remove(args: argparse.Namespace) -> int:
     for other in records:
         if isinstance(other, dict) and other.get("restore_profile") == profile.id:
             other.pop("restore_profile", None)
-    default_changed = data.get("default_profile") == profile.id
-    if default_changed:
-        replacement = next(
-            (
-                item.get("id")
-                for item in records
-                if isinstance(item, dict) and item.get("role") == "primary"
-            ),
-            records[0].get("id") if isinstance(records[0], dict) else None,
-        )
-        if not isinstance(replacement, str) or not replacement:
-            raise ProfileError("cannot select a replacement default profile")
-        data["default_profile"] = replacement
-    suffix = " (default moved)" if default_changed else ""
-    return _publish_profile_change(args.profiles, data, f"Removed profile {profile.id}{suffix}")
+    return _publish_profile_change(args.profiles, data, f"Removed profile {profile.id}")
 
 
 def _cmd_profiles_rename(args: argparse.Namespace) -> int:
@@ -1478,8 +1454,6 @@ def _cmd_profiles_rename(args: argparse.Namespace) -> int:
         print("No changes.")
         return 0
     record["id"] = new_id
-    if data.get("default_profile") == profile.id:
-        data["default_profile"] = new_id
     for item in records:
         if isinstance(item, dict) and item.get("restore_profile") == profile.id:
             item["restore_profile"] = new_id
@@ -1595,16 +1569,6 @@ def _cmd_profiles_args(args: argparse.Namespace) -> int:
     return _publish_profile_change(
         args.profiles, data, f"Removed argument {flag!r} from profile {profile.id}"
     )
-
-
-def _cmd_profiles_set_default(args: argparse.Namespace) -> int:
-    registry, data = _load_editable_manifest(args.profiles)
-    profile, _record = _record_for_selector(registry, data, args.profile_id)
-    if data.get("default_profile") == profile.id:
-        print("No changes.")
-        return 0
-    data["default_profile"] = profile.id
-    return _publish_profile_change(args.profiles, data, f"Set default profile to {profile.id}")
 
 
 def _cmd_profiles_template(args: argparse.Namespace) -> int:
@@ -1935,7 +1899,6 @@ def _add_integrate_options(
     *,
     nested: bool = False,
     allow_clean: bool = True,
-    allow_set_default: bool = True,
     allow_install_units: bool = True,
 ) -> None:
     """Add integration options to the combined and explicit integration modes."""
@@ -1953,13 +1916,6 @@ def _add_integrate_options(
     )
     if allow_clean:
         parser.add_argument("--clean", action="store_true", default=default, help="remove only stale broker-owned units")
-    if allow_set_default:
-        parser.add_argument(
-            "--set-default",
-            action="store_true",
-            default=default,
-            help="explicitly select the configured default in providers",
-        )
     if allow_install_units:
         parser.add_argument(
             "--no-install-units",
@@ -2008,9 +1964,8 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("model", nargs="?")
     verify.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
 
-    # Public setup is the discovery wizard.  The legacy flags remain accepted
-    # so older in-place callers can still parse their namespaces; they are not
-    # used by the wizard unless explicitly mapped by a future migration.
+    # Public setup is the discovery wizard. It never selects a runtime profile
+    # implicitly.
     setup = subparsers.add_parser(
         "setup",
         help="discover existing runtimes/models and create explicitly selected profiles",
@@ -2030,13 +1985,17 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--verify", action="store_true", help=argparse.SUPPRESS)
     setup.add_argument("--clean", action="store_true", help=argparse.SUPPRESS)
     setup.add_argument("--no-install-units", dest="install_units", action="store_false", default=True, help=argparse.SUPPRESS)
-    setup.add_argument("--set-default", "--set-default-model", dest="set_default", action="store_true", help=argparse.SUPPRESS)
+
 
     integrate = subparsers.add_parser(
         "integrate",
         help="install broker units and configure external providers",
     )
     _add_integrate_options(integrate)
+    integrate.add_argument(
+        "--model",
+        help="explicitly select this broker profile alias for configured tools",
+    )
     integrate_sub = integrate.add_subparsers(dest="integrate_command")
 
     integrate_install = integrate_sub.add_parser(
@@ -2045,7 +2004,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_integrate_options(
         integrate_install,
         nested=True,
-        allow_set_default=False,
     )
 
     integrate_configure = integrate_sub.add_parser(
@@ -2058,11 +2016,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     integrate_configure.add_argument("--dry-run", action="store_true", help="preview without writing")
     integrate_configure.add_argument(
-        "--set-default",
-        "--set-default-model",
-        dest="set_default",
-        action="store_true",
-        help="explicitly select the broker default model/provider",
+        "--model",
+        help="explicitly select this broker profile alias for configured tools",
     )
 
     runtime = subparsers.add_parser("runtime", help="inspect registered serving runtimes")
@@ -2234,8 +2189,6 @@ def build_parser() -> argparse.ArgumentParser:
     args_remove.add_argument("profile_id")
     args_remove.add_argument("flag")
 
-    set_default = profiles_sub.add_parser("set-default", help="set the manifest default profile")
-    set_default.add_argument("profile_id")
     profiles_sub.add_parser("template", help="sync the repository profiles.json template")
 
     return parser
@@ -2336,8 +2289,6 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_profiles_env(args)
             if args.profiles_command == "args":
                 return _cmd_profiles_args(args)
-            if args.profiles_command == "set-default":
-                return _cmd_profiles_set_default(args)
             if args.profiles_command == "template":
                 return _cmd_profiles_template(args)
 

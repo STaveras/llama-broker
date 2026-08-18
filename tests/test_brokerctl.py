@@ -340,10 +340,9 @@ class BrokerctlSetupTests(unittest.TestCase):
             .parse_args(["setup", "--no-install-units"])
             .install_units
         )
-        self.assertFalse(brokerctl.build_parser().parse_args(["setup"]).set_default)
-        self.assertTrue(
-            brokerctl.build_parser().parse_args(["setup", "--set-default"]).set_default
-        )
+        self.assertFalse(hasattr(brokerctl.build_parser().parse_args(["setup"]), "set_default"))
+        with self.assertRaises(SystemExit):
+            brokerctl.build_parser().parse_args(["setup", "--set-default"])
 
     def test_interactive_setup_does_not_expose_json(self) -> None:
         with self.assertRaises(SystemExit) as raised:
@@ -363,7 +362,6 @@ class BrokerctlSetupTests(unittest.TestCase):
             profiles=Path("profiles.json"),
             verify=False,
             install_units=True,
-            set_default=False,
             clean=True,
         )
         with tempfile.TemporaryDirectory() as tempdir:
@@ -375,7 +373,7 @@ class BrokerctlSetupTests(unittest.TestCase):
                 patch.object(
                     brokerctl.ProfileRegistry,
                     "from_path",
-                    return_value=SimpleNamespace(profiles=(), default_profile="main"),
+                    return_value=SimpleNamespace(profiles=()),
                 ),
                 patch.object(brokerctl, "create_production_controller", return_value=controller),
                 patch.object(
@@ -424,7 +422,6 @@ class BrokerctlSetupTests(unittest.TestCase):
                     "from_path",
                     return_value=SimpleNamespace(
                         profiles=(profile,),
-                        default_profile="main",
                     ),
                 ),
                 patch.object(brokerctl, "create_production_controller", return_value=controller),
@@ -477,7 +474,7 @@ class BrokerctlSetupTests(unittest.TestCase):
                     brokerctl.os.environ,
                     {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"},
                 ),
-                patch.object(brokerctl.ProfileRegistry, "from_path", return_value=SimpleNamespace(profiles=(), default_profile="main")),
+                patch.object(brokerctl.ProfileRegistry, "from_path", return_value=SimpleNamespace(profiles=())),
                 patch.object(brokerctl, "create_production_controller", return_value=controller),
                 patch.object(
                     brokerctl,
@@ -515,7 +512,7 @@ class BrokerctlSetupTests(unittest.TestCase):
                     brokerctl.ProfileRegistry,
                     "from_path",
                     return_value=SimpleNamespace(
-                        profiles=(), default_profile="main"
+                        profiles=(),
                     ),
                 ),
                 patch.object(
@@ -537,19 +534,19 @@ class BrokerctlSetupTests(unittest.TestCase):
         self.assertEqual(result, 0)
         controller.install_units.assert_not_called()
 
-    def test_setup_passes_default_selection_only_when_requested(self) -> None:
+    def test_setup_does_not_select_a_profile(self) -> None:
         args = SimpleNamespace(
             profiles=Path("profiles.json"),
             verify=False,
             install_units=False,
-            set_default=True,
+
         )
         with tempfile.TemporaryDirectory() as tempdir:
             with (
                 patch.object(
                     brokerctl.ProfileRegistry,
                     "from_path",
-                    return_value=SimpleNamespace(profiles=(), default_profile="main"),
+                    return_value=SimpleNamespace(profiles=()),
                 ),
                 patch.object(
                     brokerctl,
@@ -564,7 +561,7 @@ class BrokerctlSetupTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         configure_main.assert_called_once_with(
-            ["--set-default", "--profiles", "profiles.json"],
+            ["--profiles", "profiles.json"],
             indent=True,
         )
 
@@ -783,12 +780,6 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
         )
         self.assertEqual(
             brokerctl.main(
-                ["--profiles", str(self.profiles), "profiles", "set-default", "new-profile"]
-            ),
-            0,
-        )
-        self.assertEqual(
-            brokerctl.main(
                 ["--profiles", str(self.profiles), "profiles", "rename", "new-profile", "renamed"]
             ),
             0,
@@ -825,7 +816,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
             0,
         )
         registry = ProfileRegistry.from_path(self.profiles)
-        self.assertEqual(registry.default_profile, "fixture-text-7b")
+        self.assertFalse(hasattr(registry, "default_profile"))
         self.assertIsNone(registry.try_resolve("renamed"))
 
 
@@ -855,13 +846,13 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
             ("integrate", "install"),
         )
         integrate_configure = brokerctl.build_parser().parse_args(
-            ["integrate", "configure", "--set-default"]
+            ["integrate", "configure", "--model", "fixture-text-7b"]
         )
         self.assertEqual(
             (integrate_configure.command, integrate_configure.integrate_command),
             ("integrate", "configure"),
         )
-        self.assertTrue(integrate_configure.set_default)
+        self.assertEqual(integrate_configure.model, "fixture-text-7b")
 
         rotate = brokerctl.build_parser().parse_args(["security", "rotate", "--replace"])
         self.assertEqual((rotate.command, rotate.security_command), ("security", "rotate"))

@@ -26,14 +26,14 @@ class OpenClawProvider(ToolProvider):
         self,
         registry: ToolRegistry,
         dry_run: bool = False,
-        set_default: bool = False,
+        model: str | None = None,
     ) -> ConfigureResult:
         env_path = OPENCLAW_ENV
         env_data = self._read_env(env_path)
 
         changes = []
 
-        if set_default:
+        if model:
             # These environment variables are OpenClaw's active route, so do
             # not rewrite them unless the operator explicitly opts in.
             new_url = registry.broker_url
@@ -46,12 +46,11 @@ class OpenClawProvider(ToolProvider):
                 env_data["LLAMA_BROKER_API_KEY"] = registry.api_key
                 changes.append("LLAMA_BROKER_API_KEY: applied (value redacted)")
 
-            default_model = registry.default_model
-            if default_model and env_data.get("LLAMA_BROKER_DEFAULT_MODEL") != default_model:
+            if env_data.get("LLAMA_BROKER_DEFAULT_MODEL") != model:
                 old_model = env_data.get("LLAMA_BROKER_DEFAULT_MODEL", "")
-                env_data["LLAMA_BROKER_DEFAULT_MODEL"] = default_model
+                env_data["LLAMA_BROKER_DEFAULT_MODEL"] = model
                 changes.append(
-                    f"LLAMA_BROKER_DEFAULT_MODEL: {old_model or '(unset)'} -> {default_model}"
+                    f"LLAMA_BROKER_DEFAULT_MODEL: {old_model or '(unset)'} -> {model}"
                 )
 
         if not changes:

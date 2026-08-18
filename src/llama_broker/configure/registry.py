@@ -73,7 +73,6 @@ class ToolRegistry:
     ):
         self.broker_url = broker_url.rstrip("/")
         self.profiles_path = self._resolve_profiles_path(profiles_path)
-        self.default_profile_id = ""
         if api_key is None:
             security = load_security_config()
             if security.api_key is not None:
@@ -104,20 +103,10 @@ class ToolRegistry:
 
     def _load_profiles(self) -> list[dict[str, Any]]:
         data = json.loads(self.profiles_path.read_text(encoding="utf-8"))
-        self.default_profile_id = str(data.get("default_profile", "")).strip()
         return data.get("profiles", [])
 
     def get_model_names(self) -> list[str]:
         return [p.alias for p in self.profiles]
-
-    @property
-    def default_model(self) -> str:
-        """Return the manifest-selected alias for explicit tool opt-in."""
-
-        for raw, profile in zip(self._raw_profiles, self.profiles):
-            if raw.get("id") == self.default_profile_id:
-                return profile.alias
-        return self.profiles[0].alias if self.profiles else ""
 
     def get_model_by_alias(self, alias: str) -> ToolProfile | None:
         for p in self.profiles:

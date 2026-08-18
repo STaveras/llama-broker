@@ -42,8 +42,10 @@ profile. The broker's transactional controller starts exactly one profile unit
 on native port 10000. A profile unit has `Restart=no`; a CUDA or model-load
 failure therefore remains visible. The broker daemon itself uses
 `Restart=on-failure`, but restarting it does not authorize a different model.
-Its HTTP worker pool is bounded at two, and completion requests are defaulted
-or limited to 16,384 output tokens.
+Its HTTP worker pool is bounded at two. Completion requests without a client
+budget default to `slot_context_window // parallel`; explicit client budgets
+may be as high as the per-slot context window. Set
+`LLAMA_BROKER_MAX_OUTPUT_TOKENS` to apply an explicit operator ceiling.
 
 The broker persists this state atomically:
 
@@ -235,8 +237,8 @@ only after explicit selection. It never downloads runtimes, copies models, or
 loads a backend implicitly. Use `--check` or `--dry-run` for non-mutating
 reports. After reviewing the resulting profile manifest, run
 `brokerctl integrate install` to install broker-owned units and
-`brokerctl integrate configure` to refresh coding-tool providers; use
-`--set-default` only with the latter for an explicit model/provider selection.
+`brokerctl integrate configure` to refresh coding-tool providers. To select an
+explicit profile for those tools, pass `--model <profile-alias>`.
 Certificate private keys and the API-key file must be mode 600. Open the active
 llama-server UI at `https://<lan-host>:10000/`; its API calls require the native
 key.
@@ -252,7 +254,7 @@ python3 brokerctl.py security revoke '<old-key>'
 Normal rotation retains the old key until clients have been updated and then
 restarts the active profile once. `--replace` removes the overlap. The CLI
 refreshes broker-owned provider credentials without changing a tool's active
-endpoint or selected model; use `brokerctl integrate configure --set-default`
+endpoint or selected model; use `brokerctl integrate configure --model <profile-alias>`
 only for an explicit selection.
 
 Run the offline checks and content verification first:
@@ -275,8 +277,9 @@ systemctl --user enable --now llama-broker.service
 python3 brokerctl.py switch example-9b-v3
 ```
 
-Use `python3 brokerctl.py setup --set-default` only when the coding tools
-should explicitly select the manifest default through Llama-Broker.
+Omitting `model` from API requests uses the profile currently loaded by the
+broker. There is no manifest-selected default profile; select a profile
+explicitly with `brokerctl start <profile-alias>` or an API `model` field.
 
 If a profile is already running while its unit is regenerated, the existing
 process retains its old command. Apply a reviewed manifest update by draining
@@ -331,7 +334,8 @@ than being disguised as a successful switch. A failed restoration records
 `rollback_failed` and requires operator attention.
 
 Unknown explicit model aliases fail closed. Only an omitted `model` field uses
-the manifest default.
+the profile currently loaded by the broker; if none is loaded, the request
+fails with `503 no_active_profile`.
 
 ## Hermes configuration
 

@@ -30,7 +30,6 @@ Environment=LLAMA_BROKER_DRAIN_TIMEOUT=10
 Environment=LLAMA_BROKER_TRANSITION_TIMEOUT=360
 Environment=LLAMA_BROKER_STOP_TIMEOUT=90
 Environment=LLAMA_BROKER_MAX_BODY_BYTES=33554432
-Environment=LLAMA_BROKER_MAX_OUTPUT_TOKENS=16384
 ExecStart=/usr/bin/python3 {{REPO_DIR}}/llama_broker.py
 Restart=on-failure
 RestartSec=5

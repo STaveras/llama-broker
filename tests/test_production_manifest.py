@@ -85,7 +85,7 @@ class ProductionManifestTests(unittest.TestCase):
                     profile.safety.admission.min_free_vram_before_start_mib, 8_192
                 )
 
-        self.assertEqual(self.registry.default_profile, "fixture-text-7b")
+        self.assertFalse(hasattr(self.registry, "default_profile"))
 
     def test_production_controller_has_no_mandatory_resource_probe(self) -> None:
         controller = create_production_controller(self.registry)
