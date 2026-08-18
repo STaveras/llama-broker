@@ -79,6 +79,14 @@ def _env_value(canonical: str, legacy: str, default: str) -> str:
     return os.environ.get(canonical, os.environ.get(legacy, default))
 
 
+
+def _optional_env_int(canonical: str, legacy: str) -> int | None:
+    value = os.environ.get(canonical)
+    if value is None:
+        value = os.environ.get(legacy)
+    return int(value) if value is not None else None
+
+
 _BACKEND_URL_EXPLICIT = any(
     name in os.environ for name in ("LLAMA_BROKER_BACKEND_URL", "LLM_BROKER_BACKEND_URL")
 )
@@ -133,8 +141,8 @@ MAX_BODY_BYTES = int(
         str(32 * 1024 * 1024),
     )
 )
-MAX_OUTPUT_TOKENS = int(
-    _env_value("LLAMA_BROKER_MAX_OUTPUT_TOKENS", "LLM_BROKER_MAX_OUTPUT_TOKENS", "16384")
+MAX_OUTPUT_TOKENS = _optional_env_int(
+    "LLAMA_BROKER_MAX_OUTPUT_TOKENS", "LLM_BROKER_MAX_OUTPUT_TOKENS"
 )
 
 
@@ -268,6 +276,10 @@ class BrokerCoordinationError(RuntimeError):
     http_status = HTTPStatus.SERVICE_UNAVAILABLE
 
 
+class NoActiveProfileError(BrokerCoordinationError):
+    error_type = "no_active_profile"
+
+
 class BrokerQuiescingError(BrokerCoordinationError):
     error_type = "broker_quiescing"
 
@@ -307,12 +319,14 @@ class Controller(Protocol):
 def route_payload(
     registry: ProfileRegistry,
     payload: Mapping[str, Any],
+    *,
+    active_profile: str | None,
 ) -> tuple[Profile, dict[str, Any]]:
     """Resolve an explicit alias and rewrite it to the backend's exact alias.
 
-    A missing ``model`` selects the manifest default.  A present but unknown or
-    empty value fails closed; it never falls through to the first discovered
-    GGUF.
+    A missing ``model`` uses the currently loaded profile.  A present but
+    unknown or empty value fails closed; it never falls through to a catalog
+    entry or starts an arbitrary profile.
     """
 
     if "model" in payload:
@@ -321,24 +335,37 @@ def route_payload(
         if profile is None:
             raise UnknownModelError(f"unknown model: {requested}")
     else:
-        profile = registry.get(registry.default_profile)
+        if active_profile is None:
+            raise NoActiveProfileError("no active model loaded")
+        try:
+            profile = registry.get(active_profile)
+        except ProfileError as error:
+            raise NoActiveProfileError(
+                f"active model is unavailable: {active_profile}"
+            ) from error
     rewritten = dict(payload)
     rewritten["model"] = profile.alias
     return profile, rewritten
 
 
 def enforce_output_limit(
-    payload: Mapping[str, Any], maximum: int
+    payload: Mapping[str, Any], maximum: int, *, default: int | None = None
 ) -> dict[str, Any]:
     """Require a bounded completion budget before forwarding to llama-server."""
 
     if maximum <= 0:
         raise ValueError("broker maximum output tokens must be positive")
+    if default is None:
+        default = maximum
+    if default <= 0:
+        raise ValueError("broker default output tokens must be positive")
+    if default > maximum:
+        raise ValueError("broker default output tokens cannot exceed maximum")
     rewritten = dict(payload)
     keys = ("max_tokens", "max_completion_tokens")
     present = [key for key in keys if key in rewritten]
     if not present:
-        rewritten["max_tokens"] = maximum
+        rewritten["max_tokens"] = default
         return rewritten
     for key in present:
         value = rewritten[key]
@@ -978,7 +1005,7 @@ class BrokerApplication:
         backend_port: int,
         backend_timeout: float,
         max_body_bytes: int,
-        max_output_tokens: int = 16_384,
+        max_output_tokens: int | None = None,
         backend_url: str | None = None,
         security: SecurityConfig | None = None,
         backend_ready: Callable[[], bool] | None = None,
@@ -987,7 +1014,7 @@ class BrokerApplication:
         transition_timeout: float = TRANSITION_TIMEOUT,
         stop_timeout: float = STOP_TIMEOUT,
     ) -> None:
-        if max_output_tokens <= 0:
+        if max_output_tokens is not None and max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
         self.registry = registry
         self.controller = controller
@@ -1042,6 +1069,21 @@ class BrokerApplication:
             transition_timeout=transition_timeout,
             stop_timeout=stop_timeout,
         )
+
+    def max_output_tokens_for(self, profile: Profile) -> int:
+        """Return the maximum client-requested output for a profile."""
+
+        maximum = profile.slot_context_window
+        if self.max_output_tokens is not None:
+            maximum = min(self.max_output_tokens, maximum)
+        return maximum
+
+    def default_max_output_tokens_for(self, profile: Profile) -> int:
+        """Return the inverse-scaled output default for omitted client budgets."""
+
+        if self.max_output_tokens is not None:
+            return self.max_output_tokens_for(profile)
+        return profile.default_max_output_tokens
 
     def _remember_controller_state(self, state: Mapping[str, Any]) -> None:
         with self._state_lock:
@@ -1197,82 +1239,30 @@ class BrokerApplication:
         if profile is not None:
             result.update(
                 {
-                    "context_length": profile.context_size // profile.parallel,
+                    "context_length": profile.slot_context_window,
                     "parallel": profile.parallel,
-                    "slot_context_window": profile.context_size // profile.parallel,
-                    "max_output_tokens": self.max_output_tokens,
+                    "slot_context_window": profile.slot_context_window,
+                    "max_output_tokens": self.max_output_tokens_for(profile),
                     "capabilities": sorted(profile.capabilities),
                 }
             )
         return result
 
     def model_listing(self) -> dict[str, Any]:
-        """List visible models using normalized OpenAI-compatible objects."""
+        """List visible broker-managed models using OpenAI-compatible objects."""
 
-        backend_models: list[Mapping[str, Any]] = []
-        if self._backend_ready():
-            metadata_client = BackendClient(
-                self._backend_url,
-                timeout=min(max(self.backend_timeout, 0.05), 1.0),
-                ca_file=self._backend_ca_file,
-            )
-            try:
-                backend_data = metadata_client.list_models()
-                candidate = (
-                    backend_data.get("data", backend_data.get("models", []))
-                    if isinstance(backend_data, Mapping)
-                    else []
-                )
-                if isinstance(candidate, list):
-                    backend_models = [item for item in candidate if isinstance(item, Mapping)]
-            except (
-                OSError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-                http.client.HTTPException,
-            ) as error:
-                _log(f"[broker] backend model listing unavailable; using profiles: {error}")
-            finally:
-                metadata_client.close()
-
-        # Enrich each model with parallel info from profiles.  A broken stopped
-        # profile is intentionally invisible to the OpenAI surface; a profile
-        # currently serving remains advertised until it becomes unhealthy.
+        # The running backend's model catalog is private; publish only verified
+        # broker profiles, including the active profile while it is being checked.
         active_profile_id = self.coordinator.active_profile
         visible_profiles = {
             profile.alias: profile
             for profile in self.registry.profiles
             if self._profile_artifacts_verified(profile) or profile.id == active_profile_id
         }
-        configured_aliases = {profile.alias for profile in self.registry.profiles}
-        models: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for backend_model in backend_models:
-            backend_id = backend_model.get("id")
-            if not isinstance(backend_id, str) or not backend_id.strip():
-                continue
-            backend_id = backend_id.strip()
-            if backend_id in configured_aliases and backend_id not in visible_profiles:
-                continue
-            try:
-                normalized = self._openai_model_record(
-                    backend_model,
-                    profile=visible_profiles.get(backend_id),
-                )
-            except ValueError:
-                continue
-            if normalized["id"] in seen_ids:
-                continue
-            models.append(normalized)
-            seen_ids.add(normalized["id"])
-
-        # Include profiles not currently loaded in backend
-        for profile in visible_profiles.values():
-            if profile.alias in seen_ids:
-                continue
-            models.append(self._openai_model_record({}, profile=profile))
-            seen_ids.add(profile.alias)
+        models = [
+            self._openai_model_record({}, profile=profile)
+            for profile in visible_profiles.values()
+        ]
 
         return {"object": "list", "data": models}
 
@@ -1554,18 +1544,42 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         if not self._require_api_auth():
             return
+        proxy_payload: Mapping[str, Any] | None = None
+        payload: Mapping[str, Any] | None = None
         try:
-            payload = self._read_payload()
-        except ValueError as error:
-            self._send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"error": {"message": str(error), "type": "invalid_request_error"}},
-            )
-            return
-
-        try:
-            profile, rewritten = route_payload(self.application.registry, payload)
-            if (
+            if path == "/v1/audio/transcriptions":
+                body = self._read_multipart_body()
+                profile, _ = route_payload(
+                    self.application.registry,
+                    {},
+                    active_profile=self.application.coordinator.active_profile,
+                )
+            else:
+                payload = self._read_payload()
+                profile, rewritten = route_payload(
+                    self.application.registry,
+                    payload,
+                    active_profile=self.application.coordinator.active_profile,
+                )
+                if (
+                    not self.application._profile_artifacts_verified(profile)
+                    and profile.id != self.application.coordinator.active_profile
+                ):
+                    self._model_not_found(
+                        profile.alias,
+                        message=f"model unavailable: {profile.alias}",
+                    )
+                    return
+                if path in {"/v1/chat/completions", "/v1/completions"}:
+                    rewritten = ensure_single_system_message(rewritten)
+                    rewritten = enforce_output_limit(
+                        rewritten,
+                        self.application.max_output_tokens_for(profile),
+                        default=self.application.default_max_output_tokens_for(profile),
+                    )
+                proxy_payload = rewritten
+                body = _json_bytes(rewritten)
+            if path == "/v1/audio/transcriptions" and (
                 not self.application._profile_artifacts_verified(profile)
                 and profile.id != self.application.coordinator.active_profile
             ):
@@ -1574,13 +1588,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     message=f"model unavailable: {profile.alias}",
                 )
                 return
-            if path in {"/v1/chat/completions", "/v1/completions"}:
-                rewritten = ensure_single_system_message(rewritten)
-                rewritten = enforce_output_limit(
-                    rewritten, self.application.max_output_tokens
-                )
         except UnknownModelError as error:
-            self._model_not_found(str(payload.get("model", "")), message=str(error))
+            requested = payload.get("model", "") if payload is not None else ""
+            self._model_not_found(str(requested), message=str(error))
+            return
+        except BrokerCoordinationError as error:
+            self._send_coordination_error(error)
             return
         except ValueError as error:
             self._send_json(
@@ -1589,12 +1602,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
 
-        body = _json_bytes(rewritten)
         try:
             with self.application.coordinator.lease(
                 profile.id, transient=profile.is_transient
             ):
-                self._proxy(body, rewritten, profile)
+                self._proxy(body, proxy_payload, profile)
         except BrokerCoordinationError as error:
             self._send_coordination_error(error)
             return
@@ -1727,7 +1739,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             {"error": {"message": str(error), "type": error.error_type}},
         )
 
-    def _read_payload(self) -> dict[str, Any]:
+    def _read_raw_body(self) -> bytes:
         length_header = self.headers.get("Content-Length")
         if length_header is None:
             raise ValueError("Content-Length is required")
@@ -1735,11 +1747,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
             length = int(length_header)
         except ValueError as error:
             raise ValueError("invalid Content-Length") from error
-        if length < 0 or length > self.application.max_body_bytes:
+        if length < 0:
+            raise ValueError("invalid Content-Length")
+        if length > self.application.max_body_bytes:
             raise ValueError(
                 f"request body exceeds broker limit {self.application.max_body_bytes} bytes"
             )
         body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("request body is incomplete")
+        return body
+
+    def _read_payload(self) -> dict[str, Any]:
+        body = self._read_raw_body()
         try:
             payload = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1747,6 +1767,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             raise ValueError("request JSON must be an object")
         return payload
+
+    def _read_multipart_body(self) -> bytes:
+        content_type = self.headers.get("Content-Type", "")
+        media_type, separator, parameters = content_type.partition(";")
+        if media_type.strip().casefold() != "multipart/form-data" or not separator:
+            raise ValueError("Content-Type must be multipart/form-data")
+        if not re.search(
+            r"(?:^|;)\s*boundary\s*=\s*(?:\"[^\"]+\"|[^;\s]+)",
+            parameters,
+            re.IGNORECASE,
+        ):
+            raise ValueError("multipart/form-data boundary is required")
+        return self._read_raw_body()
 
     def _request_headers(self, body: bytes) -> dict[str, str]:
         headers = {
@@ -1758,7 +1791,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
         headers["Connection"] = "close"
         return headers
 
-    def _proxy(self, body: bytes, payload: Mapping[str, Any], profile: Profile) -> None:
+    def _proxy(
+        self,
+        body: bytes,
+        payload: Mapping[str, Any] | None,
+        profile: Profile,
+    ) -> None:
         connection = make_connection(
             self.application.backend_url,
             timeout=self.application.backend_timeout,
@@ -1774,7 +1812,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 headers=self._request_headers(body),
             )
             response = connection.getresponse()
-            streaming = bool(payload.get("stream")) or (
+            streaming = bool(payload and payload.get("stream")) or (
                 response.getheader("Content-Type", "").startswith("text/event-stream")
             )
             self.send_response(response.status, response.reason)

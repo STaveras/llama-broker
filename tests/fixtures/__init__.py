@@ -79,4 +79,3 @@ if __name__ == "__main__":
     registry = ProfileRegistry.from_path(path)
     print(f"materialized: {path}")
     print(f"profiles: {[p.id for p in registry.profiles]}")
-    print(f"default: {registry.default_profile}")

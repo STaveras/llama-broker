@@ -46,11 +46,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print changes without writing files",
     )
     parser.add_argument(
-        "--set-default",
-        "--set-default-model",
-        dest="set_default",
-        action="store_true",
-        help="explicitly select the broker default model/provider",
+        "--model",
+        metavar="ALIAS",
+        help="explicitly select this broker profile alias for the configured tool",
     )
     parser.add_argument(
         "--broker-url",
@@ -96,6 +94,8 @@ def main(argv: list[str] | None = None, *, indent: bool = False) -> int:
         broker_url=args.broker_url,
         profiles_path=args.profiles,
     )
+    if args.model is not None and registry.get_model_by_alias(args.model) is None:
+        parser.error(f"unknown broker profile alias: {args.model}")
 
     for tool_name in tools:
         try:
@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None, *, indent: bool = False) -> int:
             result = provider.configure(
                 registry,
                 dry_run=args.dry_run,
-                set_default=args.set_default,
+                model=args.model,
             )
             if result.written:
                 mode = "WOULD WRITE" if args.dry_run else "WROTE"

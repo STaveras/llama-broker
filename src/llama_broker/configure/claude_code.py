@@ -26,7 +26,7 @@ class ClaudeCodeProvider(ToolProvider):
         self,
         registry: ToolRegistry,
         dry_run: bool = False,
-        set_default: bool = False,
+        model: str | None = None,
     ) -> ConfigureResult:
         changes = []
 
@@ -34,7 +34,7 @@ class ClaudeCodeProvider(ToolProvider):
         env_path = CLAUDE_ENV
         env_data = self._read_env(env_path)
 
-        if set_default:
+        if model:
             # Claude Code exposes one active endpoint through this env file;
             # preserve it unless the operator explicitly selects the broker.
             new_url = registry.broker_url
@@ -48,10 +48,9 @@ class ClaudeCodeProvider(ToolProvider):
                 env_data["ANTHROPIC_API_KEY"] = registry.api_key
                 changes.append("ANTHROPIC_API_KEY: applied (value redacted)")
 
-            default_model = registry.default_model
-            if default_model and env_data.get("ANTHROPIC_MODEL") != default_model:
-                env_data["ANTHROPIC_MODEL"] = default_model
-                changes.append(f"ANTHROPIC_MODEL: selected {default_model}")
+            if env_data.get("ANTHROPIC_MODEL") != model:
+                env_data["ANTHROPIC_MODEL"] = model
+                changes.append(f"ANTHROPIC_MODEL: selected {model}")
 
         if not changes:
             return ConfigureResult()
@@ -64,6 +63,6 @@ class ClaudeCodeProvider(ToolProvider):
             path=str(env_path),
             details=changes + [
                 "NOTE: Claude Code uses ANTHROPIC_BASE_URL for provider routing.",
-                "Model selection remains invocation-controlled unless --set-default is used.",
+                "Model selection remains invocation-controlled unless --model is used.",
             ],
         )

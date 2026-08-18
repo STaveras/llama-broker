@@ -138,7 +138,7 @@ class ConfigPathResolutionTests(unittest.TestCase):
         example = REPO_ROOT / "profiles.example.json"
         manifest = json.loads(example.read_text(encoding="utf-8"))
         self.assertEqual(manifest["schema_version"], 1)
-        self.assertIn("default_profile", manifest)
+        self.assertNotIn("default_profile", manifest)
         self.assertTrue(manifest["profiles"])
         for profile in manifest["profiles"]:
             self.assertNotIn("/home/", profile.get("server_binary", ""))

@@ -25,7 +25,7 @@ class CodexProvider(ToolProvider):
         self,
         registry: ToolRegistry,
         dry_run: bool = False,
-        set_default: bool = False,
+        model: str | None = None,
     ) -> ConfigureResult:
         config_path = self.config_path
         if not config_path.is_file():
@@ -46,21 +46,21 @@ class CodexProvider(ToolProvider):
             stripped = line.strip()
             if stripped.startswith("model ="):
                 found_model = True
-                if set_default and registry.default_model:
+                if model:
                     old_model = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                    if old_model != registry.default_model:
-                        new_lines.append(f'model = "{registry.default_model}"')
+                    if old_model != model:
+                        new_lines.append(f'model = "{model}"')
                         changes.append(
-                            f"model: {old_model} -> {registry.default_model}"
+                            f"model: {old_model} -> {model}"
                         )
                         continue
                 new_lines.append(line)
             else:
                 new_lines.append(line)
 
-        if set_default and registry.default_model and not found_model:
-            new_lines.insert(0, f'model = "{registry.default_model}"')
-            changes.append(f"Added model = {registry.default_model}")
+        if model and not found_model:
+            new_lines.insert(0, f'model = "{model}"')
+            changes.append(f"Added model = {model}")
             found_model = True
 
         # Add a comment about --oss usage
@@ -78,8 +78,8 @@ class CodexProvider(ToolProvider):
                     changes.append(
                         "Added local-provider usage guidance; "
                         + (
-                            "broker default selected"
-                            if set_default
+                            "explicit broker model selected"
+                            if model
                             else "selected model preserved"
                         )
                     )

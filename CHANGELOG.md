@@ -1,10 +1,19 @@
 # Retrospective changelog
 
-Current assigned version: **0.2.0**.
+Current assigned version: **0.3.0**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.3.0] - 2026-08-18 — State-driven routing and multipart audio
+
+Original checkpoint: `f657dd12ed281e77a7f2835633c40fd4367d5858`.
+
+- Route omitted model requests to the loaded profile and fail when none is active; remove manifest default_profile selection and require explicit client-model selection for configuration.
+- Publish only visible verified broker profiles in the model catalog, rather than exposing the private backend catalog.
+- Forward bounded authenticated multipart audio transcription bodies and boundary-bearing content types unchanged to the active profile; validate lengths and avoid logging uploaded media.
+- Bound explicit output requests by the per-slot context window; derive omitted output budgets as context_size / parallel cubed (integer division, minimum one), unless an operator ceiling is set.
 
 ## [0.2.0] - 2026-08-17 — Command organization
 

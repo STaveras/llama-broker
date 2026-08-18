@@ -68,13 +68,12 @@ class ProfileConfigTests(unittest.TestCase):
         found = find_profile_record(self.data, "fixture-vision")
         self.assertIsNotNone(found)
         changed = dict(self.data)
-        changed["default_profile"] = "fixture-vision-12b"
-        self.assertEqual(semantic_diff(self.data, changed), ["default_profile"])
+        changed["schema_version"] = 1
+        self.assertEqual(semantic_diff(self.data, changed), [])
 
     def test_inheritance_merges_maps_and_replaces_lists(self) -> None:
         payload = {
             "schema_version": 1,
-            "default_profile": "child",
             "profiles": [
                 {"id": "base", "nested": {"one": 1}, "items": [1, 2]},
                 {

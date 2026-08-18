@@ -323,7 +323,6 @@ def apply_profile_plan(
     else:
         payload = {
             "schema_version": 1,
-            "default_profile": plan.profile_record["id"],
             "profiles": [],
         }
     records = payload.get("profiles")
@@ -333,8 +332,6 @@ def apply_profile_plan(
     if any(isinstance(item, dict) and item.get("id") == profile_id for item in records):
         raise ValueError(f"profile already exists: {profile_id}")
     records.append(plan.profile_record)
-    if not payload.get("default_profile"):
-        payload["default_profile"] = profile_id
     payload["schema_version"] = 1
 
     profiles_path.parent.mkdir(parents=True, exist_ok=True)

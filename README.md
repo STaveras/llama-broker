@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.2.0
+## Retrospective version: 0.3.0
 
-**Command organization** — source checkpoint e3b72a41be3d (2026-08-17).
+**State-driven routing and multipart audio** — source checkpoint f657dd12ed28 (2026-08-18).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
@@ -140,8 +140,20 @@ The stable additive OpenAI-compatible subset is under `/v1`:
 | --- | --- |
 | `GET /v1/models` | Authenticated list of currently healthy/serving models; stopped broken or unverifiable profiles are hidden. |
 | `GET /v1/models/{model}` | Authenticated model metadata for a verified profile, or the currently healthy active backend. |
-| `POST /v1/chat/completions` | Authenticated chat request; the explicit `model` id/alias is routed to the matching profile. `stream: true` preserves SSE streaming. |
-| `POST /v1/completions` | Authenticated completion request with the same explicit model routing and streaming behavior. |
+| `POST /v1/chat/completions` | Authenticated chat request; an explicit `model` id/alias is routed to the matching profile, while an omitted model uses the currently loaded profile. `stream: true` preserves SSE streaming. |
+| `POST /v1/completions` | Authenticated completion request with the same explicit/currently-loaded model routing and streaming behavior. |
+| `POST /v1/audio/transcriptions` | Authenticated, bounded `multipart/form-data` upload; the exact body and content type are forwarded to the currently loaded profile without parsing form fields. |
+
+## TODO
+
+- [x] **Forward multipart audio transcription requests.** The broker accepts
+  authenticated, bounded `multipart/form-data` uploads at
+  `POST /v1/audio/transcriptions`, validates `Content-Length`, preserves the
+  exact body and boundary-bearing content type through the authenticated proxy,
+  uses the currently loaded profile without parsing form fields, keeps request
+  IDs and fail-closed error handling intact, and does not log uploaded media.
+  JSON `input_audio` content through `POST /v1/chat/completions` remains the
+  other broker-supported audio path.
 
 Requests must provide the OpenAI-standard `Authorization: Bearer $API_KEY` header.
 The credential order is raw `LLAMA_BROKER_API_KEY` first, then
@@ -193,7 +205,10 @@ directly.
   TLS and the API-key file is rejected at startup.
 - **Fail-closed admission.** Profiles pin hashes (server/model/projector),
   enforce CUDA-graph safety environment, bound memory/swap/tasks per unit, and
-  cap output tokens (16,384 default; higher fails closed).
+  cap explicit output requests at the per-slot context window. Requests without
+  a client budget use the inverse-parallel default
+  (`slot_context_window // parallel`); `LLAMA_BROKER_MAX_OUTPUT_TOKENS` may set
+  an explicit operator ceiling.
 - **No GPU-telemetry dependency for normal switching.** Resource bounds come
   from systemd cgroups; `nvidia-smi`-based admission is only used in explicit
   qualification experiments.

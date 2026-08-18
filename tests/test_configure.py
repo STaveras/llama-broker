@@ -64,18 +64,20 @@ class ConfigureSafetyTests(unittest.TestCase):
         self.assertIn("codex", _select_tools(["all", "codex"]))
         self.assertEqual(_select_tools(["codex"]), ["codex"])
 
-    def test_default_selection_requires_an_explicit_flag(self) -> None:
-        self.assertFalse(_build_parser().parse_args([]).set_default)
-        self.assertTrue(_build_parser().parse_args(["--set-default"]).set_default)
-        self.assertTrue(
-            _build_parser().parse_args(["--set-default-model"]).set_default
+    def test_model_selection_requires_an_explicit_alias(self) -> None:
+        self.assertIsNone(_build_parser().parse_args([]).model)
+        self.assertEqual(
+            _build_parser().parse_args(["--model", "fixture-text-7b"]).model,
+            "fixture-text-7b",
         )
+        with self.assertRaises(SystemExit):
+            _build_parser().parse_args(["--set-default"])
 
     def test_brokerctl_passes_explicit_tool_names_via_tools_option(self) -> None:
         args = argparse.Namespace(
             tool_names=["codex"],
             dry_run=True,
-            set_default=False,
+            model=None,
             integrate_command="configure",
             profiles=Path("/tmp/profiles.json"),
         )
@@ -145,10 +147,10 @@ class ConfigureSafetyTests(unittest.TestCase):
                 self.assertTrue(OpenCodeProvider().configure(registry).written)
                 self.assertTrue(HermesProvider().configure(registry).written)
                 self.assertTrue(
-                    ClaudeCodeProvider().configure(registry, set_default=True).written
+                    ClaudeCodeProvider().configure(registry, model="fixture-text-7b").written
                 )
                 self.assertTrue(
-                    OpenClawProvider().configure(registry, set_default=True).written
+                    OpenClawProvider().configure(registry, model="fixture-text-7b").written
                 )
 
             opencode = json.loads(opencode_path.read_text(encoding="utf-8"))
@@ -270,7 +272,7 @@ class ConfigureSafetyTests(unittest.TestCase):
                     ),
                 ),
             ):
-                HermesProvider().configure(registry, set_default=True)
+                HermesProvider().configure(registry, model="fixture-text-7b")
 
             content = config_path.read_text(encoding="utf-8")
             self.assertIn("  default: fixture-text-7b", content)
@@ -325,7 +327,7 @@ class ConfigureSafetyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch("llama_broker.configure.opencode.OPENCODE_CONFIG", config_path):
-                OpenCodeProvider().configure(registry, set_default=True)
+                OpenCodeProvider().configure(registry, model="fixture-text-7b")
 
             data = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(data["model"], "llamacpp/fixture-text-7b")
@@ -341,7 +343,7 @@ class ConfigureSafetyTests(unittest.TestCase):
             config_path = Path(tempdir) / "config.toml"
             config_path.write_text('model = "gpt-5.6-luna"\n', encoding="utf-8")
             with patch("llama_broker.configure.codex.CODEX_CONFIG", config_path):
-                CodexProvider().configure(registry, set_default=True)
+                CodexProvider().configure(registry, model="fixture-text-7b")
 
             content = config_path.read_text(encoding="utf-8")
             self.assertIn('model = "fixture-text-7b"', content)

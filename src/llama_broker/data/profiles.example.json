@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "default_profile": "example-llama",
   "profiles": [
     {
       "id": "example-llama",

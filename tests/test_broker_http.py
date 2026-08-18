@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -74,10 +75,14 @@ class BackendHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
-        payload = json.loads(body)
-        self.server.seen_payloads.append(payload)  # type: ignore[attr-defined]
+        self.server.seen_bodies.append(body)  # type: ignore[attr-defined]
         self.server.seen_headers.append(dict(self.headers))  # type: ignore[attr-defined]
-        if payload.get("_test_hold_stream"):
+        if self.headers.get("Content-Type", "").startswith("multipart/form-data"):
+            payload = None
+        else:
+            payload = json.loads(body)
+            self.server.seen_payloads.append(payload)  # type: ignore[attr-defined]
+        if payload and payload.get("_test_hold_stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
@@ -97,7 +102,10 @@ class BackendHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
-        response = json.dumps({"ok": True, "model": payload["model"]}).encode()
+        response_payload = {"ok": True}
+        if payload is not None:
+            response_payload["model"] = payload["model"]
+        response = json.dumps(response_payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response)))
@@ -159,7 +167,6 @@ class BrokerHttpTests(unittest.TestCase):
         }
         manifest = {
             "schema_version": 1,
-            "default_profile": "main",
             "profiles": [
                 {
                     **common,
@@ -219,6 +226,7 @@ class BrokerHttpTests(unittest.TestCase):
 
         self.backend = ThreadingHTTPServer(("127.0.0.1", 0), BackendHandler)
         self.backend.seen_payloads = []  # type: ignore[attr-defined]
+        self.backend.seen_bodies = []  # type: ignore[attr-defined]
         self.backend.seen_headers = []  # type: ignore[attr-defined]
         self.backend.hold_stream_lock = threading.Lock()  # type: ignore[attr-defined]
         self.backend.hold_stream_count = 0  # type: ignore[attr-defined]
@@ -280,6 +288,204 @@ class BrokerHttpTests(unittest.TestCase):
         decoded = json.loads(response.read())
         connection.close()
         return response.status, decoded
+
+    def _post_raw(
+        self,
+        body: bytes,
+        path: str = "/v1/audio/transcriptions",
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, object], dict[str, str]]:
+        connection = http.client.HTTPConnection("127.0.0.1", self.broker.server_port, timeout=5)
+        request_headers = {"Authorization": f"Bearer {self.auth_key}"}
+        request_headers.update(headers or {})
+        connection.request("POST", path, body=body, headers=request_headers)
+        response = connection.getresponse()
+        decoded = json.loads(response.read())
+        response_headers = dict(response.getheaders())
+        connection.close()
+        return response.status, decoded, response_headers
+
+    def _post_raw_wire(
+        self,
+        body: bytes,
+        *,
+        content_length: str | None,
+        headers: dict[str, str] | None = None,
+        shutdown_write: bool = False,
+    ) -> tuple[int, dict[str, object], dict[str, str]]:
+        connection = http.client.HTTPConnection("127.0.0.1", self.broker.server_port, timeout=5)
+        request_headers = {
+            "Content-Type": "multipart/form-data; boundary=audio-boundary",
+            "Authorization": f"Bearer {self.auth_key}",
+            "Connection": "close",
+        }
+        if content_length is not None:
+            request_headers["Content-Length"] = content_length
+        request_headers.update(headers or {})
+        connection.putrequest("POST", "/v1/audio/transcriptions")
+        for key, value in request_headers.items():
+            connection.putheader(key, value)
+        connection.endheaders()
+        if body:
+            connection.send(body)
+        if shutdown_write:
+            assert connection.sock is not None
+            connection.sock.shutdown(socket.SHUT_WR)
+        response = connection.getresponse()
+        decoded = json.loads(response.read())
+        response_headers = dict(response.getheaders())
+        connection.close()
+        return response.status, decoded, response_headers
+
+    def test_audio_transcription_forwards_multipart_bytes_and_headers(self) -> None:
+        content_type = "multipart/form-data; boundary=audio-boundary"
+        body = (
+            b'--audio-boundary\r\n'
+            b'Content-Disposition: form-data; name="model"\r\n\r\n'
+            b"unknown-form-model\r\n"
+            b'--audio-boundary\r\n'
+            b'Content-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
+            b"Content-Type: audio/wav\r\n\r\n"
+            b"RIFF\x00\xff\x10\x80binary-audio\r\n"
+            b"--audio-boundary--\r\n"
+        )
+        request_id = "audio-request-123"
+
+        status, payload, response_headers = self._post_raw(
+            body,
+            headers={
+                "Content-Type": content_type,
+                "Authorization": f"Bearer {self.auth_key}",
+                "X-Request-ID": request_id,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(self.backend.seen_bodies[-1], body)  # type: ignore[attr-defined]
+        seen = self.backend.seen_headers[-1]  # type: ignore[attr-defined]
+        self.assertEqual(seen["Content-Type"], content_type)
+        self.assertEqual(seen["Authorization"], f"Bearer {self.auth_key}")
+        self.assertEqual(seen["X-Request-ID"], request_id)
+        self.assertEqual(response_headers["X-Llama-Broker-Profile"], "main")
+        self.assertEqual(response_headers["X-Request-ID"], request_id)
+
+    def test_audio_transcription_rejects_non_multipart_content_type(self) -> None:
+        request_id = "audio-invalid-content-type"
+
+        status, payload, response_headers = self._post_raw(
+            b'{"model":"main"}',
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-ID": request_id,
+            },
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")  # type: ignore[index]
+        self.assertEqual(self.backend.seen_bodies, [])  # type: ignore[attr-defined]
+        self.assertEqual(response_headers["X-Request-ID"], request_id)
+
+    def test_audio_transcription_rejects_oversized_body_before_backend_access(self) -> None:
+        self.broker.application.max_body_bytes = 4  # type: ignore[attr-defined]
+        request_id = "audio-oversized"
+
+        status, payload, response_headers = self._post_raw(
+            b"12345",
+            headers={
+                "Content-Type": "multipart/form-data; boundary=audio-boundary",
+                "X-Request-ID": request_id,
+            },
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")  # type: ignore[index]
+        self.assertIn("exceeds broker limit 4 bytes", payload["error"]["message"])  # type: ignore[operator,index]
+        self.assertEqual(self.backend.seen_bodies, [])  # type: ignore[attr-defined]
+        self.assertEqual(response_headers["X-Request-ID"], request_id)
+
+    def test_audio_transcription_rejects_invalid_bearer_before_backend_access(self) -> None:
+        request_id = "audio-invalid-bearer"
+
+        status, payload, response_headers = self._post_raw(
+            b"binary-audio-that-must-not-be-read",
+            headers={
+                "Content-Type": "multipart/form-data; boundary=audio-boundary",
+                "Authorization": "Bearer wrong-key",
+                "X-Request-ID": request_id,
+            },
+        )
+
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["type"], "authentication_error")  # type: ignore[index]
+        self.assertEqual(self.backend.seen_bodies, [])  # type: ignore[attr-defined]
+        self.assertEqual(response_headers["X-Request-ID"], request_id)
+
+    def test_audio_transcription_rejects_missing_bearer_before_backend_access(self) -> None:
+        request_id = "audio-missing-bearer"
+
+        status, payload, response_headers = self._post_raw(
+            b"binary-audio-that-must-not-be-read",
+            headers={
+                "Content-Type": "multipart/form-data; boundary=audio-boundary",
+                "Authorization": "",
+                "X-Request-ID": request_id,
+            },
+        )
+
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["type"], "authentication_error")  # type: ignore[index]
+        self.assertEqual(self.backend.seen_bodies, [])  # type: ignore[attr-defined]
+        self.assertEqual(response_headers["X-Request-ID"], request_id)
+
+    def test_audio_transcription_rejects_missing_invalid_and_incomplete_lengths(self) -> None:
+        cases = (
+            ("missing", b"", None, False, "Content-Length is required"),
+            ("invalid", b"", "not-a-number", False, "invalid Content-Length"),
+            ("incomplete", b"short", "10", True, "request body is incomplete"),
+        )
+
+        for label, body, content_length, shutdown_write, expected_message in cases:
+            with self.subTest(case=label):
+                request_id = f"audio-{label}-length"
+                status, payload, response_headers = self._post_raw_wire(
+                    body,
+                    content_length=content_length,
+                    headers={"X-Request-ID": request_id},
+                    shutdown_write=shutdown_write,
+                )
+
+                self.assertEqual(status, 400)
+                self.assertEqual(
+                    payload["error"]["type"], "invalid_request_error"  # type: ignore[index]
+                )
+                self.assertIn(expected_message, payload["error"]["message"])  # type: ignore[operator,index]
+                self.assertEqual(response_headers["X-Request-ID"], request_id)
+
+        self.assertEqual(self.backend.seen_bodies, [])  # type: ignore[attr-defined]
+
+    def test_audio_transcription_does_not_log_uploaded_media(self) -> None:
+        marker = "audio-media-must-not-appear-in-logs"
+        body = (
+            b'--audio-boundary\r\nContent-Disposition: form-data; name="file"\r\n\r\n'
+            + marker.encode("ascii")
+            + b"\r\n--audio-boundary--\r\n"
+        )
+
+        with patch.object(llama_broker, "_log") as log:
+            status, _, _ = self._post_raw(
+                body,
+                headers={
+                    "Content-Type": "multipart/form-data; boundary=audio-boundary",
+                    "X-Request-ID": "audio-log-safety",
+                },
+            )
+
+        self.assertEqual(status, 200)
+        messages = "\n".join(
+            str(call.args[0]) for call in log.call_args_list if call.args
+        )
+        self.assertNotIn(marker, messages)
 
     def test_native_backend_credentials_are_forwarded_unchanged(self) -> None:
         status, _ = self._post(
@@ -408,8 +614,28 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(response["model"], "main-27b")
         self.assertEqual(self.backend.seen_payloads[-1]["model"], "main-27b")  # type: ignore[attr-defined]
-        self.assertEqual(self.backend.seen_payloads[-1]["max_tokens"], 16384)  # type: ignore[attr-defined]
+        self.assertEqual(self.backend.seen_payloads[-1]["max_tokens"], 65536)  # type: ignore[attr-defined]
         self.assertEqual(self.controller.transitions, [])
+
+    def test_omitted_model_uses_currently_loaded_profile(self) -> None:
+        status, response = self._post(
+            {"messages": [{"role": "user", "content": "use active"}]}
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["model"], "main-27b")
+        self.assertEqual(self.backend.seen_payloads[-1]["model"], "main-27b")  # type: ignore[attr-defined]
+        self.assertEqual(self.controller.transitions, [])
+
+    def test_omitted_model_fails_when_no_profile_is_loaded(self) -> None:
+        self.broker.application.coordinator.stop_when_idle()  # type: ignore[attr-defined]
+
+        status, response = self._post({"messages": []})
+
+        self.assertEqual(status, 503)
+        self.assertEqual(response["error"]["type"], "no_active_profile")  # type: ignore[index]
+        self.assertIn("no active model loaded", response["error"]["message"])  # type: ignore[operator,index]
+        self.assertEqual(self.backend.seen_payloads, [])  # type: ignore[attr-defined]
 
     def test_output_budget_is_defaulted_and_oversized_requests_fail_closed(self) -> None:
         self.assertEqual(enforce_output_limit({"model": "x"}, 4096)["max_tokens"], 4096)
@@ -419,8 +645,18 @@ class BrokerHttpTests(unittest.TestCase):
             ],
             2048,
         )
+        self.assertEqual(
+            enforce_output_limit({}, 131072, default=32768)["max_tokens"],
+            32768,
+        )
+        self.assertEqual(
+            enforce_output_limit({"max_tokens": 131072}, 131072, default=32768)[
+                "max_tokens"
+            ],
+            131072,
+        )
         status, response = self._post(
-            {"model": "main", "messages": [], "max_tokens": 16385}
+            {"model": "main", "messages": [], "max_tokens": 65537}
         )
         self.assertEqual(status, 400)
         self.assertEqual(response["error"]["type"], "invalid_request_error")  # type: ignore[index]
@@ -478,6 +714,32 @@ class BrokerHttpTests(unittest.TestCase):
         response = self.broker.application.model_listing()  # type: ignore[attr-defined]
         ids = {item["id"] for item in response["data"]}
         self.assertNotIn(broken.alias, ids)
+
+    def test_models_listing_publishes_only_verified_profile_aliases(self) -> None:
+        backend_models = {
+            "data": [
+                {"id": self.registry.profiles[0].alias, "owned_by": "llamacpp"},
+                {"id": "private-backend-model", "owned_by": "llamacpp"},
+            ]
+        }
+        with patch.object(
+            llama_broker.BackendClient,
+            "list_models",
+            return_value=backend_models,
+        ):
+            status, payload = self._get("/v1/models")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            {
+                (item["id"], item["owned_by"])
+                for item in payload["data"]  # type: ignore[union-attr]
+            },
+            {
+                (profile.alias, "Llama-Broker")
+                for profile in self.registry.profiles
+            },
+        )
 
     def test_model_detail_hides_stopped_broken_profile(self) -> None:
         broken = self.registry.profiles[-1]
@@ -543,7 +805,8 @@ class BrokerHttpTests(unittest.TestCase):
             self.assertIsInstance(model["owned_by"], str)
             self.assertIsInstance(model["permission"], list)
         self.assertEqual(by_id["main-27b"]["context_length"], 65536)
-        self.assertEqual(by_id["main-27b"]["max_output_tokens"], 16384)
+        self.assertEqual(by_id["main-27b"]["max_output_tokens"], 65536)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["max_output_tokens"], 32768)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["capabilities"], ["text", "vision"])
 
     def test_admin_switch_uses_coordinator_and_reports_consistent_health(self) -> None:
@@ -1292,12 +1555,24 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIsNone(coordinator.active_profile)
         self.assertEqual(coordinator.active_requests, 0)
 
-    def test_route_payload_uses_default_only_when_model_is_absent(self) -> None:
-        profile, payload = route_payload(self.registry_fixture(), {})
+    def test_route_payload_uses_active_profile_when_model_is_absent(self) -> None:
+        profile, payload = route_payload(
+            self.registry_fixture(), {}, active_profile="main"
+        )
         self.assertEqual(profile.id, "main")
         self.assertEqual(payload["model"], "main-27b")
+
+    def test_route_payload_rejects_omitted_model_without_active_profile(self) -> None:
+        with self.assertRaisesRegex(Exception, "no active model"):
+            route_payload(self.registry_fixture(), {}, active_profile=None)
+
+    def test_route_payload_rejects_unknown_explicit_model(self) -> None:
         with self.assertRaisesRegex(Exception, "unknown model"):
-            route_payload(self.registry_fixture(), {"model": "unknown"})
+            route_payload(
+                self.registry_fixture(),
+                {"model": "unknown"},
+                active_profile=None,
+            )
 
     @staticmethod
     def registry_fixture() -> object:
@@ -1306,8 +1581,6 @@ class CoordinatorTests(unittest.TestCase):
             alias = "main-27b"
 
         class Registry:
-            default_profile = "main"
-
             def get(self, profile_id: str) -> object:
                 if profile_id != "main":
                     raise KeyError(profile_id)

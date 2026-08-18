@@ -28,14 +28,14 @@ class ToolProvider(ABC):
         self,
         registry: ToolRegistry,
         dry_run: bool = False,
-        set_default: bool = False,
+        model: str | None = None,
     ) -> ConfigureResult:
         """Configure the tool to use llama-broker.
 
         Args:
             registry: The tool registry with broker profile data
             dry_run: If True, return what would be written without modifying files
-            set_default: If True, explicitly select the broker default model/provider
+            model: Optional explicit broker profile alias to select for the tool
 
         Returns:
             ConfigureResult with details about what was done
