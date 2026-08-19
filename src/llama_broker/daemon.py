@@ -316,6 +316,72 @@ class Controller(Protocol):
     def stop_all(self) -> dict[str, Any]: ...
 
 
+def apply_reasoning_policy(
+    payload: Mapping[str, Any], *, runtime: str, max_output_tokens: int | None = None
+) -> dict[str, Any]:
+    """Apply the client reasoning policy for runtimes with template controls."""
+
+    rewritten = dict(payload)
+    if runtime != "llamacpp":
+        return rewritten
+    if max_output_tokens is None or max_output_tokens <= 0:
+        raise ValueError("llamacpp reasoning policy requires a positive output limit")
+
+    raw_kwargs = rewritten.get("chat_template_kwargs")
+    kwargs = dict(raw_kwargs) if isinstance(raw_kwargs, Mapping) else {}
+    explicit_template = "enable_thinking" in kwargs
+
+    effort: str | None = None
+    reasoning = rewritten.get("reasoning")
+    if isinstance(reasoning, Mapping):
+        raw_effort = reasoning.get("effort")
+        if isinstance(raw_effort, str):
+            effort = raw_effort
+    raw_effort = rewritten.get("reasoning_effort")
+    if effort is None and isinstance(raw_effort, str):
+        effort = raw_effort
+
+    explicit_budget = (
+        "reasoning_budget_tokens" in rewritten
+        or "thinking_budget_tokens" in rewritten
+    )
+
+    if effort is None:
+        if explicit_budget:
+            if not explicit_template:
+                kwargs["enable_thinking"] = True
+        elif not explicit_template:
+            kwargs["enable_thinking"] = False
+            rewritten["reasoning_effort"] = "none"
+            rewritten["reasoning_budget_tokens"] = 0
+    elif effort == "none":
+        if not explicit_template:
+            kwargs["enable_thinking"] = False
+            rewritten["reasoning_effort"] = "none"
+            if "reasoning_budget_tokens" not in rewritten and "thinking_budget_tokens" not in rewritten:
+                rewritten["reasoning_budget_tokens"] = 0
+    elif effort in {"low", "medium", "high"}:
+        if not explicit_template:
+            kwargs["enable_thinking"] = True
+        template_disabled = explicit_template and kwargs.get("enable_thinking") is False
+        if (
+            not template_disabled
+            and "reasoning_budget_tokens" not in rewritten
+            and "thinking_budget_tokens" not in rewritten
+        ):
+            divisor = {"low": 8, "medium": 4, "high": 2}[effort]
+            rewritten["reasoning_budget_tokens"] = max(1, max_output_tokens // divisor)
+        rewritten["reasoning_effort"] = effort
+    else:
+        raise ValueError(
+            "reasoning effort must be one of: none, low, medium, high"
+        )
+
+    if kwargs:
+        rewritten["chat_template_kwargs"] = kwargs
+    return rewritten
+
+
 def route_payload(
     registry: ProfileRegistry,
     payload: Mapping[str, Any],
@@ -1560,6 +1626,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     self.application.registry,
                     payload,
                     active_profile=self.application.coordinator.active_profile,
+                )
+                rewritten = apply_reasoning_policy(
+                    rewritten,
+                    runtime=profile.runtime,
+                    max_output_tokens=self.application.max_output_tokens_for(profile),
                 )
                 if (
                     not self.application._profile_artifacts_verified(profile)
