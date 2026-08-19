@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.3.0
+## Retrospective version: 0.4.0
 
-**State-driven routing and multipart audio** — source checkpoint f657dd12ed28 (2026-08-18).
+**llama.cpp reasoning policy** — source checkpoint 240237bdbdb1 (2026-08-18).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 

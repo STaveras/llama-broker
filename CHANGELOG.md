@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.3.0**.
+Current assigned version: **0.4.0**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.4.0] - 2026-08-18 — llama.cpp reasoning policy
+
+Original checkpoint: `240237bdbdb145c36e5eb0205ad175170d2f6ee9`.
+
+- Apply a llama.cpp-specific reasoning policy before forwarding requests: default thinking off, map none/low/medium/high efforts, and derive reasoning budgets from the profile output limit.
+- Respect explicit thinking-template controls and explicit budgets; leave other runtimes unchanged. Add policy and HTTP forwarding regression cases.
 
 ## [0.3.0] - 2026-08-18 — State-driven routing and multipart audio
 
