@@ -1112,15 +1112,18 @@ class SystemdCandidateLifecycle:
         self.runner(command)
 
     def _cleanup(self, unit_name: str, unit_path: Path, *, stop: bool) -> None:
+        try:
+            # Clear a failed result while systemd still has the candidate unit
+            # loaded.  Stopping first can garbage-collect the transient unit,
+            # which makes reset-failed produce a misleading "not loaded" line.
+            self._run("systemctl", "--user", "reset-failed", unit_name)
+        except (OSError, subprocess.SubprocessError):
+            pass
         if stop:
             try:
                 self._run("systemctl", "--user", "stop", unit_name)
             except (OSError, subprocess.SubprocessError):
                 pass
-        try:
-            self._run("systemctl", "--user", "reset-failed", unit_name)
-        except (OSError, subprocess.SubprocessError):
-            pass
         unit_path.unlink(missing_ok=True)
         try:
             self._run("systemctl", "--user", "daemon-reload")
