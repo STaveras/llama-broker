@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.8
+## Retrospective version: 0.6.9
 
-**Protect the active backend while tuning** — source checkpoint 13e885a903bd (2026-08-27).
+**Reset failed candidates before stopping** — source checkpoint 9856be8bc468 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
