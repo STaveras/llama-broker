@@ -43,11 +43,9 @@ LLAMACPP_KNOBS = (
     "batch_size",
     "ubatch_size",
     "gpu_layers",
-    "max_output_tokens",
 )
 VLLM_KNOBS = (
     "gpu_memory_utilization",
-    "max_output_tokens",
 )
 FORBIDDEN_FIELDS = frozenset(
     {
