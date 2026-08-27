@@ -732,6 +732,87 @@ def _truncate_field_value(value: str, width: int) -> str:
     return "..." + value[-(width - 3) :]
 
 
+def _alt_arrow_from_sequence(sequence: list[int]) -> int | None:
+    """Decode an Alt+Arrow sequence that curses did not recognize."""
+
+    import curses
+
+    if not sequence or sequence[0] not in (ord("["), ord("O")):
+        return None
+    arrow_keys = {
+        ord("A"): curses.KEY_UP,
+        ord("B"): curses.KEY_DOWN,
+        ord("C"): curses.KEY_RIGHT,
+        ord("D"): curses.KEY_LEFT,
+    }
+    final = sequence[-1]
+    if final not in arrow_keys:
+        return None
+    parameters = sequence[1:-1]
+    if sequence[0] == ord("O") and parameters:
+        return None
+    if sequence[0] == ord("[") and any(
+        value != ord(";")
+        and value != ord("?")
+        and not ord("0") <= value <= ord("9")
+        for value in parameters
+    ):
+        return None
+    return arrow_keys[final]
+
+
+def _read_curses_key(stdscr: Any) -> int:
+    """Read a key while keeping Alt-modified arrows from becoming Escape."""
+
+    import curses
+
+    key = stdscr.getch()
+    if key != 27:
+        return key
+
+    sequence: list[int] = []
+    try:
+        # Alt is commonly encoded as ESC followed by a CSI/SS3 arrow
+        # sequence.  curses.keypad() does not decode every modifier variant,
+        # so wait briefly for the tail before treating ESC as cancellation.
+        stdscr.timeout(50)
+        for _ in range(16):
+            next_key = stdscr.getch()
+            if next_key == -1:
+                break
+            sequence.append(next_key)
+            if len(sequence) == 1 and next_key in (
+                curses.KEY_UP,
+                curses.KEY_DOWN,
+                curses.KEY_LEFT,
+                curses.KEY_RIGHT,
+            ):
+                return next_key
+            decoded = _alt_arrow_from_sequence(sequence)
+            if decoded is not None:
+                return decoded
+            if sequence[0] not in (ord("["), ord("O")):
+                break
+            if sequence[0] == ord("O") and len(sequence) > 1:
+                break
+            if sequence[0] == ord("[") and any(
+                value != ord(";")
+                and value != ord("?")
+                and not ord("0") <= value <= ord("9")
+                and value not in (ord("A"), ord("B"), ord("C"), ord("D"))
+                for value in sequence[1:]
+            ):
+                break
+    finally:
+        stdscr.timeout(-1)
+
+    # Preserve an unrecognized Escape sequence for the caller instead of
+    # dropping the bytes that followed the Escape prefix.
+    for value in reversed(sequence):
+        curses.ungetch(value)
+    return key
+
+
 def _curses_prompt(
     stdscr: Any,
     prompt: str,
@@ -768,7 +849,7 @@ def _curses_prompt(
     render()
     while True:
         try:
-            key = stdscr.getch()
+            key = _read_curses_key(stdscr)
         except KeyboardInterrupt:
             return original
 
@@ -812,7 +893,7 @@ def _curses_confirm(stdscr: Any, prompt: str, *, default: bool = True) -> bool:
     choices = "Y/n" if default else "y/N"
     stdscr.addnstr(max(height - 2, 0), 0, f"{prompt} [{choices}]", max(width - 1, 1))
     stdscr.clrtoeol()
-    key = stdscr.getch()
+    key = _read_curses_key(stdscr)
     if key in (ord("y"), ord("Y")):
         return True
     if key in (ord("n"), ord("N")):
@@ -862,7 +943,7 @@ def _curses_select(
                     curses.A_REVERSE if choice_index == selected else 0,
                 )
                 row += 1
-        key = stdscr.getch()
+        key = _read_curses_key(stdscr)
         if key in (27, ord("q")):
             return str(current), True
         if key in (curses.KEY_UP, ord("k")):
@@ -894,7 +975,7 @@ def _curses_checklist(
             marker = "[x]" if choice in selected else "[ ]"
             attr = curses.A_REVERSE if row - 3 == cursor else 0
             stdscr.addnstr(row, 2, f"{marker} {choice}", max(width - 3, 1), attr)
-        key = stdscr.getch()
+        key = _read_curses_key(stdscr)
         if key == 27:
             return list(current or []), True
         if key in (curses.KEY_UP, ord("k")):
@@ -991,7 +1072,7 @@ def run_tui(
             stdscr.addnstr(0, 0, "Llama-Broker profile editor", max(width - 1, 1), curses.A_BOLD)
             if current is None:
                 stdscr.addnstr(2, 0, "No profiles configured. Press q to quit.", max(width - 1, 1))
-                key = stdscr.getch()
+                key = _read_curses_key(stdscr)
                 if key in (ord("q"), 27):
                     return 0
                 continue
@@ -1020,7 +1101,7 @@ def run_tui(
             if status:
                 stdscr.addnstr(max(height - 3, 0), 0, status, max(width - 1, 1), curses.A_BOLD)
             stdscr.addnstr(max(height - 2, 0), 0, "Enter opens a text box/dropdown; changes stay in memory until Save.", max(width - 1, 1))
-            key = stdscr.getch()
+            key = _read_curses_key(stdscr)
             if key in (ord("q"), 27):
                 if model.dirty:
                     if not _curses_confirm(stdscr, "Discard unsaved changes?", default=False):
