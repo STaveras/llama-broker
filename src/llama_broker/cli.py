@@ -4,7 +4,7 @@
 Usage:
     brokerctl model list                   List client-facing model references
     brokerctl status                       Show broker state
-    brokerctl render MODEL                 Render a profile unit
+    brokerctl profile render MODEL         Render a profile unit
     brokerctl load MODEL                   Load model profile
     brokerctl unload                       Unload the backend
     brokerctl verify [MODEL]               Verify SHA-256 hashes
@@ -2556,8 +2556,6 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show durable backend state")
     status.add_argument("-v", "--verbose", action="store_true", help="show full JSON state")
     status.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
-    render = subparsers.add_parser("render", help="render a profile unit without installing it")
-    render.add_argument("model")
 
     load = subparsers.add_parser("load", help="queue a model profile load")
     load.add_argument("model")
@@ -2701,6 +2699,8 @@ def build_parser() -> argparse.ArgumentParser:
     profiles_sub = profiles.add_subparsers(dest="profiles_command", required=True)
 
     profiles_sub.add_parser("list", help="list profiles with status")
+    render = profiles_sub.add_parser("render", help="render a profile unit without installing it")
+    render.add_argument("model")
     show = profiles_sub.add_parser("show", help="show one complete profile as JSON")
     show.add_argument("profile_id")
 
@@ -3042,7 +3042,7 @@ def main(argv: list[str] | None = None) -> int:
                     detail["live"] = live_state
                 print("\n" + json.dumps(detail, indent=2, sort_keys=True))
             return 1 if stale_active or phase not in {"active", "inactive"} else 0
-        if args.command == "render":
+        if args.command == "profile" and args.profiles_command == "render":
             profile = registry.resolve(args.model)
             print(controller.render_unit(profile.id), end="")
             return 0
