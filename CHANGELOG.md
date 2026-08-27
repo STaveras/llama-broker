@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.6**.
+Current assigned version: **0.6.7**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.7] - 2026-08-27 — Autotune progress and bounded commands
+
+Original checkpoint: `52c8c7ec2f82bd12f9ae3ea7620da54f2af0d0b8`.
+
+- Report candidate start/completion progress and measured results through an engine callback and CLI progress output.
+- Bound candidate lifecycle subprocesses and workload request timeouts, heartbeat maintenance during requests, and clear failed systemd candidate state during cleanup.
 
 ## [0.6.6] - 2026-08-27 — Apply candidate settings to the live workload
 

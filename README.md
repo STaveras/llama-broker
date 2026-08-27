@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.6
+## Retrospective version: 0.6.7
 
-**Apply candidate settings to the live workload** — source checkpoint 1c9c759dd11c (2026-08-27).
+**Autotune progress and bounded commands** — source checkpoint 52c8c7ec2f82 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 

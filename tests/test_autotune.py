@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
@@ -178,6 +179,31 @@ class AutotuneEngineTests(unittest.TestCase):
         self.assertEqual(result.winner.candidate.index, 1)
         self.assertEqual(result.best_latency.candidate.index, 1)
 
+    def test_engine_reports_candidate_progress(self) -> None:
+        schema = TuningSchema("llamacpp", (), "high", "adapter-defined")
+        baseline = Candidate(0, {}, (), "baseline")
+        candidate = Candidate(1, {"batch_size": 512}, (), "one-knob")
+        result = BenchmarkResult(baseline, (), True, (), 10.0, 2.0, 2.0, True)
+        progress: list[tuple[str, int, int, int, bool | None]] = []
+
+        search = AutotuneEngine(
+            schema=schema,
+            candidates=(baseline, candidate),
+            benchmark=lambda item, is_baseline: result if is_baseline else replace(
+                result, candidate=item, baseline=False
+            ),
+            progress=lambda phase, item, completed, total, measured: progress.append(
+                (phase, item.index, completed, total, measured is not None)
+            ),
+        ).run()
+
+        self.assertTrue(search.baseline.valid)
+        self.assertEqual(
+            progress,
+            [("started", 0, 0, 2, False), ("completed", 0, 1, 2, True),
+             ("started", 1, 1, 2, False), ("completed", 1, 2, 2, True)],
+        )
+
     def test_maintenance_lease_expires_and_can_be_reclaimed(self) -> None:
         now = [100.0]
         alive = {41: True, 42: True}
@@ -215,6 +241,7 @@ class AutotuneEngineTests(unittest.TestCase):
         self.assertEqual(list(unit_dir.glob("*.service")), [])
         self.assertTrue(any(command[-2:] == ("start", getattr(session, "unit_name")) for command in commands))
         self.assertTrue(any(len(command) >= 2 and command[-2] == "stop" for command in commands))
+        self.assertTrue(any(len(command) >= 2 and command[-2] == "reset-failed" for command in commands))
 
     def test_systemd_lifecycle_removes_unit_when_start_fails(self) -> None:
         commands: list[tuple[str, ...]] = []
