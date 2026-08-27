@@ -1,10 +1,16 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.10**.
+Current assigned version: **0.6.11**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.11] - 2026-08-27 — Remove deferred README note
+
+Original checkpoint: `480db28c41e191f6a28d359764035541b5ad42cd`.
+
+- Remove the deferred opt-in autotune constraint-family TODO from README. This checkpoint changes documentation only; the context/cache constraints introduced in 0.6.10 remain.
 
 ## [0.6.10] - 2026-08-27 — Keep context and cache policy fixed
 
