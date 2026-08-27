@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.5.1
+## Retrospective version: 0.6.0
 
-**Backend lifecycle integrity** — source checkpoint 4c785079e728 (2026-08-27).
+**Bounded autotune foundation** — source checkpoint 5a3cbfdadb5b (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 

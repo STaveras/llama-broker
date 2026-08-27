@@ -78,6 +78,16 @@ from .setup_wizard import (
     discover_candidates,
     render_report,
 )
+from .autotune import (
+    ADAPTERS,
+    AutotuneEngine,
+    AutotuneTransaction,
+    BenchmarkResult,
+    Candidate,
+    MaintenanceLease,
+    discover_schema,
+    generate_candidates,
+)
 from .daemon import (
     LOCK_PATH,
     PROFILES_PATH,
@@ -1445,6 +1455,149 @@ def _cmd_profiles_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _autotune_result_from_payload(candidate: Candidate, payload: object, *, baseline: bool) -> BenchmarkResult:
+    if not isinstance(payload, dict):
+        raise ProfileError("benchmark JSON entries must be objects")
+    try:
+        throughput = float(payload["aggregate_tokens_per_second"])
+        p95 = float(payload["p95_latency_seconds"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ProfileError(
+            "benchmark JSON requires aggregate_tokens_per_second and p95_latency_seconds"
+        ) from error
+    errors = payload.get("operational_errors", ())
+    if not isinstance(errors, (list, tuple)) or not all(isinstance(item, str) for item in errors):
+        raise ProfileError("operational_errors must be a list of strings")
+    valid = bool(payload.get("valid", not errors))
+    return BenchmarkResult(
+        candidate=candidate,
+        modes=(),
+        valid=valid,
+        operational_errors=tuple(errors),
+        aggregate_tokens_per_second=throughput,
+        p95_latency_seconds=p95,
+        best_latency_seconds=p95,
+        baseline=baseline,
+    )
+
+
+def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
+    manifest = load_manifest_source(args.profiles, allow_missing_artifacts=True)
+    registry = ProfileRegistry.from_path(args.profiles, allow_missing_artifacts=True)
+    profile = registry.resolve(args.profile_id)
+    if profile.runtime not in ADAPTERS:
+        raise ProfileError(f"autotune supports only llamacpp and vllm, not {profile.runtime!r}")
+    help_text = None
+    if args.help_file:
+        help_text = Path(args.help_file).read_text(encoding="utf-8")
+    schema = discover_schema(profile, help_text=help_text, include_fit=args.include_fit)
+    candidates = generate_candidates(profile, schema, max_candidates=args.max_candidates)
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "profile_id": profile.id,
+        "runtime": profile.runtime,
+        "schema": {
+            "source": schema.source,
+            "confidence": schema.confidence,
+            "knobs": [
+                {"name": knob.name, "values": list(knob.values), "confidence": knob.confidence}
+                for knob in schema.knobs
+            ],
+        },
+        "candidate_count": len(candidates),
+        "candidates": [
+            {"index": item.index, "strategy": item.strategy, "changes": dict(item.changes)}
+            for item in candidates
+        ],
+    }
+    if args.dry_run:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    if not args.benchmark_json:
+        print(
+            "refusing to run without a benchmark source; provide --benchmark-json "
+            "for an offline replay or use the programmatic BenchmarkHarness",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        benchmark_payload = json.loads(Path(args.benchmark_json).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProfileError(f"cannot read benchmark JSON: {error}") from error
+    if not isinstance(benchmark_payload, dict):
+        raise ProfileError("benchmark JSON must map candidate indexes to results")
+    results: dict[int, BenchmarkResult] = {}
+    for item in candidates:
+        entry = benchmark_payload.get(str(item.index), benchmark_payload.get(item.index))
+        if entry is not None:
+            results[item.index] = _autotune_result_from_payload(item, entry, baseline=item.index == 0)
+
+    def benchmark(item: Candidate, is_baseline: bool) -> BenchmarkResult:
+        result = results.get(item.index)
+        if result is None:
+            return _autotune_result_from_payload(
+                item,
+                {"aggregate_tokens_per_second": 0, "p95_latency_seconds": 0, "valid": False,
+                 "operational_errors": ["missing_benchmark_result"]},
+                baseline=is_baseline,
+            )
+        return result
+
+    search = AutotuneEngine(schema=schema, candidates=candidates, benchmark=benchmark).run()
+    report.update(
+        {
+            "winner": {"index": search.winner.candidate.index, "aggregate_tokens_per_second": search.winner.aggregate_tokens_per_second,
+                       "p95_latency_seconds": search.winner.p95_latency_seconds},
+            "best_latency": {"index": search.best_latency.candidate.index, "p95_latency_seconds": search.best_latency.p95_latency_seconds},
+            "evaluated": len(search.evaluated),
+        }
+    )
+    if not args.commit:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    from .daemon import AUTOTUNE_LEASE_PATH
+
+    active_state = _broker_admin_get("/admin/status")
+    backend_state = active_state.get("backend", {})
+    previous_active = backend_state.get("profile") if isinstance(backend_state, dict) else None
+    def reload_registry() -> None:
+        _broker_admin("/admin/autotune/reload", {})
+
+    def restore_active(active: str | None) -> None:
+        if active is None:
+            _broker_admin("/admin/stop", {})
+        else:
+            _broker_admin("/admin/switch", {"model": active, "wait": True})
+
+    def quiescent() -> bool:
+        status = _broker_admin_get("/admin/status")
+        leases = status.get("leases")
+        return isinstance(leases, dict) and leases.get("active_requests", 0) == 0
+
+    def mark_degraded(reason: str) -> None:
+        _broker_admin("/admin/autotune/degraded", {"reason": reason})
+
+    with MaintenanceLease(AUTOTUNE_LEASE_PATH, ttl_seconds=args.lease_ttl):
+        transaction = AutotuneTransaction(
+            Path(args.profiles),
+            reload_registry=reload_registry,
+            restore_active=restore_active,
+            quiescent=quiescent,
+            mark_degraded=mark_degraded,
+        )
+        committed = transaction.commit(
+            manifest,
+            profile_id=profile.id,
+            winner=search.winner.candidate,
+            adapter=ADAPTERS[profile.runtime],
+            previous_active=previous_active if isinstance(previous_active, str) else None,
+            state_path=Path(args.state_file) if args.state_file else None,
+        )
+    report["commit"] = committed
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 def _cmd_profiles_show(args: argparse.Namespace) -> int:
     registry, data = _load_editable_manifest(
         args.profiles, allow_missing_artifacts=True
@@ -2142,6 +2295,20 @@ def build_parser() -> argparse.ArgumentParser:
     show = profiles_sub.add_parser("show", help="show one complete profile as JSON")
     show.add_argument("profile_id")
 
+    autotune = profiles_sub.add_parser(
+        "autotune", help="benchmark bounded profile candidates and persist a winner"
+    )
+    autotune.add_argument("profile_id")
+    autotune.add_argument("--dry-run", action="store_true", help="only print schema and candidates")
+    autotune.add_argument("--json", action="store_true", help="reserved for machine-readable output")
+    autotune.add_argument("--help-file", help="captured runtime --help text for low-confidence discovery")
+    autotune.add_argument("--max-candidates", type=int, default=64)
+    autotune.add_argument("--include-fit", action="store_true", help="opt in to llama.cpp fit-family controls")
+    autotune.add_argument("--benchmark-json", help="offline candidate result map; no models or GPUs required")
+    autotune.add_argument("--commit", action="store_true", help="persist winner and ask live daemon to reload once")
+    autotune.add_argument("--lease-ttl", type=float, default=60.0)
+    autotune.add_argument("--state-file", help="optional atomic JSON result state path")
+
     discover = profiles_sub.add_parser("discover", help="discover backends via port sweep")
     discover.add_argument("--dirty-only", action="store_true", help="only recheck stale ports")
     discover.add_argument("--sweep", help="port range to scan (e.g. 8000-12000)")
@@ -2326,6 +2493,8 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_profiles_list(args)
             if args.profiles_command == "show":
                 return _cmd_profiles_show(args)
+            if args.profiles_command == "autotune":
+                return _cmd_profiles_autotune(args)
             if args.profiles_command == "discover":
                 return _cmd_profiles_discover(args)
             if args.profiles_command == "edit":

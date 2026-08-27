@@ -1266,6 +1266,20 @@ class BackendController:
         except KeyError as error:
             raise ConfigurationError(f"unknown profile: {profile_id!r}") from error
 
+    def replace_profiles(self, profiles: Mapping[str, Profile]) -> None:
+        """Replace the validated profile registry without restarting systemd."""
+
+        if not profiles:
+            raise ConfigurationError("at least one profile is required")
+        with self._lock:
+            old_profiles = self.profiles
+            self.profiles = dict(profiles)
+            try:
+                self._validate_profiles()
+            except BaseException:
+                self.profiles = old_profiles
+                raise
+
     def _emit(self, event: str, **fields: object) -> None:
         record: dict[str, object] = {"event": event, **fields}
         try:

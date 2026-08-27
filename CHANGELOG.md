@@ -1,10 +1,19 @@
 # Retrospective changelog
 
-Current assigned version: **0.5.1**.
+Current assigned version: **0.6.0**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.0] - 2026-08-27 — Bounded autotune foundation
+
+Original checkpoint: `5a3cbfdadb5b499df9384b474192fa5909229a6c`.
+
+- Introduce llama.cpp/vLLM tuning schemas, allowlisted field/extra-argument changes, deterministic baseline-first candidate generation, and bounded benchmark/search primitives (64 candidates, up to 30 minutes per profile).
+- Add benchmark measurement, maintenance leases, isolated systemd candidate lifecycle helpers, and transactional winner publication with registry reload, active-profile restoration, and compensation/degraded handling.
+- Expose profiles autotune with candidate-preview dry runs and offline benchmark-JSON replay; the CLI at this checkpoint requires replay data for evaluation and explicit --commit for publication. Live CLI benchmarking arrives in later checkpoints.
+- Expose autotune maintenance/degraded status and loopback administrative reload/degraded endpoints; add engine, lease, lifecycle, and compensation tests.
 
 ## [0.5.1] - 2026-08-27 — Backend lifecycle integrity
 
