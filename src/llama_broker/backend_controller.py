@@ -51,6 +51,7 @@ CommandRunner = Callable[[tuple[str, ...]], Any]
 ReadinessProbe = Callable[[str, float], bool]
 EndpointProbe = Callable[[], bool]
 VerifyCommand = Callable[[Profile], Sequence[str]]
+ArtifactVerifier = Callable[[Profile], None]
 
 
 @dataclass(frozen=True)
@@ -447,6 +448,7 @@ class BackendController:
         backend_listen_port: int | None = None,
         managed_args: Sequence[str] | Mapping[str, Sequence[str]] = (),
         verify_command: VerifyCommand | None = None,
+        artifact_verifier: ArtifactVerifier | None = None,
     ) -> None:
         if not profiles:
             raise ConfigurationError("at least one profile is required")
@@ -472,6 +474,7 @@ class BackendController:
         self.backend_listen_host = backend_listen_host
         self.backend_listen_port = backend_listen_port
         self.verify_command = verify_command
+        self.artifact_verifier = artifact_verifier
         if isinstance(managed_args, Mapping):
             self.managed_args = {
                 runtime: tuple(args) for runtime, args in managed_args.items()
@@ -1427,10 +1430,13 @@ class BackendController:
         return snapshot
 
     def _start(self, profile_id: str) -> None:
+        profile = self._profile(profile_id)
         self._require_not_cancelled(f"start:{profile_id}")
         self._require_all_quiescent(stage=f"pre_start:{profile_id}")
         self._require_endpoint_absent(stage=f"pre_start:{profile_id}")
         self._require_not_cancelled(f"pre_command_start:{profile_id}")
+        if self.artifact_verifier is not None:
+            self.artifact_verifier(profile)
         self._run("systemctl", "--user", "start", self.unit_name(profile_id))
 
     def _stop(self, profile_id: str) -> None:

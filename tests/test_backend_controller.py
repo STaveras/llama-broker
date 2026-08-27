@@ -582,6 +582,23 @@ class BackendControllerTest(unittest.TestCase):
         self.assertEqual(self.harness.probes[-1], ("qwen3.5-9b-vision", 45.0))
         self.assertEqual(state, {"generation": 2, "profile": "qwen-vision", "phase": "active"})
 
+    def test_switch_verifies_artifacts_before_starting_unit(self) -> None:
+        def reject(_profile: FakeProfile) -> None:
+            raise ConfigurationError("artifact digest mismatch")
+
+        self.controller.artifact_verifier = reject  # type: ignore[attr-defined]
+
+        with self.assertRaises(SwitchError) as caught:
+            self.controller.switch("main-27b")
+
+        self.assertIsInstance(caught.exception.__cause__, ConfigurationError)
+        self.assertIn("artifact digest mismatch", str(caught.exception))
+
+        self.assertNotIn(
+            ("systemctl", "--user", "start", self.controller.unit_name("main-27b")),
+            self.harness.commands,
+        )
+
     def test_successful_switch_persists_concrete_running_build_identity(self) -> None:
         profile = replace(
             self.main,
