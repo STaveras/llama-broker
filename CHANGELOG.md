@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.2**.
+Current assigned version: **0.6.3**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.3] - 2026-08-27 — Profile edits preserve the running backend
+
+Original checkpoint: `d79a64aca5421fd3b8fe517139d4de9cccb1862a`.
+
+- Publish validated profile edits and regenerate units without invoking the backend restart callback, including edits to the active profile.
+- Retain manifest/unit rollback on installation failure and update the profile-apply regression expectations.
 
 ## [0.6.2] - 2026-08-27 — Autotune all profiles by default
 

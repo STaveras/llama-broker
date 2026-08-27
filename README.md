@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.2
+## Retrospective version: 0.6.3
 
-**Autotune all profiles by default** — source checkpoint 0b245aa67808 (2026-08-27).
+**Profile edits preserve the running backend** — source checkpoint d79a64aca542 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
