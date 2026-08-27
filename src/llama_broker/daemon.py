@@ -49,6 +49,7 @@ from .broker_security import (
 from .tools.broker_backend import BackendClient
 from .tools.broker_backend import make_connection
 from .broker_profiles import Profile, ProfileError, ProfileRegistry
+from .autotune import MaintenanceLease
 from .profile_config import sha256_file
 from .paths import (
     CONFIG_DIR as XDG_CONFIG_DIR,
@@ -69,6 +70,7 @@ STATE_PATH = XDG_STATE_PATH
 LOCK_PATH = XDG_LOCK_PATH
 PROCESS_LOCK_PATH = XDG_PROCESS_LOCK_PATH
 SYSTEMD_USER_DIR = XDG_SYSTEMD_USER_DIR
+AUTOTUNE_LEASE_PATH = CONFIG_DIR / "autotune-maintenance.json"
 SERVICE_PREFIX = os.environ.get("LLAMA_BROKER_SERVICE_PREFIX", "llama-broker-profile")
 LEGACY_SERVICE_UNIT = "llama-server.service"
 
@@ -1230,6 +1232,8 @@ class BrokerApplication:
         self._recovery_attempts = 0
         self._recovery_next_at = 0.0
         self._recovery_profile: str | None = None
+        self._autotune_lease = MaintenanceLease(AUTOTUNE_LEASE_PATH)
+        self._autotune_degraded_reason: str | None = None
         state = dict(controller.state())
         self._controller_state = state
 
@@ -1641,13 +1645,18 @@ class BrokerApplication:
             state["declared_phase"] = "active"
             state["phase"] = "stale"
             state["stale_profile"] = profile_id
-        return {
-            "name": "Llama-Broker",
-            "status": (
+        health_status = (
+            "degraded"
+            if self._autotune_degraded_reason
+            else (
                 "ok"
                 if state.get("phase") == "inactive" or (phase == "active" and ready)
                 else "degraded"
-            ),
+            )
+        )
+        return {
+            "name": "Llama-Broker",
+            "status": health_status,
             "backend": {
                 "host": self.backend_host,
                 "port": self.backend_port,
@@ -1655,7 +1664,40 @@ class BrokerApplication:
                 "ready": ready,
             },
             "leases": self.coordinator.snapshot(),
+            "maintenance": {
+                "autotune": self._autotune_lease.status(),
+                "degraded_reason": self._autotune_degraded_reason,
+            },
         }
+
+    def reload_manifest_for_autotune(self) -> dict[str, Any]:
+        """Reload the validated manifest once without restarting the listener."""
+
+        if self.coordinator.quiescing or self.coordinator.active_requests > 0:
+            raise BrokerCoordinationError(
+                "autotune manifest reload requires a fully idle coordinator"
+            )
+        new_registry = ProfileRegistry.from_path(PROFILES_PATH)
+        active = self.coordinator.active_profile
+        if active is not None and new_registry.try_resolve(active) is None:
+            raise ProfileError(
+                f"autotune reload would remove the active profile {active!r}"
+            )
+        self.registry = new_registry
+        self._autotune_degraded_reason = None
+        replace_profiles = getattr(self.controller, "replace_profiles", None)
+        if callable(replace_profiles):
+            replace_profiles({profile.id: profile for profile in new_registry.profiles})
+        self._remember_controller_state(dict(self.controller.state()))
+        return self.health()
+
+    def mark_autotune_degraded(self, reason: str) -> None:
+        """Fail closed after autotune compensation cannot restore the registry."""
+
+        self._autotune_degraded_reason = str(reason)
+        active = self.coordinator.active_profile
+        if active is not None:
+            self.coordinator.invalidate_when_idle(active)
 
 
     def shutdown(self) -> None:
@@ -1819,6 +1861,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             "/admin/switch",
             "/admin/restart",
             "/admin/stop",
+            "/admin/autotune/reload",
+            "/admin/autotune/degraded",
             "/admin/credentials/rotate",
             "/admin/credentials/revoke",
         }:
@@ -1993,6 +2037,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         self.application.coordinator.switch_when_idle(profile.id)
             elif path == "/admin/stop":
                 self.application.coordinator.stop_when_idle()
+            elif path == "/admin/autotune/reload":
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.application.reload_manifest_for_autotune(),
+                )
+                return
+            elif path == "/admin/autotune/degraded":
+                reason = payload.get("reason")
+                if not isinstance(reason, str) or not reason:
+                    raise ValueError("reason must be a non-empty string")
+                self.application.mark_autotune_degraded(reason)
+                self._send_json(HTTPStatus.OK, self.application.health())
+                return
             elif path == "/admin/credentials/rotate":
                 replace = payload.get("replace", False)
                 if not isinstance(replace, bool):
@@ -2036,6 +2093,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
             "/admin/switch",
             "/admin/restart",
             "/admin/stop",
+            "/admin/autotune/reload",
+            "/admin/autotune/degraded",
             "/admin/credentials/rotate",
             "/admin/credentials/revoke",
             "/v1/models",
