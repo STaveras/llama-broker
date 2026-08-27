@@ -8,7 +8,6 @@ from unittest.mock import Mock
 
 from llama_broker.broker_profiles import ProfileRegistry
 from llama_broker.profile_config import (
-    ApplyError,
     apply_manifest_transaction,
     apply_simple_fields,
     draft_from_gguf,
@@ -126,35 +125,30 @@ class ProfileConfigTests(unittest.TestCase):
             load_manifest(self.manifest_path)
         self.assertEqual(self.manifest_path.read_text(encoding="utf-8"), unsupported)
 
-    def test_active_apply_failure_restores_manifest_and_units(self) -> None:
+    def test_active_apply_updates_without_restarting(self) -> None:
         updated = json.loads(json.dumps(self.data))
         record = next(item for item in updated["profiles"] if item["id"] == "fixture-vision-12b")
         record["batch_size"] = 32
         record["ubatch_size"] = 32
         install_calls: list[str] = []
-        restart_calls = 0
+        restart = Mock()
 
         def install() -> None:
             install_calls.append("install")
 
-        def restart() -> None:
-            nonlocal restart_calls
-            restart_calls += 1
-            if restart_calls == 1:
-                raise RuntimeError("restart failed")
+        result = apply_manifest_transaction(
+            self.manifest_path,
+            updated,
+            active_profile="fixture-vision-12b",
+            install_units=install,
+            restart_broker=restart,
+        )
 
-        with self.assertRaises(ApplyError):
-            apply_manifest_transaction(
-                self.manifest_path,
-                updated,
-                active_profile="fixture-vision-12b",
-                install_units=install,
-                restart_broker=restart,
-            )
-
-        self.assertEqual(load_manifest(self.manifest_path), self.data)
-        self.assertEqual(install_calls, ["install", "install"])
-        self.assertEqual(restart_calls, 2)
+        self.assertTrue(result.changed)
+        self.assertFalse(result.restarted)
+        self.assertEqual(load_manifest(self.manifest_path)["profiles"][1]["batch_size"], 32)
+        self.assertEqual(install_calls, ["install"])
+        restart.assert_not_called()
 
     def test_inactive_apply_does_not_restart(self) -> None:
         updated = json.loads(json.dumps(self.data))

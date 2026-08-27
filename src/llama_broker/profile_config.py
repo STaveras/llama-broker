@@ -745,55 +745,22 @@ def apply_manifest_transaction(
     restart_broker: Callable[[], Any],
     writer: Callable[[Path, Mapping[str, Any]], None] = write_manifest_atomically,
 ) -> ApplyResult:
-    """Publish a profile edit and roll back manifest/units on lifecycle failure."""
+    """Publish a profile edit without restarting a running backend."""
 
     path = Path(profiles_path)
     old_manifest = load_manifest_source(path)
     if old_manifest == new_manifest:
         return ApplyResult(changed=False, restarted=False)
     validate_manifest(new_manifest, directory=path.parent)
-    changed_ids = changed_profile_ids(old_manifest, new_manifest)
-    active_changed = active_profile is not None and active_profile in changed_ids
-    active_build_changed = False
-    if active_changed:
-        def profile_record(manifest: Mapping[str, Any]) -> Mapping[str, Any] | None:
-            records = manifest.get("profiles", [])
-            if not isinstance(records, list):
-                return None
-            return next(
-                (
-                    record
-                    for record in records
-                    if isinstance(record, Mapping) and record.get("id") == active_profile
-                ),
-                None,
-            )
-
-        before_profile = profile_record(old_manifest)
-        after_profile = profile_record(new_manifest)
-        identity_fields = ("runtime", "runtime_build", "server_binary", "server_sha256")
-        if before_profile is not None and after_profile is not None:
-            active_build_changed = any(
-                before_profile.get(field) != after_profile.get(field)
-                for field in identity_fields
-            )
-    if active_build_changed:
-        active_changed = False
     writer(path, new_manifest)
-    restart_attempted = False
     try:
         install_units()
-        if active_changed:
-            restart_attempted = True
-            restart_broker()
-        return ApplyResult(changed=True, restarted=active_changed)
+        return ApplyResult(changed=True, restarted=False)
     except Exception as error:
         rollback_errors: list[str] = []
         try:
             writer(path, old_manifest)
             install_units()
-            if active_changed and restart_attempted:
-                restart_broker()
         except Exception as rollback_error:
             rollback_errors.append(str(rollback_error))
         detail = f"profile apply failed: {error}"
