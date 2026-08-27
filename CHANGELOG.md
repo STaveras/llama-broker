@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.9**.
+Current assigned version: **0.6.10**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.10] - 2026-08-27 — Keep context and cache policy fixed
+
+Original checkpoint: `5e6cac5a800386d8cbf7549d3db45804d1ff5bdb`.
+
+- Remove context_size and cache-type fields from default llama.cpp/vLLM autotune knob allowlists and update schema tests.
+- Add a README follow-up note about possible explicit opt-in constraint families; no such opt-in controls are implemented here.
 
 ## [0.6.9] - 2026-08-27 — Reset failed candidates before stopping
 

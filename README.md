@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.9
+## Retrospective version: 0.6.10
 
-**Reset failed candidates before stopping** — source checkpoint 9856be8bc468 (2026-08-27).
+**Keep context and cache policy fixed** — source checkpoint 5e6cac5a8003 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
@@ -150,6 +150,11 @@ The stable additive OpenAI-compatible subset is under `/v1`:
 | `POST /v1/audio/transcriptions` | Authenticated, bounded `multipart/form-data` upload; the exact body and content type are forwarded to the currently loaded profile without parsing form fields. |
 
 ## TODO
+
+- [ ] **Opt-in autotune constraint families.** Keep `context_size` and cache
+  types fixed by default; later add explicit opt-in flags such as
+  `--context_size` and `--cache_types` when those dimensions should be
+  searched deliberately.
 
 - [x] **Forward multipart audio transcription requests.** The broker accepts
   authenticated, bounded `multipart/form-data` uploads at
