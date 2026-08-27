@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.13**.
+Current assigned version: **0.6.14**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.14] - 2026-08-27 — Sequential tuning and confidence metrics
+
+Original checkpoint: `6c27aa1078c9b02dc0e45fa6911cf277264c45cb`.
+
+- Use baseline-first adaptive coordinate descent: evaluate knobs in schema order, build on the current winner, and accept improvements only within the baseline p95 latency guardrail; remove generated interaction combinations.
+- Add latency means/standard deviations and latency/throughput confidence intervals to mode metrics and report JSON, with regression cases for accumulated winners and guardrails. These metrics are measurements, not hardware qualification.
 
 ## [0.6.13] - 2026-08-27 — Show winner configuration differences
 

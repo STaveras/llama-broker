@@ -12,7 +12,6 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import http.client
-import itertools
 import json
 import math
 import os
@@ -218,6 +217,11 @@ class ModeResult:
     operational_errors: tuple[str, ...]
     valid: bool
     repeats: int
+    latency_mean_seconds: float | None = None
+    latency_stddev_seconds: float | None = None
+    latency_ci95_seconds: tuple[float, float] | None = None
+    throughput_stddev_tokens_per_second: float | None = None
+    throughput_ci95_tokens_per_second: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -671,7 +675,7 @@ def generate_candidates(
     *,
     max_candidates: int = MAX_CANDIDATES,
 ) -> tuple[Candidate, ...]:
-    """Generate baseline, stable one-knob refinements, then limited interactions."""
+    """Generate baseline and stable one-knob stages in adapter-defined order."""
 
     if max_candidates <= 0 or max_candidates > MAX_CANDIDATES:
         raise AutotuneError(f"max_candidates must be in 1..{MAX_CANDIDATES}")
@@ -702,24 +706,6 @@ def generate_candidates(
                 )
             )
             index += 1
-    coupled = [knob for knob in schema.knobs if knob.coupled_group == "batch"]
-    if len(coupled) >= 2:
-        first, second = coupled[:2]
-        for left, right in itertools.product(first.values, second.values):
-            if left == baseline_changes.get(first.name) and right == baseline_changes.get(second.name):
-                continue
-            if index >= max_candidates:
-                break
-            candidates.append(
-                Candidate(
-                    index,
-                    {first.name: left, second.name: right},
-                    original_extra,
-                    "interaction",
-                    {"knobs": (first.name, second.name), "confidence": schema.confidence},
-                )
-            )
-            index += 1
     return tuple(candidates)
 
 
@@ -733,6 +719,36 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
     if lower == upper:
         return ordered[lower]
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+_T_CRITICAL_95: Mapping[int, float] = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+    10: 2.228,
+    11: 2.201,
+    12: 2.179,
+    15: 2.131,
+    20: 2.086,
+    25: 2.060,
+    30: 2.042,
+}
+
+
+def _mean_ci95(values: Sequence[float]) -> tuple[float, float] | None:
+    if len(values) < 2:
+        return None
+    mean = statistics.fmean(values)
+    standard_deviation = statistics.stdev(values)
+    critical = _T_CRITICAL_95.get(len(values) - 1, 1.96)
+    margin = critical * standard_deviation / math.sqrt(len(values))
+    return mean - margin, mean + margin
 
 
 class BenchmarkHarness:
@@ -882,23 +898,38 @@ class BenchmarkHarness:
         tokens = sum(item.generated_tokens for item in measurements)
         duration = sum(item.decode_seconds or item.end_to_end_seconds for item in measurements)
         ttfts = [item.ttft_seconds for item in measurements if item.ttft_seconds is not None]
+        latencies = [item.end_to_end_seconds for item in measurements]
+        throughput_values = [
+            item.generated_tokens / (item.decode_seconds or item.end_to_end_seconds)
+            for item in measurements
+            if (item.decode_seconds or item.end_to_end_seconds) > 0
+        ]
         decode_values = [
             item.generated_tokens / item.decode_seconds
             for item in measurements
             if item.decode_seconds and item.decode_seconds > 0
         ]
+        latency_ci95 = _mean_ci95(latencies)
+        throughput_ci95 = _mean_ci95(throughput_values)
         return ModeResult(
             mode=mode,
             scored_requests=len(measurements),
             aggregate_tokens_per_second=tokens / duration if duration else 0.0,
             p95_latency_seconds=_percentile(
-                [item.end_to_end_seconds for item in measurements], 0.95
+                latencies, 0.95
             ),
             p95_ttft_seconds=_percentile(ttfts, 0.95) if ttfts else None,
             streaming_decode_tokens_per_second=statistics.fmean(decode_values) if decode_values else None,
             operational_errors=tuple(sorted(set(errors))),
             valid=not errors,
             repeats=repeats,
+            latency_mean_seconds=statistics.fmean(latencies),
+            latency_stddev_seconds=statistics.stdev(latencies) if len(latencies) > 1 else 0.0,
+            latency_ci95_seconds=latency_ci95,
+            throughput_stddev_tokens_per_second=(
+                statistics.stdev(throughput_values) if len(throughput_values) > 1 else 0.0
+            ),
+            throughput_ci95_tokens_per_second=throughput_ci95,
         )
 
     @staticmethod
@@ -1158,7 +1189,7 @@ class SystemdCandidateLifecycle:
 
 
 class AutotuneEngine:
-    """Run baseline-first bounded search with a reliability gate."""
+    """Run baseline-first bounded adaptive coordinate descent."""
 
     def __init__(
         self,
@@ -1188,20 +1219,20 @@ class AutotuneEngine:
         if self.progress is not None:
             self.progress(phase, candidate, completed, total, result)
 
-    def run(self) -> SearchResult:
-        if not self.candidates or self.candidates[0].strategy != "baseline":
-            raise BaselineRejected("baseline must be the first candidate")
-        started = self.clock()
-        total = min(len(self.candidates), MAX_CANDIDATES)
-        self._progress("started", self.candidates[0], 0, total)
-        baseline = self.benchmark(self.candidates[0], True)
-        self._progress("completed", self.candidates[0], 1, total, baseline)
-        if not baseline.valid:
-            raise BaselineRejected(
-                f"baseline rejected: {', '.join(baseline.operational_errors) or 'invalid'}"
-            )
+    @staticmethod
+    def _score(result: BenchmarkResult) -> tuple[float, float]:
+        return (result.aggregate_tokens_per_second, -result.p95_latency_seconds)
+
+    @staticmethod
+    def _within_latency_guardrail(
+        result: BenchmarkResult, baseline: BenchmarkResult
+    ) -> bool:
+        return result.p95_latency_seconds <= baseline.p95_latency_seconds
+
+    def _run_flat(self, baseline: BenchmarkResult, started: float) -> tuple[list[BenchmarkResult], BenchmarkResult, str]:
         evaluated = [baseline]
         stopped_reason = "candidate_limit"
+        total = min(len(self.candidates), MAX_CANDIDATES)
         for candidate in self.candidates[1:]:
             if len(evaluated) >= MAX_CANDIDATES:
                 break
@@ -1212,16 +1243,89 @@ class AutotuneEngine:
             result = self.benchmark(candidate, False)
             evaluated.append(result)
             self._progress("completed", candidate, len(evaluated), total, result)
+        return evaluated, max(
+            (result for result in evaluated if self._reliable(result, baseline)),
+            key=self._score,
+        ), stopped_reason
+
+    def _run_adaptive(
+        self, baseline: BenchmarkResult, started: float
+    ) -> tuple[list[BenchmarkResult], BenchmarkResult, str]:
+        stages: dict[str, list[Candidate]] = {}
+        for candidate in self.candidates[1:]:
+            if candidate.strategy != "one-knob":
+                continue
+            knob = candidate.metadata.get("knob")
+            if isinstance(knob, str):
+                stages.setdefault(knob, []).append(candidate)
+        total = min(1 + sum(len(stage) for stage in stages.values()), MAX_CANDIDATES)
+        evaluated = [baseline]
+        incumbent = baseline
+        stopped_reason = "candidate_limit"
+        for knob in self.schema.names:
+            for source in stages.get(knob, ()):
+                if len(evaluated) >= MAX_CANDIDATES:
+                    return evaluated, incumbent, stopped_reason
+                if self.clock() - started >= self.max_seconds:
+                    return evaluated, incumbent, "time_limit"
+                changes = dict(incumbent.candidate.changes)
+                changes.update(source.changes)
+                candidate = Candidate(
+                    source.index,
+                    changes,
+                    incumbent.candidate.extra_args,
+                    source.strategy,
+                    {**source.metadata, "base_candidate": incumbent.candidate.index},
+                )
+                self._progress("started", candidate, len(evaluated), total)
+                result = self.benchmark(candidate, False)
+                evaluated.append(result)
+                self._progress("completed", candidate, len(evaluated), total, result)
+                if (
+                    self._reliable(result, baseline)
+                    and self._within_latency_guardrail(result, baseline)
+                    and self._score(result) > self._score(incumbent)
+                ):
+                    incumbent = result
+        return evaluated, incumbent, stopped_reason
+
+    def run(self) -> SearchResult:
+        if not self.candidates or self.candidates[0].strategy != "baseline":
+            raise BaselineRejected("baseline must be the first candidate")
+        started = self.clock()
+        has_stages = any(
+            candidate.strategy == "one-knob"
+            and isinstance(candidate.metadata.get("knob"), str)
+            for candidate in self.candidates[1:]
+        )
+        total = (
+            min(
+                1
+                + sum(
+                    1
+                    for candidate in self.candidates[1:]
+                    if candidate.strategy == "one-knob"
+                    and isinstance(candidate.metadata.get("knob"), str)
+                ),
+                MAX_CANDIDATES,
+            )
+            if has_stages
+            else min(len(self.candidates), MAX_CANDIDATES)
+        )
+        self._progress("started", self.candidates[0], 0, total)
+        baseline = self.benchmark(self.candidates[0], True)
+        self._progress("completed", self.candidates[0], 1, total, baseline)
+        if not baseline.valid:
+            raise BaselineRejected(
+                f"baseline rejected: {', '.join(baseline.operational_errors) or 'invalid'}"
+            )
+        if has_stages:
+            evaluated, winner, stopped_reason = self._run_adaptive(baseline, started)
+        else:
+            evaluated, winner, stopped_reason = self._run_flat(baseline, started)
         reliable = [result for result in evaluated if self._reliable(result, baseline)]
         if not reliable:
             raise CandidateRejected("no reliable autotune candidates")
-        winner = max(
-            reliable,
-            key=lambda result: (
-                result.aggregate_tokens_per_second,
-                -result.p95_latency_seconds,
-            ),
-        )
         best_latency = min(
             reliable,
             key=lambda result: (result.p95_latency_seconds, -result.aggregate_tokens_per_second),

@@ -195,6 +195,23 @@ class AutotuneEngineTests(unittest.TestCase):
         self.assertEqual({mode for mode, _, _ in lifecycle.sessions[0].requests}, {"text", "tools-json", "vision"})
         self.assertEqual(result.modes[0].scored_requests, 9)
 
+    def test_mode_result_records_variance_and_confidence_interval(self) -> None:
+        mode = BenchmarkHarness._mode_result(
+            "text",
+            (
+                ResponseMeasurement(100, 1.0, decode_seconds=0.5),
+                ResponseMeasurement(100, 1.2, decode_seconds=0.5),
+                ResponseMeasurement(100, 0.8, decode_seconds=0.5),
+            ),
+            (),
+            1,
+        )
+
+        self.assertAlmostEqual(mode.latency_stddev_seconds or 0.0, 0.2)
+        self.assertIsNotNone(mode.latency_ci95_seconds)
+        self.assertIsNotNone(mode.throughput_ci95_tokens_per_second)
+        self.assertEqual(mode.throughput_stddev_tokens_per_second, 0.0)
+
     def test_engine_requires_valid_baseline_and_selects_throughput_then_latency(self) -> None:
         schema = TuningSchema("llamacpp", (), "high", "adapter-defined")
         baseline = Candidate(0, {}, (), "baseline")
@@ -217,6 +234,79 @@ class AutotuneEngineTests(unittest.TestCase):
         self.assertEqual(seen, [(0, True), (1, False)])
         self.assertEqual(result.winner.candidate.index, 1)
         self.assertEqual(result.best_latency.candidate.index, 1)
+
+    def test_engine_combines_sequential_knob_winners(self) -> None:
+        schema = TuningSchema(
+            "llamacpp",
+            (
+                KnobSpec("knob_a", (0, 1, 2), "test", "high"),
+                KnobSpec("knob_b", (0, 1, 2), "test", "high"),
+            ),
+            "high",
+            "test",
+        )
+        candidates = (
+            Candidate(0, {"knob_a": 0, "knob_b": 0}, (), "baseline"),
+            Candidate(1, {"knob_a": 1}, (), "one-knob", {"knob": "knob_a"}),
+            Candidate(2, {"knob_a": 2}, (), "one-knob", {"knob": "knob_a"}),
+            Candidate(3, {"knob_b": 1}, (), "one-knob", {"knob": "knob_b"}),
+            Candidate(4, {"knob_b": 2}, (), "one-knob", {"knob": "knob_b"}),
+        )
+        scores = {
+            (0, 0): 10.0,
+            (1, 0): 12.0,
+            (2, 0): 11.0,
+            (1, 1): 13.0,
+            (1, 2): 12.5,
+        }
+        seen: list[dict[str, int]] = []
+
+        def benchmark(item: Candidate, is_baseline: bool) -> BenchmarkResult:
+            changes = {key: int(value) for key, value in item.changes.items()}
+            seen.append(changes)
+            score = scores[(changes["knob_a"], changes["knob_b"])]
+            return BenchmarkResult(item, (), True, (), score, 1.0, 1.0, is_baseline)
+
+        result = AutotuneEngine(
+            schema=schema,
+            candidates=candidates,
+            benchmark=benchmark,
+        ).run()
+
+        self.assertEqual(result.winner.candidate.changes, {"knob_a": 1, "knob_b": 1})
+        self.assertEqual(seen, [
+            {"knob_a": 0, "knob_b": 0},
+            {"knob_a": 1, "knob_b": 0},
+            {"knob_a": 2, "knob_b": 0},
+            {"knob_a": 1, "knob_b": 1},
+            {"knob_a": 1, "knob_b": 2},
+        ])
+
+    def test_engine_enforces_latency_guardrail_for_knob_winners(self) -> None:
+        schema = TuningSchema(
+            "llamacpp",
+            (KnobSpec("knob", (0, 1, 2), "test", "high"),),
+            "high",
+            "test",
+        )
+        baseline = Candidate(0, {"knob": 0}, (), "baseline")
+        too_slow = Candidate(1, {"knob": 1}, (), "one-knob", {"knob": "knob"})
+        acceptable = Candidate(2, {"knob": 2}, (), "one-knob", {"knob": "knob"})
+
+        def benchmark(item: Candidate, is_baseline: bool) -> BenchmarkResult:
+            if item.changes["knob"] == 1:
+                return BenchmarkResult(item, (), True, (), 20.0, 1.1, 1.1, is_baseline)
+            if item.changes["knob"] == 2:
+                return BenchmarkResult(item, (), True, (), 11.0, 0.9, 0.9, is_baseline)
+            return BenchmarkResult(item, (), True, (), 10.0, 1.0, 1.0, is_baseline)
+
+        result = AutotuneEngine(
+            schema=schema,
+            candidates=(baseline, too_slow, acceptable),
+            benchmark=benchmark,
+        ).run()
+
+        self.assertEqual(result.winner.candidate.changes, {"knob": 2})
 
     def test_engine_reports_candidate_progress(self) -> None:
         schema = TuningSchema("llamacpp", (), "high", "adapter-defined")
