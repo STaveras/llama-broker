@@ -465,6 +465,8 @@ class Profile:
     environment: Mapping[str, str]
     extra_args: tuple[str, ...]
     model_draft: Path | None
+    max_output_tokens: int | None = None
+    autotune: Mapping[str, Any] | None = None
 
     @property
     def is_transient(self) -> bool:
@@ -478,8 +480,10 @@ class Profile:
 
     @property
     def default_max_output_tokens(self) -> int:
-        """Return the swarm-friendly inverse-scaled output budget."""
+        """Return the swarm-friendly inverse-scaled output default."""
 
+        if self.max_output_tokens is not None:
+            return self.max_output_tokens
         return max(1, self.slot_context_window // (self.parallel**2))
 
     @property
@@ -711,6 +715,36 @@ def _parse_profile(
     parallel = _positive_int(record, "parallel")
     if runtime == "llamacpp" and parallel > MAX_PARALLEL:
         raise ProfileError(f"parallel slots for {profile_id!r} exceed safe limit {MAX_PARALLEL}")
+    max_output_tokens = (
+        _positive_int(record, "max_output_tokens")
+        if "max_output_tokens" in record
+        else None
+    )
+    autotune = record.get("autotune")
+    if autotune is not None:
+        if not isinstance(autotune, dict):
+            raise ProfileError(f"autotune metadata must be an object for {profile_id!r}")
+        allowed_autotune_fields = {
+            "status",
+            "winner_candidate",
+            "strategy",
+            "confidence",
+            "report",
+            "last_success_report",
+            "profile_revision",
+            "experiment_count",
+            "updated_at",
+            "accuracy",
+        }
+        unknown_autotune_fields = sorted(set(autotune) - allowed_autotune_fields)
+        if unknown_autotune_fields:
+            raise ProfileError(
+                f"unknown autotune metadata fields for {profile_id!r}: "
+                + ", ".join(unknown_autotune_fields)
+            )
+        status = autotune.get("status", "never")
+        if status not in {"never", "complete", "failed", "interrupted", "conflicted"}:
+            raise ProfileError(f"invalid autotune status for {profile_id!r}: {status!r}")
     if runtime == "llamacpp":
         batch_size = _positive_int(record, "batch_size")
         ubatch_size = _positive_int(record, "ubatch_size")
@@ -994,4 +1028,6 @@ def _parse_profile(
         environment=environment,
         extra_args=extra_args,
         model_draft=model_draft,
+        max_output_tokens=max_output_tokens,
+        autotune=autotune,
     )

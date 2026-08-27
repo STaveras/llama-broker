@@ -79,6 +79,8 @@ _BASE_FIELDS = frozenset(
         "extra_args",
         "architecture",
         "jinja_support",
+        "max_output_tokens",
+        "autotune",
     }
 )
 

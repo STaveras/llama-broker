@@ -26,18 +26,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import http.client
 import json
 import os
 import re
+import socket
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from . import daemon as broker_runtime
@@ -81,13 +84,20 @@ from .setup_wizard import (
 from .autotune import (
     ADAPTERS,
     AutotuneEngine,
+    BenchmarkHarness,
     AutotuneTransaction,
     BenchmarkResult,
     Candidate,
+    HttpCandidateSession,
     MaintenanceLease,
+    MaintenanceLeaseExpired,
+    SystemdCandidateLifecycle,
+    atomic_write_json,
     discover_schema,
     generate_candidates,
+    profile_revision,
 )
+from .tools.broker_backend import BackendClient
 from .daemon import (
     LOCK_PATH,
     PROFILES_PATH,
@@ -95,6 +105,7 @@ from .daemon import (
     backend_endpoint_ready,
     create_production_controller,
     effective_backend_url,
+    SYSTEMD_USER_DIR,
 )
 
 
@@ -1481,165 +1492,420 @@ def _autotune_result_from_payload(candidate: Candidate, payload: object, *, base
     )
 
 
+def _autotune_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _run_live_autotune(
+    profile: Profile,
+    schema: Any,
+    candidates: Sequence[Candidate],
+    *,
+    time_budget: float,
+    lease: MaintenanceLease | None = None,
+) -> Any:
+    """Run one profile's candidates through disposable local systemd units."""
+
+    security = load_security_config()
+    security.validate(require_files=True)
+    backend_url = effective_backend_url(security)
+    api_keys = security.authentication_keys()
+    api_key = api_keys[-1] if api_keys else None
+    endpoint: dict[str, Any] = {
+        "port": None,
+        "alias": None,
+        "max_output_tokens": profile.default_max_output_tokens,
+    }
+    base_parts = urlsplit(backend_url)
+    fixture_path: Path | None = None
+    if "vision" in profile.capabilities:
+        fixture_fd, fixture_name = tempfile.mkstemp(prefix="broker-autotune-", suffix=".png")
+        os.close(fixture_fd)
+        fixture_path = Path(fixture_name)
+        fixture_path.write_bytes(
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
+        )
+
+    def candidate_url() -> str:
+        port = endpoint.get("port")
+        if not isinstance(port, int):
+            raise RuntimeError("candidate endpoint was not allocated")
+        return base_parts._replace(
+            netloc=f"127.0.0.1:{port}", path="", query="", fragment=""
+        ).geturl()
+
+    def command_for(candidate: Candidate) -> Sequence[str]:
+        port = _autotune_loopback_port()
+        alias = f"autotune-{profile.id}-{candidate.index}"
+        endpoint.update(
+            {
+                "port": port,
+                "alias": alias,
+                "max_output_tokens": candidate.changes.get(
+                    "max_output_tokens", profile.default_max_output_tokens
+                ),
+            }
+        )
+        ephemeral = replace(profile, alias=alias, aliases=(alias,))
+        managed_args = security.backend_server_args(
+            listen_host="127.0.0.1",
+            listen_port=port,
+            runtime=profile.runtime,
+        )
+        return ephemeral.command(
+            host="127.0.0.1", port=port, managed_args=managed_args
+        )
+
+    def request_factory(_unit: str, mode: str, streaming: bool, concurrent: bool) -> Any:
+        if lease is not None:
+            lease.heartbeat()
+        alias = endpoint.get("alias")
+        if not isinstance(alias, str):
+            raise RuntimeError("candidate alias was not allocated")
+        return HttpCandidateSession(
+            candidate_url(),
+            alias,
+            image_fixture=fixture_path,
+            timeout=min(240.0, max(5.0, time_budget)),
+            ca_file=security.backend_tls_ca_file,
+            ssl_context=security.backend_client_context(),
+            api_key=api_key,
+            max_output_tokens=int(endpoint["max_output_tokens"]),
+        ).request(mode, streaming=streaming, concurrent=concurrent)
+
+    def readiness_probe(_candidate: Candidate) -> bool:
+        alias = endpoint.get("alias")
+        if not isinstance(alias, str):
+            return False
+        deadline = time.monotonic() + max(10.0, min(float(profile.startup_timeout), 300.0))
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        while time.monotonic() < deadline:
+            try:
+                with BackendClient(
+                    candidate_url(),
+                    timeout=1.0,
+                    ca_file=security.backend_tls_ca_file,
+                    ssl_context=security.backend_client_context(),
+                    default_headers=headers,
+                ) as client:
+                    payload = client.list_models()
+                models = payload.get("data", payload.get("models", []))
+                if isinstance(models, list) and any(
+                    isinstance(item, dict) and item.get("id") == alias for item in models
+                ):
+                    return True
+            except (OSError, TypeError, ValueError, http.client.HTTPException):
+                pass
+            time.sleep(0.25)
+        return False
+
+    def unit_directives(_candidate: Candidate) -> Sequence[str]:
+        service = profile.safety.service
+        lines = [
+            f"MemoryMax={service.memory_max_mib}M",
+            f"MemorySwapMax={service.memory_swap_max_mib}M",
+            f"TasksMax={service.tasks_max}",
+            "KillMode=control-group",
+            "SendSIGKILL=no",
+        ]
+        import shlex
+
+        lines.extend(
+            f"Environment={shlex.quote(f'{key}={value}')}"
+            for key, value in sorted(profile.environment.items())
+        )
+        return lines
+
+    lifecycle = SystemdCandidateLifecycle(
+        command_for,
+        request_factory,
+        unit_dir=SYSTEMD_USER_DIR,
+        readiness_probe=readiness_probe,
+        unit_directives_for=unit_directives,
+    )
+    try:
+        harness = BenchmarkHarness(lifecycle, image_fixture=fixture_path)
+
+        def benchmark(candidate: Candidate, baseline: bool) -> BenchmarkResult:
+            return harness.run(
+                candidate,
+                capabilities=profile.capabilities,
+                parallelism=profile.parallel,
+                baseline=baseline,
+            )
+
+        return AutotuneEngine(
+            schema=schema,
+            candidates=candidates,
+            benchmark=benchmark,
+            max_seconds=time_budget,
+        ).run()
+    finally:
+        if fixture_path is not None:
+            fixture_path.unlink(missing_ok=True)
+
+
+def _autotune_metrics(result: BenchmarkResult) -> dict[str, object]:
+    return {
+        "candidate": result.candidate.index,
+        "strategy": result.candidate.strategy,
+        "valid": result.valid,
+        "aggregate_tokens_per_second": result.aggregate_tokens_per_second,
+        "p95_latency_seconds": result.p95_latency_seconds,
+        "best_latency_seconds": result.best_latency_seconds,
+        "operational_errors": list(result.operational_errors),
+        "modes": [
+            {
+                "mode": mode.mode,
+                "scored_requests": mode.scored_requests,
+                "aggregate_tokens_per_second": mode.aggregate_tokens_per_second,
+                "p95_latency_seconds": mode.p95_latency_seconds,
+                "p95_ttft_seconds": mode.p95_ttft_seconds,
+                "streaming_decode_tokens_per_second": mode.streaming_decode_tokens_per_second,
+                "operational_errors": list(mode.operational_errors),
+                "valid": mode.valid,
+                "repeats": mode.repeats,
+            }
+            for mode in result.modes
+        ],
+    }
+
+
+def _autotune_report(profile: Profile, search: Any, *, status: str = "complete", error: str | None = None) -> dict[str, object]:
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "profile_id": profile.id,
+        "runtime": profile.runtime,
+        "accuracy": "not_measured",
+        "status": status,
+    }
+    if error is not None:
+        report["operational_errors"] = [error]
+        return report
+    report.update(
+        {
+            "stopped_reason": search.stopped_reason,
+            "experiment_count": len(search.evaluated),
+            "baseline": _autotune_metrics(search.baseline),
+            "winner": _autotune_metrics(search.winner),
+            "best_latency": _autotune_metrics(search.best_latency),
+            "experiments": [_autotune_metrics(item) for item in search.evaluated],
+        }
+    )
+    return report
+
+
 def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
+    if args.max_experiments <= 0 or args.max_experiments > 64:
+        raise ProfileError("--max-experiments must be in 1..64")
+    if args.time_budget <= 0:
+        raise ProfileError("--time-budget must be positive")
     manifest = load_manifest_source(args.profiles, allow_missing_artifacts=True)
     registry = ProfileRegistry.from_path(args.profiles, allow_missing_artifacts=True)
     profiles = [registry.resolve(args.profile_id)] if args.profile_id else list(registry.profiles)
-    help_text = Path(args.help_file).read_text(encoding="utf-8") if args.help_file else None
+    records = manifest.get("profiles")
+    if not isinstance(records, list):
+        raise ProfileError("profile manifest must contain a profiles list")
+    record_by_id = {
+        item.get("id"): item
+        for item in records
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
 
-    benchmark_payload: dict[object, object] | None = None
-    if not args.dry_run:
-        if not args.benchmark_json:
-            print(
-                "refusing to run without a benchmark source; provide --benchmark-json "
-                "for an offline replay or use the programmatic BenchmarkHarness",
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            loaded = json.loads(Path(args.benchmark_json).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise ProfileError(f"cannot read benchmark JSON: {error}") from error
-        if not isinstance(loaded, dict):
-            raise ProfileError("benchmark JSON must map profile IDs or candidate indexes to results")
-        benchmark_payload = loaded
-
+    eligible: list[Profile] = []
     reports: list[dict[str, object]] = []
-    searches: dict[str, tuple[Any, Any]] = {}
     for profile in profiles:
-        report: dict[str, object] = {
-            "schema_version": 1,
-            "profile_id": profile.id,
-            "runtime": profile.runtime,
-        }
-        if profile.runtime not in ADAPTERS:
-            report.update({"status": "skipped", "reason": f"unsupported runtime: {profile.runtime}"})
-            reports.append(report)
-            continue
-        schema = discover_schema(profile, help_text=help_text, include_fit=args.include_fit)
-        candidates = generate_candidates(profile, schema, max_candidates=args.max_candidates)
-        report.update(
-            {
-                "status": "planned",
-                "schema": {
-                    "source": schema.source,
-                    "confidence": schema.confidence,
-                    "knobs": [
-                        {"name": knob.name, "values": list(knob.values), "confidence": knob.confidence}
-                        for knob in schema.knobs
-                    ],
-                },
-                "candidate_count": len(candidates),
-                "candidates": [
-                    {"index": item.index, "strategy": item.strategy, "changes": dict(item.changes)}
-                    for item in candidates
-                ],
-            }
+        record = record_by_id.get(profile.id)
+        metadata = profile.autotune if isinstance(profile.autotune, Mapping) else {}
+        complete = (
+            metadata.get("status") == "complete"
+            and metadata.get("profile_revision") == profile_revision(record or {})
         )
-        if not args.dry_run:
-            assert benchmark_payload is not None
-            profile_results = benchmark_payload.get(profile.id, benchmark_payload.get(str(profile.id)))
-            if profile_results is None:
-                profile_results = benchmark_payload
-            if not isinstance(profile_results, dict):
-                raise ProfileError(f"benchmark results for profile {profile.id!r} must be an object")
-            results: dict[int, BenchmarkResult] = {}
-            for item in candidates:
-                entry = profile_results.get(str(item.index), profile_results.get(item.index))
-                if entry is not None:
-                    results[item.index] = _autotune_result_from_payload(
-                        item, entry, baseline=item.index == 0
-                    )
-
-            def benchmark(item: Candidate, is_baseline: bool) -> BenchmarkResult:
-                result = results.get(item.index)
-                if result is None:
-                    return _autotune_result_from_payload(
-                        item,
-                        {
-                            "aggregate_tokens_per_second": 0,
-                            "p95_latency_seconds": 0,
-                            "valid": False,
-                            "operational_errors": ["missing_benchmark_result"],
-                        },
-                        baseline=is_baseline,
-                    )
-                return result
-
-            search = AutotuneEngine(schema=schema, candidates=candidates, benchmark=benchmark).run()
-            searches[profile.id] = (search, ADAPTERS[profile.runtime])
-            report.update(
-                {
-                    "status": "evaluated",
-                    "winner": {
-                        "index": search.winner.candidate.index,
-                        "aggregate_tokens_per_second": search.winner.aggregate_tokens_per_second,
-                        "p95_latency_seconds": search.winner.p95_latency_seconds,
-                    },
-                    "best_latency": {
-                        "index": search.best_latency.candidate.index,
-                        "p95_latency_seconds": search.best_latency.p95_latency_seconds,
-                    },
-                    "evaluated": len(search.evaluated),
-                }
-            )
-        reports.append(report)
-
-    output: dict[str, object] = {"schema_version": 1, "profiles": reports}
-    if args.dry_run:
-        print(json.dumps(output, indent=2, sort_keys=True))
-        return 0
-    if not searches:
-        print("no supported profiles were available for autotune", file=sys.stderr)
-        return 2
-    if not args.commit:
-        print(json.dumps(output, indent=2, sort_keys=True))
-        return 0
-
-    from .daemon import AUTOTUNE_LEASE_PATH
+        if complete and not args.force:
+            reports.append({
+                "schema_version": 1,
+                "profile_id": profile.id,
+                "runtime": profile.runtime,
+                "status": "skipped",
+                "reason": "complete; use --force to retune",
+            })
+            continue
+        if profile.runtime not in ADAPTERS:
+            reports.append({
+                "schema_version": 1,
+                "profile_id": profile.id,
+                "runtime": profile.runtime,
+                "status": "skipped",
+                "reason": f"unsupported runtime: {profile.runtime}",
+            })
+            continue
+        eligible.append(profile)
 
     active_state = _broker_admin_get("/admin/status")
     backend_state = active_state.get("backend", {})
     previous_active = backend_state.get("profile") if isinstance(backend_state, dict) else None
-
-    def reload_registry() -> None:
-        _broker_admin("/admin/autotune/reload", {})
-
-    def restore_active(active: str | None) -> None:
-        if active is None:
-            _broker_admin("/admin/stop", {})
+    active_to_stop = previous_active if isinstance(previous_active, str) and any(
+        profile.id == previous_active for profile in eligible
+    ) else None
+    if active_to_stop is not None and not args.yes:
+        estimated = sum(
+            len(generate_candidates(
+                profile,
+                discover_schema(profile),
+                max_candidates=args.max_experiments,
+            ))
+            for profile in eligible
+        )
+        message = (
+            f"active profile {active_to_stop!r} must be stopped for autotune; "
+            f"{len(eligible)} profile(s), up to {estimated} candidate experiment(s). "
+            "Re-run with --yes to proceed."
+        )
+        if args.json:
+            print(json.dumps({"schema_version": 1, "status": "confirmation_required", "message": message}, sort_keys=True))
         else:
-            _broker_admin("/admin/switch", {"model": active, "wait": True})
+            print(message, file=sys.stderr)
+        return 2
 
-    def quiescent() -> bool:
-        status = _broker_admin_get("/admin/status")
-        leases = status.get("leases")
-        return isinstance(leases, dict) and leases.get("active_requests", 0) == 0
+    winners: dict[str, tuple[Candidate, Any]] = {}
+    winner_metadata: dict[str, Mapping[str, Any]] = {}
+    live_failures: set[str] = set()
+    active_succeeded = False
+    aborted = False
+    report_dir = broker_runtime.CONFIG_DIR / "autotune"
 
-    def mark_degraded(reason: str) -> None:
-        _broker_admin("/admin/autotune/degraded", {"reason": reason})
+    def restore_active() -> None:
+        if not isinstance(previous_active, str):
+            return
+        if active_to_stop is not None and active_to_stop not in live_failures:
+            _broker_admin("/admin/switch", {"model": previous_active, "wait": True})
 
-    winners = {
-        profile_id: (search.winner.candidate, adapter)
-        for profile_id, (search, adapter) in searches.items()
-    }
-    with MaintenanceLease(AUTOTUNE_LEASE_PATH, ttl_seconds=args.lease_ttl):
-        transaction = AutotuneTransaction(
-            Path(args.profiles),
-            reload_registry=reload_registry,
-            restore_active=restore_active,
-            quiescent=quiescent,
-            mark_degraded=mark_degraded,
-        )
-        committed = transaction.commit_many(
-            manifest,
-            winners=winners,
-            previous_active=previous_active if isinstance(previous_active, str) else None,
-            state_path=Path(args.state_file) if args.state_file else None,
-        )
-    output["commit"] = committed
-    print(json.dumps(output, indent=2, sort_keys=True))
-    return 0
+    try:
+        with MaintenanceLease(broker_runtime.AUTOTUNE_LEASE_PATH, ttl_seconds=60.0) as lease:
+            if active_to_stop is not None:
+                _broker_admin("/admin/stop", {})
+            for profile in eligible:
+                schema = discover_schema(profile, include_fit=False)
+                candidates = generate_candidates(
+                    profile, schema, max_candidates=args.max_experiments
+                )
+                if not args.json:
+                    print(f"Autotuning {profile.id}: {len(candidates)} candidate(s)")
+                try:
+                    search = _run_live_autotune(
+                        profile,
+                        schema,
+                        candidates,
+                        time_budget=args.time_budget,
+                        lease=lease,
+                    )
+                    report = _autotune_report(profile, search)
+                    report_path = report_dir / f"{profile.id}-{time.time_ns()}.json"
+                    atomic_write_json(report_path, report)
+                    record = record_by_id.get(profile.id, {})
+                    tuned_record = ADAPTERS[profile.runtime].apply(
+                        record, search.winner.candidate
+                    )
+                    metadata = {
+                        "status": "complete",
+                        "winner_candidate": search.winner.candidate.index,
+                        "strategy": search.winner.candidate.strategy,
+                        "confidence": search.winner.candidate.metadata.get("confidence", "high"),
+                        "report": str(report_path),
+                        "last_success_report": str(report_path),
+                        "profile_revision": profile_revision(tuned_record),
+                        "experiment_count": len(search.evaluated),
+                        "updated_at": time.time(),
+                        "accuracy": "not_measured",
+                    }
+                    winners[profile.id] = (search.winner.candidate, ADAPTERS[profile.runtime])
+                    winner_metadata[profile.id] = metadata
+                    reports.append({
+                        "profile_id": profile.id,
+                        "runtime": profile.runtime,
+                        "status": "complete" if not args.dry_run else "dry_run",
+                        "report": str(report_path),
+                        "winner": _autotune_metrics(search.winner),
+                        "experiment_count": len(search.evaluated),
+                    })
+                    if profile.id == active_to_stop:
+                        active_succeeded = True
+                except MaintenanceLeaseExpired:
+                    raise
+                except Exception as error:
+                    live_failures.add(profile.id)
+                    error_name = type(error).__name__
+                    report = _autotune_report(profile, None, status="failed", error=error_name)
+                    report_path = report_dir / f"{profile.id}-{time.time_ns()}-failed.json"
+                    atomic_write_json(report_path, report)
+                    reports.append({
+                        "profile_id": profile.id,
+                        "runtime": profile.runtime,
+                        "status": "failed",
+                        "error": error_name,
+                        "report": str(report_path),
+                    })
+                    if profile.id == active_to_stop and not args.json:
+                        print(f"{profile.id}: failed; leaving broker stopped", file=sys.stderr)
+    except (KeyboardInterrupt, MaintenanceLeaseExpired) as error:
+        aborted = True
+        live_failures.update(profile.id for profile in eligible)
+        if not args.json:
+            print(f"autotune aborted ({type(error).__name__}); no winners were committed", file=sys.stderr)
+        if active_to_stop is not None and isinstance(previous_active, str):
+            try:
+                _broker_admin("/admin/switch", {"model": previous_active, "wait": True})
+            except Exception as restore_error:
+                if not args.json:
+                    print(f"failed to restore active profile: {type(restore_error).__name__}", file=sys.stderr)
+    finally:
+        if not aborted and active_to_stop is not None and active_succeeded and (args.dry_run or not winners):
+            restore_active()
+
+    if winners and not args.dry_run and not aborted:
+        def reload_registry() -> None:
+            _broker_admin("/admin/autotune/reload", {})
+
+        def restore_after_reload(active: str | None) -> None:
+            if active is not None and active_to_stop not in live_failures:
+                _broker_admin("/admin/switch", {"model": active, "wait": True})
+
+        def quiescent() -> bool:
+            status = _broker_admin_get("/admin/status")
+            leases = status.get("leases")
+            return isinstance(leases, dict) and leases.get("active_requests", 0) == 0
+
+        def mark_degraded(reason: str) -> None:
+            _broker_admin("/admin/autotune/degraded", {"reason": reason})
+
+        with MaintenanceLease(broker_runtime.AUTOTUNE_LEASE_PATH, ttl_seconds=60.0):
+            transaction = AutotuneTransaction(
+                Path(args.profiles),
+                reload_registry=reload_registry,
+                restore_active=restore_after_reload,
+                quiescent=quiescent,
+                mark_degraded=mark_degraded,
+            )
+            committed = transaction.commit_many(
+                manifest,
+                winners=winners,
+                previous_active=previous_active if active_to_stop not in live_failures else None,
+                metadata=winner_metadata,
+            )
+        output: dict[str, object] = {"schema_version": 1, "profiles": reports, "commit": committed}
+    else:
+        output = {"schema_version": 1, "profiles": reports}
+
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        for item in reports:
+            print(f"{item.get('profile_id')}: {item.get('status')}")
+    return 1 if live_failures else 0
 
 
 def _cmd_profiles_show(args: argparse.Namespace) -> int:
@@ -2343,15 +2609,12 @@ def build_parser() -> argparse.ArgumentParser:
         "autotune", help="benchmark bounded profile candidates and persist a winner"
     )
     autotune.add_argument("profile_id", nargs="?", help="optional profile id; omit to tune all profiles")
-    autotune.add_argument("--dry-run", action="store_true", help="only print schema and candidates")
-    autotune.add_argument("--json", action="store_true", help="reserved for machine-readable output")
-    autotune.add_argument("--help-file", help="captured runtime --help text for low-confidence discovery")
-    autotune.add_argument("--max-candidates", type=int, default=64)
-    autotune.add_argument("--include-fit", action="store_true", help="opt in to llama.cpp fit-family controls")
-    autotune.add_argument("--benchmark-json", help="offline candidate result map; no models or GPUs required")
-    autotune.add_argument("--commit", action="store_true", help="persist winner and ask live daemon to reload once")
-    autotune.add_argument("--lease-ttl", type=float, default=60.0)
-    autotune.add_argument("--state-file", help="optional atomic JSON result state path")
+    autotune.add_argument("--force", action="store_true", help="retune complete profiles and resume matching work")
+    autotune.add_argument("--dry-run", action="store_true", help="run the real benchmark without persisting winners")
+    autotune.add_argument("--yes", action="store_true", help="allow graceful stop of the active profile")
+    autotune.add_argument("--max-experiments", type=int, default=64, help="maximum candidates per profile")
+    autotune.add_argument("--time-budget", type=float, default=1800.0, help="maximum seconds per profile")
+    autotune.add_argument("--json", action="store_true", help="emit clean machine-readable output")
 
     discover = profiles_sub.add_parser("discover", help="discover backends via port sweep")
     discover.add_argument("--dirty-only", action="store_true", help="only recheck stale ports")

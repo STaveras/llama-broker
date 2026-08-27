@@ -8,6 +8,9 @@ configuration.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import http.client
 import itertools
 import json
 import math
@@ -22,6 +25,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+
 
 
 MAX_CANDIDATES = 64
@@ -44,12 +48,14 @@ LLAMACPP_KNOBS = (
     "cache_type_v",
     "flash_attention",
     "gpu_layers",
+    "max_output_tokens",
 )
 VLLM_KNOBS = (
     "context_size",
     "tensor_parallel_size",
     "gpu_memory_utilization",
     "kv_cache_dtype",
+    "max_output_tokens",
 )
 FORBIDDEN_FIELDS = frozenset(
     {
@@ -90,12 +96,14 @@ FALLBACK_DOCUMENTED: Mapping[str, Mapping[str, tuple[Any, ...]]] = {
         "flash_attention": ("auto", "on", "off"),
         "cache_type_k": ("f16", "q8_0", "q4_0"),
         "cache_type_v": ("f16", "q8_0", "q4_0"),
+        "max_output_tokens": (64, 128, 256, 512, 1024),
     },
     "vllm": {
         "context_size": (2048, 4096, 8192, 16384, 32768),
         "tensor_parallel_size": (1, 2),
         "gpu_memory_utilization": (0.80, 0.90, 0.95),
         "kv_cache_dtype": ("auto", "float16", "bfloat16", "fp8"),
+        "max_output_tokens": (64, 128, 256, 512, 1024),
     },
 }
 HELP_FLAGS: Mapping[str, Mapping[str, str]] = {
@@ -259,6 +267,203 @@ class RequestProbe(Protocol):
     def __call__(
         self, session: CandidateSession, mode: str, *, streaming: bool, concurrent: bool
     ) -> ResponseMeasurement: ...
+
+
+class HttpCandidateSession:
+    """Deterministic local OpenAI-compatible workload for one candidate."""
+
+    _TEXT_PROMPT = (
+        "Write a Python function named safe_divide(a: float, b: float) -> "
+        "float | None. Return None on division by zero. Output only code."
+    )
+    _TOOLS_PROMPT = (
+        'Return JSON for tool_calls: get_weather(city="Boston") and '
+        'get_stock(symbol="AAPL"). Use the declared tool schema.'
+    )
+    _VISION_PROMPT = "Describe the provided image in one short sentence."
+
+    def __init__(
+        self,
+        base_url: str,
+        alias: str,
+        *,
+        image_fixture: Path | None = None,
+        timeout: float = 240.0,
+        ca_file: str | Path | None = None,
+        ssl_context: Any = None,
+        api_key: str | None = None,
+        max_output_tokens: int = 128,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.alias = alias
+        self.image_fixture = image_fixture
+        self.timeout = timeout
+        self.ca_file = ca_file
+        self.ssl_context = ssl_context
+        self.api_key = api_key
+        self.max_output_tokens = max(1, int(max_output_tokens))
+
+    def request(self, mode: str, *, streaming: bool, concurrent: bool) -> ResponseMeasurement:
+        del concurrent  # The harness supplies bounded waves; requests remain isolated here.
+        started = time.monotonic()
+        try:
+            payload = self._payload(mode, streaming=streaming)
+            connection = self._connection()
+            headers = {"Content-Type": "application/json", "Connection": "close"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+            )
+            response = connection.getresponse()
+            body = response.read()
+            elapsed = max(time.monotonic() - started, 1e-9)
+            connection.close()
+            if response.status < 200 or response.status >= 300:
+                text = body.decode("utf-8", errors="replace").lower()
+                return ResponseMeasurement(
+                    0,
+                    elapsed,
+                    error_class=f"http_{response.status}",
+                    context_rejected=response.status in {400, 413}
+                    and any(word in text for word in ("context", "token", "prompt")),
+                )
+            if streaming:
+                return self._stream_measurement(body, elapsed)
+            return self._json_measurement(body, elapsed)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            elapsed = max(time.monotonic() - started, 1e-9)
+            return ResponseMeasurement(0, elapsed, error_class=type(error).__name__)
+
+    def _connection(self) -> http.client.HTTPConnection:
+        from .tools.broker_backend import make_connection
+
+        return make_connection(
+            self.base_url,
+            timeout=self.timeout,
+            ca_file=self.ca_file,
+            ssl_context=self.ssl_context,
+        )
+
+    def _payload(self, mode: str, *, streaming: bool) -> dict[str, Any]:
+        if mode == "tools-json":
+            content: Any = self._TOOLS_PROMPT
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather for a city",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_stock",
+                        "description": "Get a stock quote",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"symbol": {"type": "string"}},
+                            "required": ["symbol"],
+                        },
+                    },
+                },
+            ]
+        elif mode == "vision":
+            if self.image_fixture is None or not self.image_fixture.is_file():
+                raise FileNotFoundError("vision fixture missing")
+            encoded = base64.b64encode(self.image_fixture.read_bytes()).decode("ascii")
+            content = [
+                {"type": "text", "text": self._VISION_PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                },
+            ]
+            tools = None
+        else:
+            content = self._TEXT_PROMPT
+            tools = None
+        payload: dict[str, Any] = {
+            "model": self.alias,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": self.max_output_tokens,
+            "temperature": 0.0,
+            "seed": 7,
+            "stream": streaming,
+        }
+        if tools is not None:
+            payload["tools"] = tools
+            payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    @staticmethod
+    def _token_count(value: Any) -> int:
+        if isinstance(value, int) and value > 0:
+            return value
+        if isinstance(value, str):
+            return max(1, len(value.split())) if value.strip() else 0
+        return 0
+
+    def _json_measurement(self, body: bytes, elapsed: float) -> ResponseMeasurement:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return ResponseMeasurement(0, elapsed, error_class="malformed_json", malformed=True)
+        if not isinstance(payload, dict):
+            return ResponseMeasurement(0, elapsed, error_class="malformed_json", malformed=True)
+        usage = payload.get("usage")
+        choices = payload.get("choices")
+        content = ""
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message", choices[0])
+            if isinstance(message, dict):
+                raw_content = message.get("content", choices[0].get("text", ""))
+                if isinstance(raw_content, str):
+                    content = raw_content
+        tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        tokens = self._token_count(tokens) or self._token_count(content)
+        if not choices or tokens <= 0:
+            return ResponseMeasurement(0, elapsed, error_class="malformed_response", malformed=True)
+        return ResponseMeasurement(tokens, elapsed, decode_seconds=elapsed, ttft_seconds=elapsed)
+
+    def _stream_measurement(self, body: bytes, elapsed: float) -> ResponseMeasurement:
+        content_parts: list[str] = []
+        usage_tokens: int | None = None
+        try:
+            for raw_line in body.decode("utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        continue
+                    payload = json.loads(data)
+                    if not isinstance(payload, dict):
+                        continue
+                    usage = payload.get("usage")
+                    if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
+                        usage_tokens = usage["completion_tokens"]
+                    choices = payload.get("choices")
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                        delta = choices[0].get("delta", choices[0])
+                        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                            content_parts.append(delta["content"])
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return ResponseMeasurement(0, elapsed, error_class="malformed_sse", malformed=True)
+        tokens = self._token_count(usage_tokens) or self._token_count("".join(content_parts))
+        if tokens <= 0:
+            return ResponseMeasurement(0, elapsed, error_class="malformed_stream", malformed=True)
+        return ResponseMeasurement(tokens, elapsed, decode_seconds=elapsed, ttft_seconds=elapsed)
 
 
 class RuntimeAdapter(Protocol):
@@ -474,7 +679,7 @@ def generate_candidates(
     baseline_changes = {
         knob.name: getattr(profile, knob.name)
         for knob in schema.knobs
-        if hasattr(profile, knob.name)
+        if hasattr(profile, knob.name) and getattr(profile, knob.name) is not None
     }
     original_extra = tuple(str(value) for value in getattr(profile, "extra_args", ()))
     candidates: list[Candidate] = [
@@ -622,6 +827,8 @@ class BenchmarkHarness:
                 ),
                 baseline=baseline,
             )
+        except MaintenanceLeaseExpired:
+            raise
         except (AutotuneError, OSError, subprocess.SubprocessError, TimeoutError, RuntimeError) as error:
             return self._invalid(candidate, type(error).__name__, baseline=baseline)
         finally:
@@ -863,6 +1070,7 @@ class SystemdCandidateLifecycle:
         unit_dir: Path,
         runner: Callable[[Sequence[str]], Any] | None = None,
         readiness_probe: Callable[[Candidate], bool] | None = None,
+        unit_directives_for: Callable[[Candidate], Sequence[str]] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.command_for = command_for
@@ -870,6 +1078,7 @@ class SystemdCandidateLifecycle:
         self.unit_dir = Path(unit_dir)
         self.runner = runner or (lambda command: subprocess.run(command, check=True))
         self.readiness_probe = readiness_probe or (lambda _candidate: True)
+        self.unit_directives_for = unit_directives_for or (lambda _candidate: ())
         self.clock = clock
 
     def _run(self, *command: str) -> None:
@@ -896,11 +1105,13 @@ class SystemdCandidateLifecycle:
         command = tuple(str(part) for part in self.command_for(candidate))
         if not command:
             raise AutotuneError("candidate command cannot be empty")
+        directives = [str(line) for line in self.unit_directives_for(candidate)]
         unit_path.write_text(
             "[Unit]\nDescription=Llama Broker autotune candidate\n"
             "[Service]\nType=exec\n"
             f"ExecStart={shlex.join(command)}\n"
-            "KillSignal=SIGINT\nTimeoutStopSec=20\n",
+            + "".join(f"{line.rstrip()}\n" for line in directives)
+            + "KillSignal=SIGINT\nTimeoutStopSec=20\n",
             encoding="utf-8",
         )
         started = False
@@ -1022,12 +1233,23 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def profile_revision(record: Mapping[str, Any]) -> str:
+    """Return a stable digest for configuration owned by the profile itself."""
+
+    canonical = json.loads(json.dumps(record))
+    if isinstance(canonical, dict):
+        canonical.pop("autotune", None)
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def apply_winner_to_manifest(
     manifest: Mapping[str, Any],
     profile_id: str,
     winner: Candidate,
     *,
     adapter: RuntimeAdapter,
+    autotune_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a copied manifest containing only whitelisted winner changes."""
 
@@ -1038,12 +1260,16 @@ def apply_winner_to_manifest(
     for record in records:
         if isinstance(record, dict) and record.get("id") == profile_id:
             updated = adapter.apply(record, winner)
-            updated["autotune"] = {
-                "winner_candidate": winner.index,
-                "strategy": winner.strategy,
-                "confidence": winner.metadata.get("confidence", "high"),
-                "hardware_fingerprint": None,
-            }
+            updated["autotune"] = dict(
+                autotune_metadata
+                or {
+                    "status": "complete",
+                    "winner_candidate": winner.index,
+                    "strategy": winner.strategy,
+                    "confidence": winner.metadata.get("confidence", "high"),
+                    "accuracy": "not_measured",
+                }
+            )
             record.clear()
             record.update(updated)
             return output
@@ -1095,6 +1321,7 @@ class AutotuneTransaction:
         winners: Mapping[str, tuple[Candidate, RuntimeAdapter]],
         previous_active: str | None,
         state_path: Path | None = None,
+        metadata: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Commit several profile winners with one reload and compensation boundary."""
 
@@ -1106,7 +1333,11 @@ class AutotuneTransaction:
         updated: Mapping[str, Any] = manifest
         for profile_id, (winner, adapter) in winners.items():
             updated = apply_winner_to_manifest(
-                updated, profile_id, winner, adapter=adapter
+                updated,
+                profile_id,
+                winner,
+                adapter=adapter,
+                autotune_metadata=(metadata or {}).get(profile_id),
             )
         atomic_write_json(self.manifest_path, updated)
         result = {
@@ -1155,6 +1386,7 @@ __all__ = [
     "Candidate",
     "CandidateRejected",
     "FALLBACK_DOCUMENTED",
+    "HttpCandidateSession",
     "KnobSpec",
     "LlamaCppAdapter",
     "MaintenanceLeaseExpired",
