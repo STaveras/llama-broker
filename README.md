@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.12
+## Retrospective version: 0.6.13
 
-**Keep parallelism and flash attention fixed** — source checkpoint 52bdd25d0dcc (2026-08-27).
+**Show winner configuration differences** — source checkpoint b86e56a43852 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 

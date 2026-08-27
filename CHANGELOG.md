@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.12**.
+Current assigned version: **0.6.13**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.13] - 2026-08-27 — Show winner configuration differences
+
+Original checkpoint: `b86e56a43852f452218a4a27bf9f3b0c423833bc`.
+
+- Compute normalized before/after differences for winner fields and extra arguments, include them in JSON reports, and print them in human-readable autotune results.
+- Add a report regression case for winner changes and unchanged-field omission.
 
 ## [0.6.12] - 2026-08-27 — Keep parallelism and flash attention fixed
 

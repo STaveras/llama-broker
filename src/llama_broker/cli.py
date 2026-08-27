@@ -1643,8 +1643,39 @@ def _run_live_autotune(
             fixture_path.unlink(missing_ok=True)
 
 
-def _autotune_metrics(result: BenchmarkResult) -> dict[str, object]:
-    return {
+def _json_value(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    return value
+
+
+def _candidate_changes(profile: Profile, candidate: Candidate) -> dict[str, dict[str, Any]]:
+    changes: dict[str, dict[str, Any]] = {}
+    for field_name, after in candidate.changes.items():
+        before = getattr(profile, field_name, None)
+        if before != after:
+            changes[field_name] = {
+                "before": _json_value(before),
+                "after": _json_value(after),
+            }
+    before_extra = tuple(str(value) for value in getattr(profile, "extra_args", ()))
+    after_extra = tuple(str(value) for value in candidate.extra_args)
+    if before_extra != after_extra:
+        changes["extra_args"] = {
+            "before": _json_value(before_extra),
+            "after": _json_value(after_extra),
+        }
+    return changes
+
+
+def _autotune_metrics(
+    result: BenchmarkResult, profile: Profile | None = None
+) -> dict[str, object]:
+    metrics: dict[str, object] = {
         "candidate": result.candidate.index,
         "strategy": result.candidate.strategy,
         "valid": result.valid,
@@ -1667,6 +1698,9 @@ def _autotune_metrics(result: BenchmarkResult) -> dict[str, object]:
             for mode in result.modes
         ],
     }
+    if profile is not None:
+        metrics["changes"] = _candidate_changes(profile, result.candidate)
+    return metrics
 
 
 def _autotune_report(profile: Profile, search: Any, *, status: str = "complete", error: str | None = None) -> dict[str, object]:
@@ -1684,10 +1718,11 @@ def _autotune_report(profile: Profile, search: Any, *, status: str = "complete",
         {
             "stopped_reason": search.stopped_reason,
             "experiment_count": len(search.evaluated),
-            "baseline": _autotune_metrics(search.baseline),
-            "winner": _autotune_metrics(search.winner),
-            "best_latency": _autotune_metrics(search.best_latency),
-            "experiments": [_autotune_metrics(item) for item in search.evaluated],
+            "baseline": _autotune_metrics(search.baseline, profile),
+            "winner": _autotune_metrics(search.winner, profile),
+            "best_latency": _autotune_metrics(search.best_latency, profile),
+            "winner_changes": _candidate_changes(profile, search.winner.candidate),
+            "experiments": [_autotune_metrics(item, profile) for item in search.evaluated],
         }
     )
     return report
@@ -1857,7 +1892,8 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
                         "runtime": profile.runtime,
                         "status": "complete" if not args.dry_run else "dry_run",
                         "report": str(report_path),
-                        "winner": _autotune_metrics(search.winner),
+                        "winner": _autotune_metrics(search.winner, profile),
+                        "winner_changes": _candidate_changes(profile, search.winner.candidate),
                         "experiment_count": len(search.evaluated),
                     })
                     if profile.id == active_to_stop:
@@ -1941,6 +1977,18 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
                     f"p95={winner.get('p95_latency_seconds', 0):.3f}s "
                     f"report={item.get('report')}"
                 )
+                changes = item.get("winner_changes")
+                if isinstance(changes, Mapping):
+                    if changes:
+                        print("  winner changes:")
+                        for field_name, change in changes.items():
+                            if isinstance(change, Mapping):
+                                print(
+                                    f"    {field_name}: {change.get('before')!r} "
+                                    f"-> {change.get('after')!r}"
+                                )
+                    else:
+                        print("  winner changes: none (baseline retained)")
             else:
                 print(f"{item.get('profile_id')}: {item.get('status')}")
     return 1 if live_failures else 0
