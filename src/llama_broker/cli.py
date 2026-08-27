@@ -14,12 +14,12 @@ Usage:
     brokerctl integrate configure [TOOLS]   Configure AI coding tools
     brokerctl security rotate               Rotate native API keys
     brokerctl security revoke KEY           Revoke a native API key
-    brokerctl profiles list                List profiles with status
-    brokerctl profiles show ID             Show one complete profile as JSON
-    brokerctl profiles add ID --model PATH Add a complete profile
-    brokerctl profiles discover            Discover backends via port sweep
-    brokerctl profiles edit [MODEL]        Open the field-oriented profile editor
-    brokerctl profiles add MODEL           Inspect a candidate (non-mutating)
+    brokerctl profile list                 List profiles with status
+    brokerctl profile show ID              Show one complete profile as JSON
+    brokerctl profile add ID --model PATH  Add a complete profile
+    brokerctl profile discover             Discover backends via port sweep
+    brokerctl profile edit [MODEL]         Open the field-oriented profile editor
+    brokerctl profile add MODEL            Inspect a candidate (non-mutating)
     brokerctl runtime list                 List runtimes and their profiles
 """
 
@@ -467,7 +467,10 @@ def _remove_optional_field(record: dict[str, object], field: str) -> None:
         for key in ("fit", "fit_target_mib", "fit_ctx", "ctx_checkpoints", "cache_ram_mib"):
             record.pop(key, None)
         return
-    supported = "mmproj, restore, model-draft, environment, extra-args, aliases, fit"
+    if field == "autotune":
+        record.pop("autotune", None)
+        return
+    supported = "mmproj, restore, model-draft, environment, extra-args, aliases, fit, autotune"
     raise ProfileError(f"unknown optional field {field!r}; supported fields: {supported}")
 
 
@@ -1904,7 +1907,17 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
         print(json.dumps(output, indent=2, sort_keys=True))
     else:
         for item in reports:
-            print(f"{item.get('profile_id')}: {item.get('status')}")
+            winner = item.get("winner")
+            if isinstance(winner, dict):
+                print(
+                    f"{item.get('profile_id')}: {item.get('status')} "
+                    f"candidate={winner.get('candidate')} "
+                    f"throughput={winner.get('aggregate_tokens_per_second', 0):.2f} tok/s "
+                    f"p95={winner.get('p95_latency_seconds', 0):.3f}s "
+                    f"report={item.get('report')}"
+                )
+            else:
+                print(f"{item.get('profile_id')}: {item.get('status')}")
     return 1 if live_failures else 0
 
 

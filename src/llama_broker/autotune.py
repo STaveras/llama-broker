@@ -9,6 +9,7 @@ configuration.
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import http.client
 import itertools
@@ -306,6 +307,7 @@ class HttpCandidateSession:
     def request(self, mode: str, *, streaming: bool, concurrent: bool) -> ResponseMeasurement:
         del concurrent  # The harness supplies bounded waves; requests remain isolated here.
         started = time.monotonic()
+        connection: http.client.HTTPConnection | None = None
         try:
             payload = self._payload(mode, streaming=streaming)
             connection = self._connection()
@@ -321,7 +323,6 @@ class HttpCandidateSession:
             response = connection.getresponse()
             body = response.read()
             elapsed = max(time.monotonic() - started, 1e-9)
-            connection.close()
             if response.status < 200 or response.status >= 300:
                 text = body.decode("utf-8", errors="replace").lower()
                 return ResponseMeasurement(
@@ -337,6 +338,9 @@ class HttpCandidateSession:
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
             elapsed = max(time.monotonic() - started, 1e-9)
             return ResponseMeasurement(0, elapsed, error_class=type(error).__name__)
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _connection(self) -> http.client.HTTPConnection:
         from .tools.broker_backend import make_connection
@@ -793,14 +797,25 @@ class BenchmarkHarness:
                 scored = SERIAL_REQUESTS_PER_MODE
                 wave_width = min(max(1, parallelism), MAX_SCORED_REQUESTS_PER_MODE)
                 for _ in range(CONCURRENCY_WAVES_PER_MODE):
-                    for _ in range(wave_width):
-                        if scored >= MAX_SCORED_REQUESTS_PER_MODE:
-                            break
-                        measurement = self.request_probe(
-                            session, mode, streaming=True, concurrent=True
-                        )
-                        self._collect(measurement, measurements, errors)
-                        scored += 1
+                    remaining = MAX_SCORED_REQUESTS_PER_MODE - scored
+                    request_count = min(wave_width, remaining)
+                    if request_count <= 0:
+                        break
+                    with ThreadPoolExecutor(max_workers=request_count) as executor:
+                        futures = [
+                            executor.submit(
+                                self.request_probe,
+                                session,
+                                mode,
+                                streaming=True,
+                                concurrent=True,
+                            )
+                            for _ in range(request_count)
+                        ]
+                        for future in as_completed(futures):
+                            measurement = future.result()
+                            self._collect(measurement, measurements, errors)
+                            scored += 1
                 repeats = 1
                 while measurements and self._high_variance(measurements) and repeats < MAX_HIGH_VARIANCE_REPEATS:
                     measurement = self.request_probe(

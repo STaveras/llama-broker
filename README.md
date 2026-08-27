@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.4
+## Retrospective version: 0.6.5
 
-**Live on-demand autotune** — source checkpoint 699922468afe (2026-08-27).
+**Concurrent benchmark waves and cleanup** — source checkpoint d71f4ed05082 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
