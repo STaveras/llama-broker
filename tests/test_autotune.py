@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Sequence
+from typing import Any, Sequence, cast
 
 from llama_broker.autotune import (
     ADAPTERS,
@@ -29,6 +29,7 @@ from llama_broker.autotune import (
     parse_runtime_help,
     patch_autotune_extra_args,
 )
+from llama_broker.cli import _autotune_report
 
 
 class FakeSession:
@@ -111,6 +112,35 @@ class AutotuneEngineTests(unittest.TestCase):
         self.assertEqual(schema.confidence, "low")
         self.assertEqual(schema.names, ("batch_size",))
         self.assertNotIn("flash_attention", schema.names)
+
+    def test_report_includes_before_after_changes(self) -> None:
+        baseline_candidate = Candidate(
+            0, {"batch_size": 256}, self.profile.extra_args, "baseline"
+        )
+        winner_candidate = Candidate(
+            1, {"batch_size": 512}, self.profile.extra_args, "one-knob"
+        )
+        baseline = BenchmarkResult(baseline_candidate, (), True, (), 10.0, 2.0, 2.0, True)
+        winner = BenchmarkResult(winner_candidate, (), True, (), 11.0, 1.9, 1.9, False)
+        search = SimpleNamespace(
+            baseline=baseline,
+            winner=winner,
+            best_latency=winner,
+            evaluated=(baseline, winner),
+            stopped_reason="candidate_limit",
+        )
+
+        report = cast(dict[str, Any], _autotune_report(cast(Any, self.profile), search))
+
+        self.assertEqual(
+            report["winner_changes"],
+            {"batch_size": {"before": 256, "after": 512}},
+        )
+        self.assertEqual(report["experiments"][0]["changes"], {})
+        self.assertEqual(
+            report["experiments"][1]["changes"],
+            {"batch_size": {"before": 256, "after": 512}},
+        )
 
     def test_candidate_order_cap_and_interaction_are_deterministic(self) -> None:
         schema = TuningSchema(
