@@ -71,6 +71,38 @@ class BrokerApplicationShutdownTests(unittest.TestCase):
 
         self.assertEqual(controller.stops, 0)
 
+    def test_server_construction_failure_handoffs_without_stopping_backend(self) -> None:
+        lock = object()
+        controller = BlockingController()
+        application = make_application(controller)
+        with (
+            patch.object(
+                llama_broker, "acquire_process_instance_lock", return_value=lock
+            ),
+            patch.object(
+                llama_broker,
+                "create_production_application",
+                return_value=(application, object()),
+            ),
+            patch.object(
+                llama_broker,
+                "BrokerServer",
+                side_effect=OSError("listener bind failed"),
+            ),
+            patch.object(
+                llama_broker, "load_security_config", return_value=SimpleNamespace()
+            ),
+            patch.object(
+                llama_broker, "stop_production_units_after_startup_failure"
+            ) as emergency_stop,
+            patch.object(llama_broker, "release_process_instance_lock") as release,
+        ):
+            self.assertEqual(llama_broker.main(), 1)
+
+        self.assertEqual(controller.stops, 0)
+        emergency_stop.assert_not_called()
+        release.assert_called_once_with(lock)
+
 
 class CoordinatorShutdownTests(unittest.TestCase):
     def test_failed_transition_clears_active_profile_without_restore(self) -> None:

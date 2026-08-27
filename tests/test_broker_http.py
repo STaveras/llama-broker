@@ -67,6 +67,24 @@ class FakeController:
             self.generation += 1
             return self.state()
 
+    def record_recovery_failure(
+        self, profile: str, *, attempts: int, error: str
+    ) -> dict[str, object]:
+        with self._lock:
+            self.profile = None
+            self.generation += 1
+            return {
+                "generation": self.generation,
+                "profile": None,
+                "phase": "stale",
+                "stale_profile": profile,
+                "recovery": {
+                    "attempts": attempts,
+                    "error": error,
+                    "action": "broker_watchdog_restart",
+                },
+            }
+
 
 class BackendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -965,6 +983,46 @@ class BrokerHttpTests(unittest.TestCase):
             self.assertIsNone(application.coordinator.active_profile)
         finally:
             application.shutdown()
+
+    def test_profile_artifact_verifier_rehashes_projector_before_start(self) -> None:
+        profile = self.registry.get("vision")
+        self.assertIsNotNone(profile.mmproj_path)
+        assert profile.mmproj_path is not None
+        mmproj_path = Path(profile.mmproj_path)
+        mmproj_path.write_bytes(b"tampered-projector")
+
+        with self.assertRaisesRegex(BackendControllerError, "mmproj SHA mismatch"):
+            llama_broker._verify_profile_artifacts(profile)
+
+    def test_failed_recovery_cannot_republish_dead_profile_as_active(self) -> None:
+        application = self.broker.application  # type: ignore[attr-defined]
+        application._backend_alias_ready = lambda _alias: False
+
+        class OnePassStop:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def wait(self, _timeout: float) -> bool:
+                self.calls += 1
+                return self.calls > 1
+
+            def set(self) -> None:
+                return
+
+        application._recovery_stop = OnePassStop()  # type: ignore[assignment]
+        self.controller.restart = lambda _profile: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("recovery restart failed")
+        )
+
+        application._recovery_loop()
+
+        self.assertIsNone(application.coordinator.active_profile)
+        self.assertEqual(application._recovery_profile, "main")
+        with self.assertRaises(BrokerQuiescingError):
+            with application.coordinator.lease_active():
+                self.fail("dead backend retained an active request lease")
+        application.coordinator.stop_when_idle()
+        self.assertIsNone(application._recovery_profile)
 
     def test_saturated_streams_cannot_block_health_or_emergency_stop(self) -> None:
         self._replace_broker(

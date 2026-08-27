@@ -326,6 +326,41 @@ class Controller(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _verify_profile_artifacts(profile: Any) -> None:
+    """Verify every immutable artifact immediately before a backend start."""
+
+    checks: list[tuple[Path, object, str]] = [
+        (
+            Path(profile.server_binary),
+            getattr(profile, "server_sha256", None),
+            "server_binary",
+        ),
+        (Path(profile.model_path), getattr(profile, "model_sha256", None), "model"),
+    ]
+    mmproj_path = getattr(profile, "mmproj_path", None)
+    if mmproj_path is not None:
+        checks.append(
+            (Path(mmproj_path), getattr(profile, "mmproj_sha256", None), "mmproj")
+        )
+
+    for path, expected, kind in checks:
+        if not isinstance(expected, str) or not expected:
+            raise BackendControllerError(
+                f"{profile.id} {kind} has no configured SHA-256 digest"
+            )
+        try:
+            actual = sha256_file(path)
+        except OSError as error:
+            raise BackendControllerError(
+                f"{profile.id} {kind} is unavailable: {error}"
+            ) from error
+        if actual != expected:
+            raise BackendControllerError(
+                f"{profile.id} {kind} SHA mismatch: expected {expected}, "
+                f"got {actual} ({path})"
+            )
+
+
 def apply_reasoning_policy(
     payload: Mapping[str, Any], *, runtime: str, max_output_tokens: int | None = None
 ) -> dict[str, Any]:
@@ -1194,6 +1229,7 @@ class BrokerApplication:
         self._recovery_thread: threading.Thread | None = None
         self._recovery_attempts = 0
         self._recovery_next_at = 0.0
+        self._recovery_profile: str | None = None
         state = dict(controller.state())
         self._controller_state = state
 
@@ -1253,7 +1289,14 @@ class BrokerApplication:
     def _recovery_loop(self) -> None:
         while not self._recovery_stop.wait(RECOVERY_INTERVAL):
             try:
-                profile_id = self.coordinator.active_profile
+                active_profile = self.coordinator.active_profile
+                if (
+                    active_profile is not None
+                    and self._recovery_profile is not None
+                    and active_profile != self._recovery_profile
+                ):
+                    self._recovery_profile = None
+                profile_id = active_profile or self._recovery_profile
                 if profile_id is None or self.coordinator.quiescing:
                     self._recovery_attempts = 0
                     self._recovery_next_at = 0.0
@@ -1267,8 +1310,12 @@ class BrokerApplication:
                 if now < self._recovery_next_at:
                     continue
                 try:
-                    self.coordinator.restart_when_idle(profile_id)
+                    if self.coordinator.active_profile == profile_id:
+                        self.coordinator.restart_when_idle(profile_id)
+                    else:
+                        self.coordinator.switch_when_idle(profile_id)
                 except BaseException as error:
+                    self._recovery_profile = profile_id
                     self._recovery_attempts += 1
                     backoff = min(
                         RECOVERY_MAX_BACKOFF,
@@ -1282,7 +1329,6 @@ class BrokerApplication:
                             error=str(error),
                         )
                         self._remember_controller_state(state)
-                        self.coordinator.synchronize_after_controller_failure(profile_id)
                     except BaseException as record_error:
                         _log(
                             f"[broker] backend recovery state update failed for "
@@ -1295,6 +1341,7 @@ class BrokerApplication:
                 else:
                     self._recovery_attempts = 0
                     self._recovery_next_at = 0.0
+                    self._recovery_profile = None
                     _log(f"[broker] recovered active backend {profile_id!r}")
             except BaseException as error:
                 _log(f"[broker] recovery watchdog check failed: {error}")
@@ -1369,6 +1416,12 @@ class BrokerApplication:
         return result
 
     def _stop_backend(self) -> Any:
+        # An explicit administrative stop cancels any watchdog retry target;
+        # otherwise a failed recovery could resurrect a deliberately unloaded
+        # backend on the next watchdog tick.
+        self._recovery_profile = None
+        self._recovery_attempts = 0
+        self._recovery_next_at = 0.0
         try:
             result = self.controller.stop_all()
         except Exception as error:
@@ -1606,7 +1659,7 @@ class BrokerApplication:
 
 
     def shutdown(self) -> None:
-        """Stop every backend synchronously before process teardown."""
+        """Quiesce the control plane while preserving broker-owned backends."""
 
         with self._shutdown_lock:
             if self._shutdown_complete:
@@ -2441,6 +2494,7 @@ def create_production_controller(
         backend_listen_host=backend_listen_host,
         backend_listen_port=BACKEND_LISTEN_PORT,
         managed_args=managed_args,
+        artifact_verifier=_verify_profile_artifacts,
         verify_command=lambda profile: (
             sys.executable,
             str(ROOT / "brokerctl.py"),

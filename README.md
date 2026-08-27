@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.5.0
+## Retrospective version: 0.5.1
 
-**Runtime build profiles and lifecycle handoff** — source checkpoint 1a7f5b0de8fb (2026-08-27).
+**Backend lifecycle integrity** — source checkpoint 4c785079e728 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
