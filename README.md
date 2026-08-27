@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.0
+## Retrospective version: 0.6.1
 
-**Bounded autotune foundation** — source checkpoint 5a3cbfdadb5b (2026-08-27).
+**Singular profile command** — source checkpoint 9a4c3c47d7d4 (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
