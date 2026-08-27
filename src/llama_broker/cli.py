@@ -1690,6 +1690,19 @@ def _autotune_metrics(
                 "aggregate_tokens_per_second": mode.aggregate_tokens_per_second,
                 "p95_latency_seconds": mode.p95_latency_seconds,
                 "p95_ttft_seconds": mode.p95_ttft_seconds,
+                "latency_mean_seconds": mode.latency_mean_seconds,
+                "latency_stddev_seconds": mode.latency_stddev_seconds,
+                "latency_ci95_seconds": (
+                    list(mode.latency_ci95_seconds)
+                    if mode.latency_ci95_seconds is not None
+                    else None
+                ),
+                "throughput_stddev_tokens_per_second": mode.throughput_stddev_tokens_per_second,
+                "throughput_ci95_tokens_per_second": (
+                    list(mode.throughput_ci95_tokens_per_second)
+                    if mode.throughput_ci95_tokens_per_second is not None
+                    else None
+                ),
                 "streaming_decode_tokens_per_second": mode.streaming_decode_tokens_per_second,
                 "operational_errors": list(mode.operational_errors),
                 "valid": mode.valid,
