@@ -171,6 +171,41 @@ class ProfileConfigTests(unittest.TestCase):
         restart.assert_not_called()
         self.assertEqual(load_manifest(self.manifest_path)["profiles"][0]["batch_size"], 128)
 
+    def test_active_runtime_build_change_does_not_restart(self) -> None:
+        updated = json.loads(json.dumps(self.data))
+        record = next(item for item in updated["profiles"] if item["id"] == "fixture-vision-12b")
+        record["runtime"] = "llamacpp"
+        record["runtime_build"] = "new-build"
+        Path(record["server_binary"]).chmod(0o755)
+        updated["runtime_builds"] = [
+            {
+                "id": "new-build",
+                "runtime": record["runtime"],
+                "display_name": "New build",
+                "server_binary": record["server_binary"],
+                "server_sha256": record["server_sha256"],
+            }
+        ]
+        restart = Mock()
+        install = Mock()
+
+        result = apply_manifest_transaction(
+            self.manifest_path,
+            updated,
+            active_profile="fixture-vision-12b",
+            install_units=install,
+            restart_broker=restart,
+        )
+
+        self.assertTrue(result.changed)
+        self.assertFalse(result.restarted)
+        restart.assert_not_called()
+        install.assert_called_once_with()
+        self.assertEqual(
+            next(item for item in load_manifest(self.manifest_path)["profiles"] if item["id"] == "fixture-vision-12b")["runtime_build"],
+            "new-build",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

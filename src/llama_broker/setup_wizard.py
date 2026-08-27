@@ -71,6 +71,7 @@ class SetupPlan:
     selected_runtime: Path | None = None
     selected_model: Path | None = None
     profile_record: dict[str, object] | None = None
+    runtime_build_record: dict[str, object] | None = None
     operations: tuple[dict[str, object], ...] = ()
     errors: tuple[str, ...] = ()
     enable_startup: bool = False
@@ -83,6 +84,7 @@ class SetupPlan:
             "selected_runtime": str(self.selected_runtime) if self.selected_runtime else None,
             "selected_model": str(self.selected_model) if self.selected_model else None,
             "profile": self.profile_record,
+            "runtime_build": self.runtime_build_record,
             "operations": list(self.operations),
             "errors": list(self.errors),
             "enable_startup": self.enable_startup,
@@ -175,6 +177,19 @@ def _profile_id(model: Path) -> str:
     return slug[:48]
 
 
+def _runtime_build_record(runtime: RuntimeCandidate) -> dict[str, object]:
+    digest = sha256_file(runtime.path)
+    build_id = f"{runtime.runtime}-{digest[:12]}"
+    display_name = f"{runtime.runtime} build ({digest[:12]})"
+    return {
+        "id": build_id,
+        "runtime": runtime.runtime,
+        "display_name": display_name,
+        "server_binary": str(runtime.path),
+        "server_sha256": digest,
+    }
+
+
 def _profile_record(runtime: RuntimeCandidate, model: ModelCandidate) -> dict[str, object]:
     profile_id = _profile_id(model.path)
     if runtime.runtime != "llamacpp":
@@ -188,6 +203,7 @@ def _profile_record(runtime: RuntimeCandidate, model: ModelCandidate) -> dict[st
         "display_name": model.path.stem,
         "role": "persistent",
         "capabilities": ["text"],
+        "runtime": runtime.runtime,
         "server_binary": str(runtime.path),
         "server_sha256": sha256_file(runtime.path),
         "model_path": str(model.path),
@@ -249,6 +265,7 @@ def build_setup_plan(
     errors: list[str] = []
     operations: list[dict[str, object]] = []
     record = None
+    runtime_build_record = None
     if runtime_path is not None and selected_runtime is None:
         errors.append(f"runtime was not discovered or does not exist: {runtime_path}")
     if model_path is not None and selected_model is None:
@@ -260,6 +277,7 @@ def build_setup_plan(
             errors.append("experimental runtime requires explicit opt-in")
         else:
             try:
+                runtime_build_record = _runtime_build_record(runtime)
                 record = _profile_record(runtime, model)
             except (OSError, ValueError) as error:
                 errors.append(str(error))
@@ -276,6 +294,7 @@ def build_setup_plan(
         selected_runtime=selected_runtime,
         selected_model=selected_model,
         profile_record=record,
+        runtime_build_record=runtime_build_record,
         operations=tuple(operations),
         errors=tuple(errors),
         enable_startup=enable_startup,
@@ -328,10 +347,26 @@ def apply_profile_plan(
     records = payload.get("profiles")
     if not isinstance(records, list):
         raise ValueError("profile manifest must contain a profiles list")
-    profile_id = plan.profile_record["id"]
+    runtime_builds = payload.setdefault("runtime_builds", [])
+    if not isinstance(runtime_builds, list):
+        raise ValueError("profile manifest runtime_builds must be a list")
+    if plan.runtime_build_record is not None:
+        build_id = plan.runtime_build_record["id"]
+        existing_build = next(
+            (item for item in runtime_builds if isinstance(item, dict) and item.get("id") == build_id),
+            None,
+        )
+        if existing_build is None:
+            runtime_builds.append(plan.runtime_build_record)
+        elif existing_build != plan.runtime_build_record:
+            raise ValueError(f"runtime build already exists with different data: {build_id}")
+    profile_record = dict(plan.profile_record)
+    if plan.runtime_build_record is not None:
+        profile_record["runtime_build"] = plan.runtime_build_record["id"]
+    profile_id = profile_record["id"]
     if any(isinstance(item, dict) and item.get("id") == profile_id for item in records):
         raise ValueError(f"profile already exists: {profile_id}")
-    records.append(plan.profile_record)
+    records.append(profile_record)
     payload["schema_version"] = 1
 
     profiles_path.parent.mkdir(parents=True, exist_ok=True)

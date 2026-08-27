@@ -134,6 +134,12 @@ TRANSITION_TIMEOUT = float(
 STOP_TIMEOUT = float(
     _env_value("LLAMA_BROKER_STOP_TIMEOUT", "LLM_BROKER_STOP_TIMEOUT", "90")
 )
+RECOVERY_INTERVAL = float(
+    _env_value("LLAMA_BROKER_RECOVERY_INTERVAL", "LLM_BROKER_RECOVERY_INTERVAL", "2")
+)
+RECOVERY_MAX_BACKOFF = float(
+    _env_value("LLAMA_BROKER_RECOVERY_MAX_BACKOFF", "LLM_BROKER_RECOVERY_MAX_BACKOFF", "60")
+)
 MAX_BODY_BYTES = int(
     _env_value(
         "LLAMA_BROKER_MAX_BODY_BYTES",
@@ -315,6 +321,10 @@ class Controller(Protocol):
 
     def stop_all(self) -> dict[str, Any]: ...
 
+    def record_recovery_failure(
+        self, profile_id: str, *, attempts: int, error: str
+    ) -> dict[str, Any]: ...
+
 
 def apply_reasoning_policy(
     payload: Mapping[str, Any], *, runtime: str, max_output_tokens: int | None = None
@@ -345,6 +355,31 @@ def apply_reasoning_policy(
         "reasoning_budget_tokens" in rewritten
         or "thinking_budget_tokens" in rewritten
     )
+    zero_budget_requested = any(
+        isinstance(rewritten.get(key), int)
+        and not isinstance(rewritten.get(key), bool)
+        and rewritten.get(key) == 0
+        for key in ("reasoning_budget_tokens", "thinking_budget_tokens")
+    )
+    # llama.cpp forks do not agree on the legacy spelling. BeeLlama consumes
+    # thinking_budget_tokens; Atomic accepts that spelling as a fallback.
+    if "reasoning_budget_tokens" in rewritten:
+        if "thinking_budget_tokens" not in rewritten:
+            rewritten["thinking_budget_tokens"] = rewritten["reasoning_budget_tokens"]
+        rewritten.pop("reasoning_budget_tokens", None)
+
+    zero_budget = (
+        isinstance(rewritten.get("thinking_budget_tokens"), int)
+        and not isinstance(rewritten.get("thinking_budget_tokens"), bool)
+        and rewritten.get("thinking_budget_tokens") == 0
+    )
+    if zero_budget_requested or zero_budget:
+        kwargs["enable_thinking"] = False
+        rewritten["reasoning_effort"] = "none"
+        rewritten["thinking_budget_tokens"] = 0
+        rewritten.pop("reasoning_budget_tokens", None)
+        rewritten["chat_template_kwargs"] = kwargs
+        return rewritten
 
     if effort is None:
         if explicit_budget:
@@ -353,14 +388,14 @@ def apply_reasoning_policy(
         elif not explicit_template:
             kwargs["enable_thinking"] = False
             rewritten["reasoning_effort"] = "none"
-            rewritten["reasoning_budget_tokens"] = 0
+            rewritten["thinking_budget_tokens"] = 0
     elif effort == "none":
         if not explicit_template:
             kwargs["enable_thinking"] = False
             rewritten["reasoning_effort"] = "none"
             if "reasoning_budget_tokens" not in rewritten and "thinking_budget_tokens" not in rewritten:
-                rewritten["reasoning_budget_tokens"] = 0
-    elif effort in {"low", "medium", "high"}:
+                rewritten["thinking_budget_tokens"] = 0
+    elif effort in {"minimal", "low", "medium", "high", "extra high", "max"}:
         if not explicit_template:
             kwargs["enable_thinking"] = True
         template_disabled = explicit_template and kwargs.get("enable_thinking") is False
@@ -369,17 +404,61 @@ def apply_reasoning_policy(
             and "reasoning_budget_tokens" not in rewritten
             and "thinking_budget_tokens" not in rewritten
         ):
-            divisor = {"low": 8, "medium": 4, "high": 2}[effort]
-            rewritten["reasoning_budget_tokens"] = max(1, max_output_tokens // divisor)
+            divisor = {
+                "minimal": 16,
+                "low": 8,
+                "medium": 4,
+                "high": 2,
+                "extra high": 4 / 3,
+                "max": 1,
+            }[effort]
+            rewritten["thinking_budget_tokens"] = max(
+                1, int(max_output_tokens / divisor)
+            )
         rewritten["reasoning_effort"] = effort
     else:
-        raise ValueError(
-            "reasoning effort must be one of: none, low, medium, high"
-        )
+        # Be tolerant of client-specific effort enums. Unsupported values
+        # do not reach llama.cpp; absent an explicit budget, default to off.
+        rewritten.pop("reasoning_effort", None)
+        if not explicit_budget and not explicit_template:
+            kwargs["enable_thinking"] = False
+            rewritten["thinking_budget_tokens"] = 0
 
     if kwargs:
         rewritten["chat_template_kwargs"] = kwargs
     return rewritten
+
+
+def reasoning_policy_metadata(
+    payload: Mapping[str, Any], rewritten: Mapping[str, Any], *, runtime: str
+) -> dict[str, object] | None:
+    """Return safe reasoning metadata without exposing request content."""
+
+    if runtime != "llamacpp":
+        return None
+
+    effort = rewritten.get("reasoning_effort")
+    if not isinstance(effort, str):
+        reasoning = rewritten.get("reasoning")
+        effort = reasoning.get("effort") if isinstance(reasoning, Mapping) else None
+    if not isinstance(effort, str):
+        effort = payload.get("reasoning_effort")
+    if not isinstance(effort, str):
+        effort = "unspecified"
+    explicit_budget = any(
+        key in payload for key in ("reasoning_budget_tokens", "thinking_budget_tokens")
+    )
+    effective_budget = rewritten.get("reasoning_budget_tokens")
+    if effective_budget is None:
+        effective_budget = rewritten.get("thinking_budget_tokens")
+    if not isinstance(effective_budget, int) or isinstance(effective_budget, bool):
+        effective_budget = None
+    return {
+        "runtime": runtime,
+        "effort": effort,
+        "budget_present": explicit_budget,
+        "budget_tokens": effective_budget,
+    }
 
 
 def route_payload(
@@ -977,29 +1056,23 @@ class ProfileCoordinator:
         )
 
     def stop_for_process_shutdown(self) -> Any:
-        """Synchronously quiesce and stop before the broker process may exit.
+        """Explicitly stop runtimes during destructive process teardown.
 
-        Unlike an HTTP admin request, process teardown must not abandon a
-        timed-out daemon transition and then terminate its lifecycle helper.
-        Once shutdown begins, queued writers are rejected, an already-running
-        transition is allowed to settle, active leases receive the normal
-        drain window, and the configured cooperative stop runs on the main
-        thread to completion.
+        Normal broker restarts must use :meth:`handoff_for_process_shutdown`.
+        This method remains available only for callers that explicitly require
+        all runtime services to be unloaded.
         """
 
         if self._stop_backend is None:
             return None
-
-        operation_name = "broker process shutdown"
+        operation_name = "destructive broker shutdown"
         forced = False
         with self._condition:
             self._shutdown_requested = True
             self._cancel_temporary_restore_unlocked()
             self._condition.notify_all()
-
             while self._transitioning:
                 self._condition.wait(timeout=0.25)
-
             deadline = time.monotonic() + self._drain_timeout
             while self._active_requests > 0:
                 remaining = deadline - time.monotonic()
@@ -1007,18 +1080,14 @@ class ProfileCoordinator:
                     forced = True
                     break
                 self._condition.wait(timeout=remaining)
-
             self._transitioning = True
             self._transition_name = operation_name
             self._condition.notify_all()
-
         if forced:
             _log(
-                f"[broker] process shutdown drain deadline expired with "
-                f"{self.active_requests} active request(s); invoking the "
-                "configured graceful stop without SIGKILL"
+                f"[broker] {operation_name} drain deadline expired with "
+                f"{self.active_requests} active request(s); stopping runtimes"
             )
-
         try:
             result = self._stop_backend()
         except BaseException:
@@ -1028,7 +1097,6 @@ class ProfileCoordinator:
                 self._transition_target = None
                 self._condition.notify_all()
             raise
-
         with self._condition:
             self._active_profile = None
             self._transitioning = False
@@ -1036,6 +1104,33 @@ class ProfileCoordinator:
             self._transition_target = None
             self._condition.notify_all()
         return result
+
+    def handoff_for_process_shutdown(self) -> None:
+        """Quiesce broker ownership without stopping the runtime service.
+
+        The broker control plane and the broker-owned profile service have
+        independent lifecycles. A graceful broker restart therefore rejects new
+        work and waits for in-flight requests/transitions, but leaves the active
+        profile unit, alias, and durable controller state untouched.
+        """
+
+        operation_name = "broker control-plane handoff"
+        deadline = time.monotonic() + self._drain_timeout + self._transition_timeout
+        with self._condition:
+            self._shutdown_requested = True
+            self._cancel_temporary_restore_unlocked()
+            self._condition.notify_all()
+            while self._transitioning or self._active_requests > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _log(
+                        f"[broker] {operation_name} deadline expired with "
+                        f"{self._active_requests} active request(s) and "
+                        f"transitioning={self._transitioning}; preserving runtime state"
+                    )
+                    return
+                self._condition.wait(timeout=min(remaining, 0.25))
+
 
     def invalidate_when_idle(self, expected_profile: str) -> bool:
         """Forget a dead backend so the next request performs a real switch."""
@@ -1095,6 +1190,10 @@ class BrokerApplication:
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._shutdown_error: BaseException | None = None
+        self._recovery_stop = threading.Event()
+        self._recovery_thread: threading.Thread | None = None
+        self._recovery_attempts = 0
+        self._recovery_next_at = 0.0
         state = dict(controller.state())
         self._controller_state = state
 
@@ -1135,6 +1234,77 @@ class BrokerApplication:
             transition_timeout=transition_timeout,
             stop_timeout=stop_timeout,
         )
+
+    def start_recovery_watchdog(self) -> None:
+        """Start the internal watchdog for the currently active backend only."""
+
+        if RECOVERY_INTERVAL <= 0 or RECOVERY_MAX_BACKOFF <= 0:
+            raise ValueError("recovery intervals must be positive")
+        if self._recovery_thread is not None and self._recovery_thread.is_alive():
+            return
+        self._recovery_stop.clear()
+        self._recovery_thread = threading.Thread(
+            target=self._recovery_loop,
+            name="llama-broker-backend-recovery",
+            daemon=True,
+        )
+        self._recovery_thread.start()
+
+    def _recovery_loop(self) -> None:
+        while not self._recovery_stop.wait(RECOVERY_INTERVAL):
+            try:
+                profile_id = self.coordinator.active_profile
+                if profile_id is None or self.coordinator.quiescing:
+                    self._recovery_attempts = 0
+                    self._recovery_next_at = 0.0
+                    continue
+                profile = self.registry.get(profile_id)
+                if self._backend_alias_ready(profile.alias):
+                    self._recovery_attempts = 0
+                    self._recovery_next_at = 0.0
+                    continue
+                now = time.monotonic()
+                if now < self._recovery_next_at:
+                    continue
+                try:
+                    self.coordinator.restart_when_idle(profile_id)
+                except BaseException as error:
+                    self._recovery_attempts += 1
+                    backoff = min(
+                        RECOVERY_MAX_BACKOFF,
+                        RECOVERY_INTERVAL * (2 ** min(self._recovery_attempts - 1, 5)),
+                    )
+                    self._recovery_next_at = time.monotonic() + backoff
+                    try:
+                        state = self.controller.record_recovery_failure(
+                            profile_id,
+                            attempts=self._recovery_attempts,
+                            error=str(error),
+                        )
+                        self._remember_controller_state(state)
+                        self.coordinator.synchronize_after_controller_failure(profile_id)
+                    except BaseException as record_error:
+                        _log(
+                            f"[broker] backend recovery state update failed for "
+                            f"{profile_id!r}: {record_error}"
+                        )
+                    _log(
+                        f"[broker] backend recovery attempt {self._recovery_attempts} "
+                        f"for {profile_id!r} failed; retrying in {backoff:g}s: {error}"
+                    )
+                else:
+                    self._recovery_attempts = 0
+                    self._recovery_next_at = 0.0
+                    _log(f"[broker] recovered active backend {profile_id!r}")
+            except BaseException as error:
+                _log(f"[broker] recovery watchdog check failed: {error}")
+
+    def _stop_recovery_watchdog(self) -> None:
+        self._recovery_stop.set()
+        thread = self._recovery_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, RECOVERY_INTERVAL + 1.0))
+        self._recovery_thread = None
 
     def max_output_tokens_for(self, profile: Profile) -> int:
         """Return the maximum client-requested output for a profile."""
@@ -1444,7 +1614,8 @@ class BrokerApplication:
                     raise self._shutdown_error
                 return
             try:
-                self.coordinator.stop_for_process_shutdown()
+                self._stop_recovery_watchdog()
+                self.coordinator.handoff_for_process_shutdown()
             except BaseException as error:
                 self._shutdown_error = error
                 raise
@@ -1627,11 +1798,37 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     payload,
                     active_profile=self.application.coordinator.active_profile,
                 )
-                rewritten = apply_reasoning_policy(
-                    rewritten,
-                    runtime=profile.runtime,
-                    max_output_tokens=self.application.max_output_tokens_for(profile),
+                try:
+                    rewritten = apply_reasoning_policy(
+                        rewritten,
+                        runtime=profile.runtime,
+                        max_output_tokens=self.application.max_output_tokens_for(profile),
+                    )
+                except ValueError:
+                    rejected_metadata = reasoning_policy_metadata(
+                        payload, payload, runtime=profile.runtime
+                    )
+                    if rejected_metadata is not None:
+                        _controller_event_logger(
+                            {
+                                "decision": "rejected",
+                                "event": "reasoning_policy",
+                                "profile": profile.id,
+                                **rejected_metadata,
+                            }
+                        )
+                    raise
+                reasoning_metadata = reasoning_policy_metadata(
+                    payload, rewritten, runtime=profile.runtime
                 )
+                if reasoning_metadata is not None:
+                    _controller_event_logger(
+                        {
+                            "event": "reasoning_policy",
+                            "profile": profile.id,
+                            **reasoning_metadata,
+                        }
+                    )
                 if (
                     not self.application._profile_artifacts_verified(profile)
                     and profile.id != self.application.coordinator.active_profile
@@ -2150,6 +2347,13 @@ class LockedController:
         with _operation_lock(self.lock_path):
             return self.controller.stop_all()
 
+    def record_recovery_failure(
+        self, profile_id: str, *, attempts: int, error: str
+    ) -> dict[str, Any]:
+        with _operation_lock(self.lock_path):
+            return self.controller.record_recovery_failure(
+                profile_id, attempts=attempts, error=error
+            )
 
 def _readiness_probe(
     alias: str,
@@ -2261,7 +2465,14 @@ def create_production_application(
         controller.install_units()
         if shutdown_requested is not None and shutdown_requested.is_set():
             raise BrokerQuiescingError("Llama-Broker startup was interrupted")
-        controller.reconcile(active_probe_timeout=0.5)
+        reconciled = controller.reconcile(active_probe_timeout=0.5)
+        if reconciled.get("phase") == "stale":
+            stale_profile = reconciled.get("stale_profile")
+            if not isinstance(stale_profile, str):
+                raise BackendControllerError(
+                    "stale backend state has no recoverable profile"
+                )
+            controller.switch(stale_profile)
     if shutdown_requested is not None and shutdown_requested.is_set():
         raise BrokerQuiescingError("Llama-Broker startup was interrupted")
     locked = LockedController(controller)
@@ -2280,6 +2491,7 @@ def create_production_application(
         transition_timeout=TRANSITION_TIMEOUT,
         stop_timeout=STOP_TIMEOUT,
     )
+    application.start_recovery_watchdog()
     return application, controller
 
 

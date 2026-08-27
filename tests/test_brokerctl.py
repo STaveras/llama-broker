@@ -157,9 +157,9 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
             "Request:   accepted\n"
             "Target:    vision\n"
             "Broker:    ok\n"
-            "Backend:   main\n"
-            "Phase:     active\n"
-            "Ready:     yes\n"
+            "Backend:   transition pending (current: main)\n"
+            "Phase:     transition_pending\n"
+            "Ready:     no\n"
             "Generation: 12\n"
             "Endpoint:  127.0.0.1:10000\n",
         )
@@ -655,6 +655,115 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
         parsed = ProfileRegistry.from_path(self.profiles).get("fixture-text-7b")
         self.assertNotIn("--fit", parsed.server_args(host="127.0.0.1", port=10000))
 
+    def test_profiles_edit_selects_cataloged_runtime_build(self) -> None:
+        profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        server = Path(profile["server_binary"])
+        server.chmod(0o755)
+        self.data["runtime_builds"] = [
+            {
+                "id": "beellama",
+                "runtime": "llamacpp",
+                "display_name": "BeeLlama",
+                "server_binary": str(server),
+                "server_sha256": profile["server_sha256"],
+            }
+        ]
+        self.profiles.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profiles",
+                    "edit",
+                    "fixture-text-7b",
+                    "--runtime-build",
+                    "beellama",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        updated = json.loads(self.profiles.read_text(encoding="utf-8"))
+        selected = next(
+            item for item in updated["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        self.assertEqual(selected["runtime_build"], "beellama")
+        self.assertEqual(selected["server_binary"], str(server.resolve()))
+        self.assertEqual(selected["server_sha256"], profile["server_sha256"])
+
+    def test_profiles_edit_rejects_unknown_or_mismatched_build_without_mutation(self) -> None:
+        profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        server = Path(profile["server_binary"])
+        server.chmod(0o755)
+        self.data["runtime_builds"] = [
+            {
+                "id": "atomic-vllm",
+                "runtime": "vllm",
+                "display_name": "Atomic vLLM",
+                "server_binary": str(server),
+                "server_sha256": profile["server_sha256"],
+            }
+        ]
+        self.profiles.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
+
+        for build_id in ("missing", "atomic-vllm"):
+            before = self.profiles.read_bytes()
+            error = io.StringIO()
+            with redirect_stderr(error):
+                result = brokerctl.main(
+                    [
+                        "--profiles",
+                        str(self.profiles),
+                        "profiles",
+                        "edit",
+                        "fixture-text-7b",
+                        "--runtime-build",
+                        build_id,
+                    ]
+                )
+
+            self.assertEqual(result, 1)
+            self.assertEqual(self.profiles.read_bytes(), before)
+            self.assertIn("runtime build", error.getvalue())
+
+    def test_profiles_show_reports_inferred_runtime_build_identity(self) -> None:
+        profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        server = Path(profile["server_binary"])
+        server.chmod(0o755)
+        self.data["runtime_builds"] = [
+            {
+                "id": "beellama",
+                "runtime": "llamacpp",
+                "display_name": "BeeLlama",
+                "server_binary": str(server),
+                "server_sha256": profile["server_sha256"],
+            }
+        ]
+        self.profiles.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profiles",
+                    "show",
+                    "fixture-text-7b",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["runtime_build"], "beellama")
+
     def test_profiles_add_refuses_incomplete_discovery_without_mutation(self) -> None:
         before = self.profiles.read_bytes()
         model = SimpleNamespace(id="unreviewed-model", context_length=65_536, parallel=1)
@@ -821,6 +930,13 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
 
 
 class BrokerctlProfileEditorTests(unittest.TestCase):
+    def test_edit_parser_accepts_runtime_build(self) -> None:
+        args = brokerctl.build_parser().parse_args(
+            ["profiles", "edit", "fixture-text-7b", "--runtime-build", "beellama"]
+        )
+
+        self.assertEqual(args.runtime_build, "beellama")
+
     def test_edit_parser_targets_field_editor_and_configure_is_removed(self) -> None:
         args = brokerctl.build_parser().parse_args(["profiles", "edit"])
         self.assertEqual(args.command, "profiles")

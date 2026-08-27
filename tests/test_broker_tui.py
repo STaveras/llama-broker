@@ -1,15 +1,383 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from llama_broker.broker_tui import EDITOR_FIELDS, TUIModel, run_guided_wizard
+from llama_broker.broker_tui import (
+    EDITOR_FIELDS,
+    TUIModel,
+    _curses_prompt,
+    run_guided_wizard,
+)
+from llama_broker.profile_config import merge_manifest_drafts
 
 
 class BrokerTUIModelTests(unittest.TestCase):
+    def test_runtime_family_reveals_backend_build_and_applies_catalog_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            binary = Path(tempdir) / "llama-server"
+            binary.write_bytes(b"beellama")
+            binary.chmod(0o755)
+            server_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            manifest = {
+                "runtime_builds": [
+                    {
+                        "id": "beellama",
+                        "runtime": "llamacpp",
+                        "display_name": "BeeLlama",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    },
+                    {
+                        "id": "atomic-vllm",
+                        "runtime": "vllm",
+                        "display_name": "Atomic vLLM",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    },
+                ],
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "runtime": "llamacpp",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    }
+                ],
+            }
+
+            model = TUIModel(manifest)
+
+            family = next(item for item in model.visible_fields if item.key == "runtime_family")
+            build = next(item for item in model.visible_fields if item.key == "runtime_build")
+            self.assertEqual(family.options, ("llamacpp — 1 build", "vllm — 1 build", "(custom/manual)"))
+            self.assertEqual(model.field_value("runtime_family"), "llamacpp — 1 build")
+            self.assertTrue(any(option.startswith("BeeLlama — beellama\n") for option in build.options))
+            model.set_field("runtime_build", build.options[0])
+            self.assertEqual(model.current["runtime_build"], "beellama")
+            self.assertEqual(model.current["server_binary"], str(binary.resolve()))
+            self.assertEqual(model.current["server_sha256"], server_sha256)
+
+    def test_runtime_family_and_backend_build_are_dependent(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            binary = Path(tempdir) / "llama-server"
+            binary.write_bytes(b"shared runtime")
+            binary.chmod(0o755)
+            server_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            manifest = {
+                "runtime_builds": [
+                    {
+                        "id": "beellama",
+                        "runtime": "llamacpp",
+                        "display_name": "BeeLlama",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    },
+                    {
+                        "id": "atomic",
+                        "runtime": "llamacpp",
+                        "display_name": "Atomic",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    },
+                    {
+                        "id": "atomic-vllm",
+                        "runtime": "vllm",
+                        "display_name": "Atomic vLLM",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    },
+                ],
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "runtime": "llamacpp",
+                        "runtime_build": "beellama",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    }
+                ],
+            }
+
+            model = TUIModel(manifest)
+            keys = {field.key for field in model.visible_fields}
+            family = next(field for field in model.visible_fields if field.key == "runtime_family")
+
+            self.assertIn("runtime_family", keys)
+            self.assertIn("runtime_build", keys)
+            self.assertNotIn("runtime", keys)
+            self.assertEqual(
+                family.options,
+                ("llamacpp — 2 builds", "vllm — 1 build", "(custom/manual)"),
+            )
+            self.assertEqual(model.field_value("runtime_family"), "llamacpp — 2 builds")
+
+            model.set_field("runtime_build", "Atomic — atomic")
+            assert model.current is not None
+            self.assertEqual(model.current["runtime"], "llamacpp")
+            self.assertEqual(model.current["runtime_build"], "atomic")
+
+            model.set_field("runtime_family", "vllm")
+            self.assertEqual(model.current["runtime"], "vllm")
+            self.assertEqual(model.current["runtime_build"], "atomic-vllm")
+
+    def test_curses_prompt_edits_existing_text_and_refreshes(self) -> None:
+        class FakeWindow:
+            def __init__(self, keys: list[int]) -> None:
+                self.keys = iter(keys)
+                self.refresh_count = 0
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 80)
+
+            def move(self, _row: int, _column: int) -> None:
+                pass
+
+            def clrtoeol(self) -> None:
+                pass
+
+            def addnstr(self, _row: int, _column: int, _text: str, _count: int) -> None:
+                pass
+
+            def refresh(self) -> None:
+                self.refresh_count += 1
+
+            def getch(self) -> int:
+                return next(self.keys)
+
+        window = FakeWindow([21, *map(ord, "New display name"), 10])
+
+        value = _curses_prompt(window, "Display name", "Old display name")
+
+        self.assertEqual(value, "New display name")
+        self.assertGreater(window.refresh_count, 0)
+
+        model = TUIModel({"profiles": [{"id": "one", "display_name": "Old display name"}]})
+        model.set_field("display_name", value)
+        assert model.current is not None
+        self.assertEqual(model.current["display_name"], "New display name")
+
+    def test_curses_prompt_cancels_cleanly_on_keyboard_interrupt(self) -> None:
+        class InterruptingWindow:
+            def getmaxyx(self) -> tuple[int, int]:
+                return (24, 80)
+
+            def move(self, _row: int, _column: int) -> None:
+                pass
+
+            def clrtoeol(self) -> None:
+                pass
+
+            def addnstr(self, _row: int, _column: int, _text: str, _count: int) -> None:
+                pass
+
+            def refresh(self) -> None:
+                pass
+
+            def getch(self) -> int:
+                raise KeyboardInterrupt
+
+        self.assertEqual(
+            _curses_prompt(InterruptingWindow(), "Display name", "Old display name"),
+            "Old display name",
+        )
+
+    def test_runtime_change_keeps_runtime_build_selection_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            binary = Path(tempdir) / "llama-server"
+            binary.write_bytes(b"shared runtime")
+            binary.chmod(0o755)
+            server_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+            manifest = {
+                "runtime_builds": [
+                    {
+                        "id": "beellama",
+                        "runtime": "llamacpp",
+                        "display_name": "BeeLlama",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    },
+                    {
+                        "id": "atomic-vllm",
+                        "runtime": "vllm",
+                        "display_name": "Atomic vLLM",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    },
+                ],
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "runtime": "llamacpp",
+                        "runtime_build": "beellama",
+                        "server_binary": str(binary),
+                        "server_sha256": server_sha256,
+                    }
+                ],
+            }
+
+            model = TUIModel(manifest)
+            model.set_field("runtime_family", "vllm")
+
+            field = next(item for item in model.visible_fields if item.key == "runtime_family")
+            self.assertEqual(field.options, ("llamacpp — 1 build", "vllm — 1 build", "(custom/manual)"))
+            self.assertEqual(model.field_value("runtime_family"), "vllm — 1 build")
+            assert model.current is not None
+            self.assertEqual(model.current["runtime_build"], "atomic-vllm")
+
+    def test_custom_manual_clears_build_and_reveals_manual_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            binary = Path(tempdir) / "llama-server"
+            binary.write_bytes(b"runtime")
+            binary.chmod(0o755)
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            manifest = {
+                "runtime_builds": [
+                    {
+                        "id": "beellama",
+                        "runtime": "llamacpp",
+                        "display_name": "BeeLlama",
+                        "server_binary": str(binary),
+                        "server_sha256": digest,
+                    }
+                ],
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "runtime": "llamacpp",
+                        "runtime_build": "beellama",
+                        "server_binary": str(binary),
+                        "server_sha256": digest,
+                    }
+                ],
+            }
+            model = TUIModel(manifest)
+            model.set_field("runtime_family", "(custom/manual)")
+            assert model.current is not None
+            self.assertNotIn("runtime_build", model.current)
+            keys = {field.key for field in model.visible_fields}
+            self.assertIn("runtime", keys)
+            self.assertNotIn("runtime_build", keys)
+            self.assertTrue(model.dirty)
+
+    def test_family_filter_keeps_invalid_builds_and_sorts_by_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            valid_binary = Path(tempdir) / "valid-server"
+            valid_binary.write_bytes(b"valid")
+            valid_binary.chmod(0o755)
+            digest = hashlib.sha256(valid_binary.read_bytes()).hexdigest()
+            manifest = {
+                "runtime_builds": [
+                    {
+                        "id": "z-valid",
+                        "runtime": "llamacpp",
+                        "display_name": "Zed",
+                        "server_binary": str(valid_binary),
+                        "server_sha256": digest,
+                    },
+                    {
+                        "id": "a-invalid",
+                        "runtime": "llamacpp",
+                        "display_name": "Alpha",
+                        "server_binary": str(Path(tempdir) / "missing-server"),
+                        "server_sha256": "0" * 64,
+                    },
+                    {
+                        "id": "vllm-only-invalid",
+                        "runtime": "vllm",
+                        "display_name": "VLLM",
+                        "server_binary": str(Path(tempdir) / "missing-vllm"),
+                        "server_sha256": "1" * 64,
+                    },
+                ],
+                "profiles": [{"id": "one", "alias": "one", "runtime": "llamacpp"}],
+            }
+            model = TUIModel(manifest)
+            model.set_field("runtime_family", "llamacpp")
+            family = next(field for field in model.visible_fields if field.key == "runtime_family")
+            self.assertEqual(family.options, ("llamacpp — 2 builds", "(custom/manual)"))
+            build = next(field for field in model.visible_fields if field.key == "runtime_build")
+            self.assertTrue(build.options[0].startswith("Alpha — a-invalid"))
+            self.assertTrue(build.options[1].startswith("Zed — z-valid"))
+
+    def test_catalog_is_snapshotted_for_editor_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            binary = Path(tempdir) / "llama-server"
+            binary.write_bytes(b"runtime")
+            binary.chmod(0o755)
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            manifest = {
+                "runtime_builds": [
+                    {
+                        "id": "one-build",
+                        "runtime": "llamacpp",
+                        "display_name": "One",
+                        "server_binary": str(binary),
+                        "server_sha256": digest,
+                    }
+                ],
+                "profiles": [{"id": "one", "alias": "one", "runtime": "llamacpp"}],
+            }
+            model = TUIModel(manifest)
+            model.manifest["runtime_builds"].append(
+                {
+                    "id": "two-build",
+                    "runtime": "vllm",
+                    "display_name": "Two",
+                    "server_binary": str(binary),
+                    "server_sha256": digest,
+                }
+            )
+            family = next(field for field in model.visible_fields if field.key == "runtime_family")
+            self.assertNotIn("vllm", family.options)
+
+    def test_no_valid_catalog_builds_keeps_custom_manual_available(self) -> None:
+        model = TUIModel({"runtime_builds": [], "profiles": [{"id": "one", "alias": "one"}]})
+        family = next(field for field in model.visible_fields if field.key == "runtime_family")
+        self.assertEqual(
+            family.options,
+            ("(no valid catalog builds available)", "(custom/manual)"),
+        )
+
+    def test_manifest_merge_preserves_external_fields_and_reports_conflicts(self) -> None:
+        base = {
+            "profiles": [
+                {"id": "one", "alias": "one", "context_size": 32768, "parallel": 1}
+            ]
+        }
+        disk = {
+            "profiles": [
+                {
+                    "id": "one",
+                    "alias": "one-on-disk",
+                    "context_size": 65536,
+                    "parallel": 1,
+                }
+            ],
+            "external_setting": True,
+        }
+        draft = {
+            "profiles": [
+                {"id": "one", "alias": "one", "context_size": 131072, "parallel": 1}
+            ]
+        }
+
+        merged, conflicts = merge_manifest_drafts(base, disk, draft)
+
+        self.assertEqual(merged["external_setting"], True)
+        profile = merged["profiles"][0]
+        self.assertEqual(profile["alias"], "one-on-disk")
+        self.assertEqual(profile["context_size"], 131072)
+        self.assertEqual(conflicts, ["profiles[one].context_size"])
+
     def test_capabilities_editor_exposes_tools(self) -> None:
         field = next(item for item in EDITOR_FIELDS if item.key == "capabilities")
         self.assertIn("tools", field.options)

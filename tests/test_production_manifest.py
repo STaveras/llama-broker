@@ -181,6 +181,7 @@ class ProductionManifestTests(unittest.TestCase):
         self.assertIn("TimeoutStopSec=20s", unit)
         self.assertIn("KillMode=control-group", unit)
         self.assertIn("SendSIGKILL=no", unit)
+        self.assertIn("Restart=no", unit)
 
     def test_broker_control_plane_unit_is_bounded_without_forced_kill(self) -> None:
         unit = (

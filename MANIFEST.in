@@ -4,6 +4,7 @@ include CHANGELOG.md
 include pyproject.toml
 recursive-include src/llama_broker/data *.json *.service.in
 prune docs/plans
+prune docs/goals
 exclude docs/broker-autotune-workstream.md
 exclude DESIGN.md
 exclude profiles.json

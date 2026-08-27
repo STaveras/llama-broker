@@ -61,6 +61,14 @@ class SetupWizardTests(unittest.TestCase):
             self.assertEqual(selected.selected_model, model.resolve())
             self.assertEqual(selected.selected_runtime, runtime.resolve())
             self.assertEqual(selected.operations[0]["action"], "create_profile")
+            assert selected.profile_record is not None
+            self.assertNotIn("runtime_build", selected.profile_record)
+            assert selected.runtime_build_record is not None
+            self.assertTrue(str(selected.runtime_build_record["id"]).startswith("llamacpp-"))
+            self.assertEqual(selected.runtime_build_record["runtime"], "llamacpp")
+            self.assertEqual(
+                selected.runtime_build_record["server_binary"], str(runtime.resolve())
+            )
 
     def test_report_has_versioned_machine_readable_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -159,6 +167,7 @@ class SetupWizardTests(unittest.TestCase):
                 model_path=model,
             )
             assert seed.profile_record is not None
+            assert seed.runtime_build_record is not None
             base = dict(seed.profile_record)
             base["id"] = "base"
             base["alias"] = "base"
@@ -173,6 +182,7 @@ class SetupWizardTests(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
+                        "runtime_builds": [seed.runtime_build_record],
                         "profiles": [base, child],
                     }
                 ),
@@ -185,7 +195,14 @@ class SetupWizardTests(unittest.TestCase):
 
             saved = json.loads(profiles_path.read_text(encoding="utf-8"))
             saved_child = next(item for item in saved["profiles"] if item["id"] == "child")
+            saved_added = next(item for item in saved["profiles"] if item["id"] == "added")
             self.assertEqual(saved_child["extends"], "base")
+            self.assertEqual(saved_added["runtime_build"], seed.runtime_build_record["id"])
+            self.assertEqual(len(saved["runtime_builds"]), 1)
+            self.assertEqual(
+                saved["runtime_builds"][0]["id"],
+                seed.runtime_build_record["id"],
+            )
 
 
 if __name__ == "__main__":
