@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.7
+## Retrospective version: 0.6.8
 
-**Autotune progress and bounded commands** — source checkpoint 52c8c7ec2f82 (2026-08-27).
+**Protect the active backend while tuning** — source checkpoint 13e885a903bd (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 

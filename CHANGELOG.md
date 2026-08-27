@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.7**.
+Current assigned version: **0.6.8**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.8] - 2026-08-27 — Protect the active backend while tuning
+
+Original checkpoint: `13e885a903bdd7f3cc3cb773d95ca0d6d3e13e14`.
+
+- Require the active-backend stop/confirmation path whenever any eligible profile is tuned, including when the active profile is outside the selected set.
+- Regenerate controller units when the autotune manifest is reloaded.
 
 ## [0.6.7] - 2026-08-27 — Autotune progress and bounded commands
 
