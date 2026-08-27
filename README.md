@@ -141,6 +141,11 @@ The stable additive OpenAI-compatible subset is under `/v1`:
 
 ## TODO
 
+- [ ] **Opt-in autotune constraint families.** Keep `context_size` and cache
+  types fixed by default; later add explicit opt-in flags such as
+  `--context_size` and `--cache_types` when those dimensions should be
+  searched deliberately.
+
 - [x] **Forward multipart audio transcription requests.** The broker accepts
   authenticated, bounded `multipart/form-data` uploads at
   `POST /v1/audio/transcriptions`, validates `Content-Length`, preserves the

@@ -85,7 +85,13 @@ class AutotuneEngineTests(unittest.TestCase):
     def test_adapter_schema_has_stable_order_and_fit_is_opt_in(self) -> None:
         schema = discover_schema(self.profile)
         self.assertEqual(schema.runtime, "llamacpp")
-        self.assertEqual(schema.names[:4], ("context_size", "parallel", "batch_size", "ubatch_size"))
+        self.assertEqual(
+            schema.names,
+            ("parallel", "batch_size", "ubatch_size", "flash_attention", "max_output_tokens"),
+        )
+        self.assertNotIn("context_size", schema.names)
+        self.assertNotIn("cache_type_k", schema.names)
+        self.assertNotIn("cache_type_v", schema.names)
         self.assertFalse(schema.fit_enabled)
         self.assertEqual(schema.confidence, "high")
 
