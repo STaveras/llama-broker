@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.15
+## Retrospective version: 0.6.16
 
-**Keep output-token policy fixed** — source checkpoint 36ee43e9bfc1 (2026-08-27).
+**Profile editor row and dirty-state fixes** — source checkpoint c34c5e8fba6f (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 

@@ -540,8 +540,7 @@ class TUIModel:
         if current is None:
             raise ValueError("no profile selected")
         updated = apply_simple_fields(current, values)
-        self.manifest["profiles"][self.index] = updated
-        self.dirty = True
+        self._publish(updated)
         return updated
 
     def field_value(self, key: str) -> Any:
@@ -579,6 +578,15 @@ class TUIModel:
         current = self.current
         if current is None:
             raise ValueError("no profile selected")
+        current_value = self.field_value(key)
+        if key not in {"runtime_build", *self._PATH_FIELDS} and (
+            value == current_value
+            or (
+                isinstance(value, str)
+                and str(value).strip() == str(current_value).strip()
+            )
+        ):
+            return current
         draft = clone_record(current)
 
         if key == "runtime_family":
@@ -709,7 +717,19 @@ class TUIModel:
 
     def _publish(self, draft: dict[str, Any]) -> None:
         self.manifest["profiles"][self.index] = draft
-        self.dirty = True
+        self.dirty = self.manifest != self.base_manifest
+
+
+def _truncate_field_value(value: str, width: int) -> str:
+    """Keep a root-list value on one row while preserving its useful tail."""
+
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return "." * width
+    return "..." + value[-(width - 3) :]
 
 
 def _curses_prompt(
@@ -802,7 +822,9 @@ def _curses_confirm(stdscr: Any, prompt: str, *, default: bool = True) -> bool:
     return False
 
 
-def _curses_select(stdscr: Any, label: str, current: Any, options: Iterable[str]) -> str:
+def _curses_select(
+    stdscr: Any, label: str, current: Any, options: Iterable[str]
+) -> tuple[str, bool]:
     """Choose one value from a keyboard-navigable dropdown."""
 
     import curses
@@ -842,7 +864,7 @@ def _curses_select(stdscr: Any, label: str, current: Any, options: Iterable[str]
                 row += 1
         key = stdscr.getch()
         if key in (27, ord("q")):
-            return str(current)
+            return str(current), True
         if key in (curses.KEY_UP, ord("k")):
             selected = (selected - 1) % len(choices)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -850,10 +872,12 @@ def _curses_select(stdscr: Any, label: str, current: Any, options: Iterable[str]
         elif key in (10, 13):
             if choices[selected] == "(no valid catalog builds available)":
                 continue
-            return choices[selected]
+            return str(choices[selected]), False
 
 
-def _curses_checklist(stdscr: Any, label: str, current: Any, options: Iterable[str]) -> list[str]:
+def _curses_checklist(
+    stdscr: Any, label: str, current: Any, options: Iterable[str]
+) -> tuple[list[str], bool]:
     """Choose zero or more values from a keyboard-navigable checklist."""
 
     import curses
@@ -872,7 +896,7 @@ def _curses_checklist(stdscr: Any, label: str, current: Any, options: Iterable[s
             stdscr.addnstr(row, 2, f"{marker} {choice}", max(width - 3, 1), attr)
         key = stdscr.getch()
         if key == 27:
-            return list(current or [])
+            return list(current or []), True
         if key in (curses.KEY_UP, ord("k")):
             cursor = (cursor - 1) % len(choices)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -884,7 +908,7 @@ def _curses_checklist(stdscr: Any, label: str, current: Any, options: Iterable[s
             else:
                 selected.add(choice)
         elif key in (10, 13):
-            return [choice for choice in choices if choice in selected]
+            return [choice for choice in choices if choice in selected], False
 
 
 def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
@@ -893,10 +917,12 @@ def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
     if field is None or current is None:
         return
     value = model.field_value(field.key)
+    cancelled = False
+    original_value = value
     if field.kind == "select":
-        value = _curses_select(stdscr, field.label, value, field.options)
+        value, cancelled = _curses_select(stdscr, field.label, value, field.options)
     elif field.kind == "multi":
-        value = _curses_checklist(stdscr, field.label, current.get(field.key, []), field.options)
+        value, cancelled = _curses_checklist(stdscr, field.label, current.get(field.key, []), field.options)
     elif field.kind == "toggle":
         value = not bool(value)
     else:
@@ -906,6 +932,16 @@ def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
             value,
             allow_empty=field.key in {"mmproj_path", "model_draft", "restore_profile"},
         )
+    if cancelled:
+        return
+    if field.kind not in {"select", "multi", "toggle"} and (
+        value == original_value
+        or (
+            isinstance(value, str)
+            and str(value).strip() == str(original_value).strip()
+        )
+    ):
+        return
     model.set_field(field.key, value)
 
 
@@ -914,6 +950,8 @@ def _format_field_value(value: Any) -> str:
         return "(unset)"
     if isinstance(value, bool):
         return "on" if value else "off"
+    if isinstance(value, str):
+        return " | ".join(line.strip() for line in value.splitlines() if line.strip())
     return str(value)
 
 
@@ -972,6 +1010,9 @@ def run_tui(
                 field_index = start + row - 5
                 marker = ">" if field_index == model.field_index else " "
                 value = _format_field_value(model.field_value(field.key))
+                value_column = 33
+                value_width = max(width - value_column - 1, 1)
+                value = _truncate_field_value(value, value_width)
                 line = f"{marker} {field.label:<30} {value}"
                 attr = curses.A_REVERSE if field_index == model.field_index else 0
                 stdscr.addnstr(row, 0, line, max(width - 1, 1), attr)

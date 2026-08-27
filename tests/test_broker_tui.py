@@ -127,6 +127,33 @@ class BrokerTUIModelTests(unittest.TestCase):
             self.assertEqual(model.current["runtime"], "vllm")
             self.assertEqual(model.current["runtime_build"], "atomic-vllm")
 
+    def test_entering_and_canceling_a_field_keeps_model_clean(self) -> None:
+        manifest = {
+            "profiles": [
+                {"id": "one", "alias": "one", "context_size": 32768, "capabilities": ["text"]}
+            ]
+        }
+        model = TUIModel(manifest)
+
+        model.set_field("context_size", 32768)
+        self.assertFalse(model.dirty)
+        model.set_field("context_size", 65536)
+        self.assertTrue(model.dirty)
+        model.set_field("context_size", 32768)
+        self.assertFalse(model.dirty)
+
+    def test_multiline_and_long_field_values_are_safe_for_root_list(self) -> None:
+        from llama_broker.broker_tui import _format_field_value, _truncate_field_value
+
+        value = _format_field_value(
+            "BeeLlama — beellama\n"
+            "  binary: /example/user/.local/share/runtimes/beellama.cpp/runtime/bin/llama-server\n"
+            "  sha256: deadbeef"
+        )
+
+        self.assertNotIn("\n", value)
+        self.assertLessEqual(len(_truncate_field_value(value, 32)), 32)
+
     def test_curses_prompt_edits_existing_text_and_refreshes(self) -> None:
         class FakeWindow:
             def __init__(self, keys: list[int]) -> None:

@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.15**.
+Current assigned version: **0.6.16**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.16] - 2026-08-27 — Profile editor row and dirty-state fixes
+
+Original checkpoint: `c34c5e8fba6f64005bcf0a57b9e83b05982d088a`.
+
+- Ignore cancelled and unchanged field edits, derive dirty state by comparison with the base manifest, and clear it when edits are reverted.
+- Flatten multiline display values and clip long field values to their row while preserving useful trailing text; add model/display regression cases.
 
 ## [0.6.15] - 2026-08-27 — Keep output-token policy fixed
 
