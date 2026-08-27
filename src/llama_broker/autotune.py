@@ -1078,16 +1078,43 @@ class AutotuneTransaction:
         previous_active: str | None,
         state_path: Path | None = None,
     ) -> dict[str, Any]:
+        result = self.commit_many(
+            manifest,
+            winners={profile_id: (winner, adapter)},
+            previous_active=previous_active,
+            state_path=state_path,
+        )
+        result["profile_id"] = profile_id
+        result["winner_candidate"] = winner.index
+        return result
+
+    def commit_many(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        winners: Mapping[str, tuple[Candidate, RuntimeAdapter]],
+        previous_active: str | None,
+        state_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """Commit several profile winners with one reload and compensation boundary."""
+
+        if not winners:
+            raise AutotuneError("at least one profile winner is required")
         if not self.quiescent():
             raise AutotuneError("coordinator is not quiescent for autotune reload")
         original = self.manifest_path.read_bytes()
-        updated = apply_winner_to_manifest(
-            manifest, profile_id, winner, adapter=adapter
-        )
+        updated: Mapping[str, Any] = manifest
+        for profile_id, (winner, adapter) in winners.items():
+            updated = apply_winner_to_manifest(
+                updated, profile_id, winner, adapter=adapter
+            )
         atomic_write_json(self.manifest_path, updated)
         result = {
-            "profile_id": profile_id,
-            "winner_candidate": winner.index,
+            "profile_ids": list(winners),
+            "winner_candidates": {
+                profile_id: winner.index
+                for profile_id, (winner, _adapter) in winners.items()
+            },
             "reloads": 0,
             "active_profile": previous_active,
             "status": "committed",

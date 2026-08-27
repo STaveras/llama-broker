@@ -1484,82 +1484,124 @@ def _autotune_result_from_payload(candidate: Candidate, payload: object, *, base
 def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
     manifest = load_manifest_source(args.profiles, allow_missing_artifacts=True)
     registry = ProfileRegistry.from_path(args.profiles, allow_missing_artifacts=True)
-    profile = registry.resolve(args.profile_id)
-    if profile.runtime not in ADAPTERS:
-        raise ProfileError(f"autotune supports only llamacpp and vllm, not {profile.runtime!r}")
-    help_text = None
-    if args.help_file:
-        help_text = Path(args.help_file).read_text(encoding="utf-8")
-    schema = discover_schema(profile, help_text=help_text, include_fit=args.include_fit)
-    candidates = generate_candidates(profile, schema, max_candidates=args.max_candidates)
-    report: dict[str, object] = {
-        "schema_version": 1,
-        "profile_id": profile.id,
-        "runtime": profile.runtime,
-        "schema": {
-            "source": schema.source,
-            "confidence": schema.confidence,
-            "knobs": [
-                {"name": knob.name, "values": list(knob.values), "confidence": knob.confidence}
-                for knob in schema.knobs
-            ],
-        },
-        "candidate_count": len(candidates),
-        "candidates": [
-            {"index": item.index, "strategy": item.strategy, "changes": dict(item.changes)}
-            for item in candidates
-        ],
-    }
-    if args.dry_run:
-        print(json.dumps(report, indent=2, sort_keys=True))
-        return 0
-    if not args.benchmark_json:
-        print(
-            "refusing to run without a benchmark source; provide --benchmark-json "
-            "for an offline replay or use the programmatic BenchmarkHarness",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        benchmark_payload = json.loads(Path(args.benchmark_json).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ProfileError(f"cannot read benchmark JSON: {error}") from error
-    if not isinstance(benchmark_payload, dict):
-        raise ProfileError("benchmark JSON must map candidate indexes to results")
-    results: dict[int, BenchmarkResult] = {}
-    for item in candidates:
-        entry = benchmark_payload.get(str(item.index), benchmark_payload.get(item.index))
-        if entry is not None:
-            results[item.index] = _autotune_result_from_payload(item, entry, baseline=item.index == 0)
+    profiles = [registry.resolve(args.profile_id)] if args.profile_id else list(registry.profiles)
+    help_text = Path(args.help_file).read_text(encoding="utf-8") if args.help_file else None
 
-    def benchmark(item: Candidate, is_baseline: bool) -> BenchmarkResult:
-        result = results.get(item.index)
-        if result is None:
-            return _autotune_result_from_payload(
-                item,
-                {"aggregate_tokens_per_second": 0, "p95_latency_seconds": 0, "valid": False,
-                 "operational_errors": ["missing_benchmark_result"]},
-                baseline=is_baseline,
+    benchmark_payload: dict[object, object] | None = None
+    if not args.dry_run:
+        if not args.benchmark_json:
+            print(
+                "refusing to run without a benchmark source; provide --benchmark-json "
+                "for an offline replay or use the programmatic BenchmarkHarness",
+                file=sys.stderr,
             )
-        return result
+            return 2
+        try:
+            loaded = json.loads(Path(args.benchmark_json).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ProfileError(f"cannot read benchmark JSON: {error}") from error
+        if not isinstance(loaded, dict):
+            raise ProfileError("benchmark JSON must map profile IDs or candidate indexes to results")
+        benchmark_payload = loaded
 
-    search = AutotuneEngine(schema=schema, candidates=candidates, benchmark=benchmark).run()
-    report.update(
-        {
-            "winner": {"index": search.winner.candidate.index, "aggregate_tokens_per_second": search.winner.aggregate_tokens_per_second,
-                       "p95_latency_seconds": search.winner.p95_latency_seconds},
-            "best_latency": {"index": search.best_latency.candidate.index, "p95_latency_seconds": search.best_latency.p95_latency_seconds},
-            "evaluated": len(search.evaluated),
+    reports: list[dict[str, object]] = []
+    searches: dict[str, tuple[Any, Any]] = {}
+    for profile in profiles:
+        report: dict[str, object] = {
+            "schema_version": 1,
+            "profile_id": profile.id,
+            "runtime": profile.runtime,
         }
-    )
-    if not args.commit:
-        print(json.dumps(report, indent=2, sort_keys=True))
+        if profile.runtime not in ADAPTERS:
+            report.update({"status": "skipped", "reason": f"unsupported runtime: {profile.runtime}"})
+            reports.append(report)
+            continue
+        schema = discover_schema(profile, help_text=help_text, include_fit=args.include_fit)
+        candidates = generate_candidates(profile, schema, max_candidates=args.max_candidates)
+        report.update(
+            {
+                "status": "planned",
+                "schema": {
+                    "source": schema.source,
+                    "confidence": schema.confidence,
+                    "knobs": [
+                        {"name": knob.name, "values": list(knob.values), "confidence": knob.confidence}
+                        for knob in schema.knobs
+                    ],
+                },
+                "candidate_count": len(candidates),
+                "candidates": [
+                    {"index": item.index, "strategy": item.strategy, "changes": dict(item.changes)}
+                    for item in candidates
+                ],
+            }
+        )
+        if not args.dry_run:
+            assert benchmark_payload is not None
+            profile_results = benchmark_payload.get(profile.id, benchmark_payload.get(str(profile.id)))
+            if profile_results is None:
+                profile_results = benchmark_payload
+            if not isinstance(profile_results, dict):
+                raise ProfileError(f"benchmark results for profile {profile.id!r} must be an object")
+            results: dict[int, BenchmarkResult] = {}
+            for item in candidates:
+                entry = profile_results.get(str(item.index), profile_results.get(item.index))
+                if entry is not None:
+                    results[item.index] = _autotune_result_from_payload(
+                        item, entry, baseline=item.index == 0
+                    )
+
+            def benchmark(item: Candidate, is_baseline: bool) -> BenchmarkResult:
+                result = results.get(item.index)
+                if result is None:
+                    return _autotune_result_from_payload(
+                        item,
+                        {
+                            "aggregate_tokens_per_second": 0,
+                            "p95_latency_seconds": 0,
+                            "valid": False,
+                            "operational_errors": ["missing_benchmark_result"],
+                        },
+                        baseline=is_baseline,
+                    )
+                return result
+
+            search = AutotuneEngine(schema=schema, candidates=candidates, benchmark=benchmark).run()
+            searches[profile.id] = (search, ADAPTERS[profile.runtime])
+            report.update(
+                {
+                    "status": "evaluated",
+                    "winner": {
+                        "index": search.winner.candidate.index,
+                        "aggregate_tokens_per_second": search.winner.aggregate_tokens_per_second,
+                        "p95_latency_seconds": search.winner.p95_latency_seconds,
+                    },
+                    "best_latency": {
+                        "index": search.best_latency.candidate.index,
+                        "p95_latency_seconds": search.best_latency.p95_latency_seconds,
+                    },
+                    "evaluated": len(search.evaluated),
+                }
+            )
+        reports.append(report)
+
+    output: dict[str, object] = {"schema_version": 1, "profiles": reports}
+    if args.dry_run:
+        print(json.dumps(output, indent=2, sort_keys=True))
         return 0
+    if not searches:
+        print("no supported profiles were available for autotune", file=sys.stderr)
+        return 2
+    if not args.commit:
+        print(json.dumps(output, indent=2, sort_keys=True))
+        return 0
+
     from .daemon import AUTOTUNE_LEASE_PATH
 
     active_state = _broker_admin_get("/admin/status")
     backend_state = active_state.get("backend", {})
     previous_active = backend_state.get("profile") if isinstance(backend_state, dict) else None
+
     def reload_registry() -> None:
         _broker_admin("/admin/autotune/reload", {})
 
@@ -1577,6 +1619,10 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
     def mark_degraded(reason: str) -> None:
         _broker_admin("/admin/autotune/degraded", {"reason": reason})
 
+    winners = {
+        profile_id: (search.winner.candidate, adapter)
+        for profile_id, (search, adapter) in searches.items()
+    }
     with MaintenanceLease(AUTOTUNE_LEASE_PATH, ttl_seconds=args.lease_ttl):
         transaction = AutotuneTransaction(
             Path(args.profiles),
@@ -1585,16 +1631,14 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
             quiescent=quiescent,
             mark_degraded=mark_degraded,
         )
-        committed = transaction.commit(
+        committed = transaction.commit_many(
             manifest,
-            profile_id=profile.id,
-            winner=search.winner.candidate,
-            adapter=ADAPTERS[profile.runtime],
+            winners=winners,
             previous_active=previous_active if isinstance(previous_active, str) else None,
             state_path=Path(args.state_file) if args.state_file else None,
         )
-    report["commit"] = committed
-    print(json.dumps(report, indent=2, sort_keys=True))
+    output["commit"] = committed
+    print(json.dumps(output, indent=2, sort_keys=True))
     return 0
 
 
@@ -2288,9 +2332,7 @@ def build_parser() -> argparse.ArgumentParser:
     revoke_security.add_argument("key")
 
     # Profiles remain the authoritative model-to-runtime binding manifest.
-    profiles = subparsers.add_parser(
-        "profile", aliases=["profiles"], help="profile manifest management"
-    )
+    profiles = subparsers.add_parser("profile", help="profile manifest management")
     profiles_sub = profiles.add_subparsers(dest="profiles_command", required=True)
 
     profiles_sub.add_parser("list", help="list profiles with status")
@@ -2300,7 +2342,7 @@ def build_parser() -> argparse.ArgumentParser:
     autotune = profiles_sub.add_parser(
         "autotune", help="benchmark bounded profile candidates and persist a winner"
     )
-    autotune.add_argument("profile_id")
+    autotune.add_argument("profile_id", nargs="?", help="optional profile id; omit to tune all profiles")
     autotune.add_argument("--dry-run", action="store_true", help="only print schema and candidates")
     autotune.add_argument("--json", action="store_true", help="reserved for machine-readable output")
     autotune.add_argument("--help-file", help="captured runtime --help text for low-confidence discovery")
@@ -2490,7 +2532,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_model_list(args)
         if args.command == "runtime" and args.runtime_command == "list":
             return _cmd_runtime_list(args)
-        if args.command in {"profile", "profiles"}:
+        if args.command == "profile":
             if args.profiles_command == "list":
                 return _cmd_profiles_list(args)
             if args.profiles_command == "show":
