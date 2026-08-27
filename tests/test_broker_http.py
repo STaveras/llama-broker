@@ -918,6 +918,26 @@ class BrokerHttpTests(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.005)
 
+    def test_admin_restart_recovers_last_failed_target_without_model(self) -> None:
+        application = self.broker.application  # type: ignore[attr-defined]
+        application._remember_controller_state(  # type: ignore[attr-defined]
+            {
+                "generation": 9,
+                "profile": None,
+                "phase": "failed",
+                "target_profile": "main",
+            }
+        )
+        application.coordinator.synchronize_after_controller_failure(None)
+        self.controller.profile = None
+
+        status, payload = self._post({}, "/admin/restart")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["backend"]["profile"], "main")  # type: ignore[index]
+        self.assertEqual(self.controller.transitions, ["main"])
+        self.assertEqual(self.controller.profile, "main")
+
     def test_admin_restart_reloads_active_profile_without_unloading_it(self) -> None:
         status, payload = self._post({}, "/admin/restart")
 

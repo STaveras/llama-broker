@@ -1387,6 +1387,21 @@ class BrokerApplication:
             thread.join(timeout=max(1.0, RECOVERY_INTERVAL + 1.0))
         self._recovery_thread = None
 
+    def restart_when_idle(self) -> Any:
+        """Restart the active profile or recover the last failed target."""
+
+        if self.coordinator.active_profile is None:
+            state = self._controller_state_snapshot()
+            if state.get("phase") == "failed":
+                target_profile = state.get("target_profile")
+                if isinstance(target_profile, str) and target_profile:
+                    _log(
+                        f"[broker] restart requested with no active profile; "
+                        f"recovering failed target {target_profile!r}"
+                    )
+                    return self.coordinator.switch_when_idle(target_profile)
+        return self.coordinator.restart_when_idle()
+
     def max_output_tokens_for(self, profile: Profile) -> int:
         """Return the maximum client-requested output for a profile."""
 
@@ -2064,7 +2079,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             elif path == "/admin/restart":
                 model = payload.get("model")
                 if model is None:
-                    self.application.coordinator.restart_when_idle()
+                    self.application.restart_when_idle()
                 else:
                     profile = self.application.registry.resolve(model)
                     if self.application.coordinator.active_profile == profile.id:
