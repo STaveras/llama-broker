@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.5
+## Retrospective version: 0.6.6
 
-**Concurrent benchmark waves and cleanup** — source checkpoint d71f4ed05082 (2026-08-27).
+**Apply candidate settings to the live workload** — source checkpoint 1c9c759dd11c (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 

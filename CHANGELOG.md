@@ -1,10 +1,18 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.5**.
+Current assigned version: **0.6.6**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.6] - 2026-08-27 — Apply candidate settings to the live workload
+
+Original checkpoint: `1c9c759dd11c08db36afb354a49398b6644bc0e2`.
+
+- Apply candidate field changes to the temporary profile used by the live HTTP workload, so its settings match the candidate being benchmarked.
+- Remove the now-unused benchmark-JSON conversion helper after the switch to live workloads; keep the engine's benchmark callback live and on demand.
+- Correct --force help to describe retuning completed profiles without promising matching-work resumption.
 
 ## [0.6.5] - 2026-08-27 — Concurrent benchmark waves and cleanup
 

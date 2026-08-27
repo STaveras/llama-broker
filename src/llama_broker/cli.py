@@ -1469,32 +1469,6 @@ def _cmd_profiles_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _autotune_result_from_payload(candidate: Candidate, payload: object, *, baseline: bool) -> BenchmarkResult:
-    if not isinstance(payload, dict):
-        raise ProfileError("benchmark JSON entries must be objects")
-    try:
-        throughput = float(payload["aggregate_tokens_per_second"])
-        p95 = float(payload["p95_latency_seconds"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ProfileError(
-            "benchmark JSON requires aggregate_tokens_per_second and p95_latency_seconds"
-        ) from error
-    errors = payload.get("operational_errors", ())
-    if not isinstance(errors, (list, tuple)) or not all(isinstance(item, str) for item in errors):
-        raise ProfileError("operational_errors must be a list of strings")
-    valid = bool(payload.get("valid", not errors))
-    return BenchmarkResult(
-        candidate=candidate,
-        modes=(),
-        valid=valid,
-        operational_errors=tuple(errors),
-        aggregate_tokens_per_second=throughput,
-        p95_latency_seconds=p95,
-        best_latency_seconds=p95,
-        baseline=baseline,
-    )
-
-
 def _autotune_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -1553,7 +1527,12 @@ def _run_live_autotune(
                 ),
             }
         )
-        ephemeral = replace(profile, alias=alias, aliases=(alias,))
+        ephemeral = replace(
+            profile,
+            alias=alias,
+            aliases=(alias,),
+            **dict(candidate.changes),
+        )
         managed_args = security.backend_server_args(
             listen_host="127.0.0.1",
             listen_port=port,
@@ -2622,7 +2601,7 @@ def build_parser() -> argparse.ArgumentParser:
         "autotune", help="benchmark bounded profile candidates and persist a winner"
     )
     autotune.add_argument("profile_id", nargs="?", help="optional profile id; omit to tune all profiles")
-    autotune.add_argument("--force", action="store_true", help="retune complete profiles and resume matching work")
+    autotune.add_argument("--force", action="store_true", help="retune profiles already marked complete")
     autotune.add_argument("--dry-run", action="store_true", help="run the real benchmark without persisting winners")
     autotune.add_argument("--yes", action="store_true", help="allow graceful stop of the active profile")
     autotune.add_argument("--max-experiments", type=int, default=64, help="maximum candidates per profile")
