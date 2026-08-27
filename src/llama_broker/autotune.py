@@ -270,6 +270,9 @@ class RequestProbe(Protocol):
     ) -> ResponseMeasurement: ...
 
 
+ProgressCallback = Callable[[str, Candidate, int, int, BenchmarkResult | None], None]
+
+
 class HttpCandidateSession:
     """Deterministic local OpenAI-compatible workload for one candidate."""
 
@@ -1087,14 +1090,23 @@ class SystemdCandidateLifecycle:
         readiness_probe: Callable[[Candidate], bool] | None = None,
         unit_directives_for: Callable[[Candidate], Sequence[str]] | None = None,
         clock: Callable[[], float] = time.time,
+        command_timeout: float = 45.0,
     ) -> None:
         self.command_for = command_for
         self.request_factory = request_factory
         self.unit_dir = Path(unit_dir)
-        self.runner = runner or (lambda command: subprocess.run(command, check=True))
         self.readiness_probe = readiness_probe or (lambda _candidate: True)
         self.unit_directives_for = unit_directives_for or (lambda _candidate: ())
         self.clock = clock
+        if command_timeout <= 0:
+            raise ValueError("candidate command timeout must be positive")
+        self.command_timeout = float(command_timeout)
+        if runner is None:
+            self.runner = lambda command: subprocess.run(
+                command, check=True, timeout=self.command_timeout
+            )
+        else:
+            self.runner = runner
 
     def _run(self, *command: str) -> None:
         self.runner(command)
@@ -1105,6 +1117,10 @@ class SystemdCandidateLifecycle:
                 self._run("systemctl", "--user", "stop", unit_name)
             except (OSError, subprocess.SubprocessError):
                 pass
+        try:
+            self._run("systemctl", "--user", "reset-failed", unit_name)
+        except (OSError, subprocess.SubprocessError):
+            pass
         unit_path.unlink(missing_ok=True)
         try:
             self._run("systemctl", "--user", "daemon-reload")
@@ -1157,18 +1173,34 @@ class AutotuneEngine:
         benchmark: Callable[[Candidate, bool], BenchmarkResult],
         clock: Callable[[], float] = time.monotonic,
         max_seconds: float = MAX_PROFILE_SECONDS,
+        progress: ProgressCallback | None = None,
     ) -> None:
         self.schema = schema
         self.candidates = tuple(candidates)
         self.benchmark = benchmark
         self.clock = clock
         self.max_seconds = min(float(max_seconds), float(MAX_PROFILE_SECONDS))
+        self.progress = progress
+
+    def _progress(
+        self,
+        phase: str,
+        candidate: Candidate,
+        completed: int,
+        total: int,
+        result: BenchmarkResult | None = None,
+    ) -> None:
+        if self.progress is not None:
+            self.progress(phase, candidate, completed, total, result)
 
     def run(self) -> SearchResult:
         if not self.candidates or self.candidates[0].strategy != "baseline":
             raise BaselineRejected("baseline must be the first candidate")
         started = self.clock()
+        total = min(len(self.candidates), MAX_CANDIDATES)
+        self._progress("started", self.candidates[0], 0, total)
         baseline = self.benchmark(self.candidates[0], True)
+        self._progress("completed", self.candidates[0], 1, total, baseline)
         if not baseline.valid:
             raise BaselineRejected(
                 f"baseline rejected: {', '.join(baseline.operational_errors) or 'invalid'}"
@@ -1181,8 +1213,10 @@ class AutotuneEngine:
             if self.clock() - started >= self.max_seconds:
                 stopped_reason = "time_limit"
                 break
+            self._progress("started", candidate, len(evaluated), total)
             result = self.benchmark(candidate, False)
             evaluated.append(result)
+            self._progress("completed", candidate, len(evaluated), total, result)
         reliable = [result for result in evaluated if self._reliable(result, baseline)]
         if not reliable:
             raise CandidateRejected("no reliable autotune candidates")

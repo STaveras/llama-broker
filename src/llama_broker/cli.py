@@ -40,7 +40,7 @@ import tempfile
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from . import daemon as broker_runtime
@@ -1482,6 +1482,7 @@ def _run_live_autotune(
     *,
     time_budget: float,
     lease: MaintenanceLease | None = None,
+    progress: Callable[[str, Candidate, int, int, BenchmarkResult | None], None] | None = None,
 ) -> Any:
     """Run one profile's candidates through disposable local systemd units."""
 
@@ -1495,6 +1496,16 @@ def _run_live_autotune(
         "alias": None,
         "max_output_tokens": profile.default_max_output_tokens,
     }
+    last_heartbeat = [0.0]
+
+    def keep_lease_alive() -> None:
+        if lease is None:
+            return
+        now = time.monotonic()
+        if now - last_heartbeat[0] >= 10.0:
+            lease.heartbeat()
+            last_heartbeat[0] = now
+
     base_parts = urlsplit(backend_url)
     fixture_path: Path | None = None
     if "vision" in profile.capabilities:
@@ -1543,8 +1554,7 @@ def _run_live_autotune(
         )
 
     def request_factory(_unit: str, mode: str, streaming: bool, concurrent: bool) -> Any:
-        if lease is not None:
-            lease.heartbeat()
+        keep_lease_alive()
         alias = endpoint.get("alias")
         if not isinstance(alias, str):
             raise RuntimeError("candidate alias was not allocated")
@@ -1552,7 +1562,7 @@ def _run_live_autotune(
             candidate_url(),
             alias,
             image_fixture=fixture_path,
-            timeout=min(240.0, max(5.0, time_budget)),
+            timeout=min(30.0, max(5.0, time_budget)),
             ca_file=security.backend_tls_ca_file,
             ssl_context=security.backend_client_context(),
             api_key=api_key,
@@ -1566,6 +1576,7 @@ def _run_live_autotune(
         deadline = time.monotonic() + max(10.0, min(float(profile.startup_timeout), 300.0))
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         while time.monotonic() < deadline:
+            keep_lease_alive()
             try:
                 with BackendClient(
                     candidate_url(),
@@ -1625,6 +1636,7 @@ def _run_live_autotune(
             candidates=candidates,
             benchmark=benchmark,
             max_seconds=time_budget,
+            progress=progress,
         ).run()
     finally:
         if fixture_path is not None:
@@ -1777,6 +1789,41 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
                 )
                 if not args.json:
                     print(f"Autotuning {profile.id}: {len(candidates)} candidate(s)")
+
+                def progress(
+                    phase: str,
+                    candidate: Candidate,
+                    completed: int,
+                    total: int,
+                    result: BenchmarkResult | None,
+                ) -> None:
+                    if args.json:
+                        return
+                    ordinal = completed + 1 if phase == "started" else completed
+                    if phase == "started":
+                        print(
+                            f"[{ordinal}/{total}] candidate {candidate.index} "
+                            f"({candidate.strategy}) starting...",
+                            flush=True,
+                        )
+                        return
+                    if result is None:
+                        print(
+                            f"[{ordinal}/{total}] candidate {candidate.index} finished",
+                            flush=True,
+                        )
+                        return
+                    state = "complete" if result.valid else "failed"
+                    detail = (
+                        f"throughput={result.aggregate_tokens_per_second:.2f} tok/s "
+                        f"p95={result.p95_latency_seconds:.3f}s"
+                        if result.valid
+                        else f"errors={','.join(result.operational_errors) or 'invalid'}"
+                    )
+                    print(
+                        f"[{ordinal}/{total}] candidate {candidate.index} {state}; {detail}",
+                        flush=True,
+                    )
                 try:
                     search = _run_live_autotune(
                         profile,
@@ -1784,6 +1831,7 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
                         candidates,
                         time_budget=args.time_budget,
                         lease=lease,
+                        progress=progress,
                     )
                     report = _autotune_report(profile, search)
                     report_path = report_dir / f"{profile.id}-{time.time_ns()}.json"
