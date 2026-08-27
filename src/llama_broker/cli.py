@@ -63,6 +63,12 @@ from .profile_config import (
     sha256_file,
     write_manifest_atomically,
 )
+from .runtime_builds import (
+    apply_runtime_build,
+    infer_runtime_build,
+    resolve_runtime_build,
+    runtime_build_label,
+)
 from .runtimes import get_runtime_info, list_runtimes, runtime_names
 from .integration import filtered_manifest, inspect_manifest, report_for
 from .paths import MODELS_DIR
@@ -228,11 +234,21 @@ REQUIRED_LLAMACPP_ENVIRONMENT = frozenset(
 )
 
 
-def _load_editable_manifest(profiles_path: Path) -> tuple[ProfileRegistry, dict[str, object]]:
-    """Load raw records only after the authoritative registry accepts the manifest."""
+def _load_editable_manifest(
+    profiles_path: Path, *, allow_missing_artifacts: bool = False
+) -> tuple[ProfileRegistry, dict[str, object]]:
+    """Load a manifest for diagnostics or mutation.
 
-    registry = ProfileRegistry.from_path(profiles_path)
-    return registry, load_manifest_source(profiles_path)
+    Missing artifacts are allowed only for read-only diagnostics and the TUI
+    inspection surface. Any mutation still validates strictly before publish.
+    """
+
+    registry = ProfileRegistry.from_path(
+        profiles_path, allow_missing_artifacts=allow_missing_artifacts
+    )
+    return registry, load_manifest_source(
+        profiles_path, allow_missing_artifacts=allow_missing_artifacts
+    )
 
 
 def _write_validated_manifest(profiles_path: Path, data: dict[str, object]) -> None:
@@ -438,13 +454,13 @@ def _template_profile_record(data: dict[str, object]) -> dict[str, object]:
     records = data.get("profiles")
     if not isinstance(records, list) or not records:
         raise ProfileError("cannot add a profile without an existing template profile")
-    for record in records:
-        if isinstance(record, dict) and record.get("role") == "primary":
-            return copy.deepcopy(record)
-    for record in records:
-        if isinstance(record, dict):
-            return copy.deepcopy(record)
-    raise ProfileError("profile template is not an object")
+    template = next(
+        (record for record in records if isinstance(record, dict)),
+        None,
+    )
+    if template is None:
+        raise ProfileError("profile template is not an object")
+    return copy.deepcopy(template)
 
 
 def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> dict[str, object]:
@@ -581,8 +597,32 @@ def _interactive_edit(
 
     display_name = profile_data.get("display_name", profile_data.get("alias", profile_id))
     print(f"\nEditing: {profile_data['id']} ({display_name})\n")
+    inferred_build = infer_runtime_build(data, profile_data)
+    print(
+        f"Runtime build: {runtime_build_label(inferred_build) if inferred_build is not None else '(custom/manual)'}"
+    )
 
     changed = False
+    runtime_build = flags.get("runtime_build")
+    if runtime_build is not None:
+        # Resolve the build strictly, but defer the runtime/build relationship
+        # check to the final manifest validation. This lets a flag-based edit
+        # hold a temporary mismatch while still refusing to publish one.
+        build = resolve_runtime_build(data, runtime_build)
+        updated = copy.deepcopy(profile_data)
+        updated.update(
+            {
+                "runtime": selected_runtime,
+                "runtime_build": build.id,
+                "server_binary": str(build.server_binary),
+                "server_sha256": build.server_sha256,
+            }
+        )
+        if updated != profile_data:
+            profile_data = updated
+            data["profiles"][profile_idx] = profile_data
+            changed = True
+            print(f"  Runtime build: {runtime_build}")
     for field_key, field_label, field_type in EDITABLE_FIELDS:
         current = profile_data.get(field_key)
         flag_value = flags.get(field_key)
@@ -1406,9 +1446,17 @@ def _cmd_profiles_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_profiles_show(args: argparse.Namespace) -> int:
-    registry, data = _load_editable_manifest(args.profiles)
+    registry, data = _load_editable_manifest(
+        args.profiles, allow_missing_artifacts=True
+    )
     _profile, record = _record_for_selector(registry, data, args.profile_id)
-    print(json.dumps(record, indent=2, ensure_ascii=False))
+    shown = copy.deepcopy(record)
+    inferred = infer_runtime_build(
+        data, record, allow_missing_artifacts=True
+    )
+    if "runtime_build" not in shown and inferred is not None:
+        shown["runtime_build"] = inferred.id
+    print(json.dumps(shown, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -1723,6 +1771,7 @@ def _cmd_profiles_edit(args: argparse.Namespace) -> int:
     """Open the field-oriented editor or apply a compatibility flag edit."""
     flags = {
         "runtime": args.runtime,
+        "runtime_build": args.runtime_build,
         "context_size": args.context_size,
         "parallel": args.parallel,
         "tensor_parallel_size": args.tensor_parallel_size,
@@ -2103,6 +2152,7 @@ def build_parser() -> argparse.ArgumentParser:
     edit = profiles_sub.add_parser("edit", help="open the field-oriented profile editor")
     edit.add_argument("model", nargs="?", help="profile id or alias (default: first profile)")
     edit.add_argument("--runtime", choices=runtime_names(), help="set serving runtime")
+    edit.add_argument("--runtime-build", help="select a concrete cataloged runtime build")
     edit.add_argument("--context-size", help="set context_size")
     edit.add_argument("--parallel", help="set parallel requests")
     edit.add_argument("--tensor-parallel-size", help="set vLLM tensor parallel size")
@@ -2214,10 +2264,17 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
 
     profile = backend.get("profile")
     phase = backend.get("phase", "unknown")
-    print(f"Backend:   {profile if profile else phase}")
+    accepted = isinstance(operation, dict) and operation.get("status") == "accepted"
+    if accepted:
+        print(
+            f"Backend:   transition pending (current: {profile if profile else 'none'})"
+        )
+        phase = "transition_pending"
+    else:
+        print(f"Backend:   {profile if profile else phase}")
     print(f"Phase:     {phase}")
     if "ready" in backend:
-        print(f"Ready:     {'yes' if backend['ready'] else 'no'}")
+        print(f"Ready:     {'no' if accepted else ('yes' if backend['ready'] else 'no')}")
     if "generation" in backend:
         print(f"Generation: {backend['generation']}")
     if "host" in backend and "port" in backend:
@@ -2293,7 +2350,9 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_profiles_template(args)
 
         # Original commands
-        registry = ProfileRegistry.from_path(args.profiles)
+        registry = ProfileRegistry.from_path(
+            args.profiles, allow_missing_artifacts=args.command == "status"
+        )
         controller = create_production_controller(registry)
 
         if args.command == "status":
@@ -2321,12 +2380,30 @@ def main(argv: list[str] | None = None) -> int:
                 if "ready" in live_backend:
                     backend_ready = bool(live_backend["ready"])
             stale_active = phase == "active" and not backend_ready
+            configured_identity: tuple[str, str] | None = None
+            running_identity: tuple[str, str] | None = None
+            if profile_id and phase == "active":
+                configured_profile = registry.try_resolve(str(profile_id))
+                configured_build = getattr(configured_profile, "runtime_build", None)
+                configured_sha = getattr(configured_profile, "server_sha256", None)
+                running_build = state.get("runtime_build")
+                running_sha = state.get("server_sha256")
+                if isinstance(configured_build, str) and configured_build and isinstance(configured_sha, str) and configured_sha:
+                    configured_identity = (configured_build, configured_sha)
+                if isinstance(running_build, str) and running_build and isinstance(running_sha, str) and running_sha:
+                    running_identity = (running_build, running_sha)
+            runtime_configuration_pending = (
+                configured_identity is not None
+                and running_identity is not None
+                and configured_identity != running_identity
+            )
 
             if getattr(args, "json", False):
                 detail = dict(state)
                 detail["schema_version"] = 1
                 detail["observed_phase"] = "stale" if stale_active else phase
                 detail["backend_ready"] = backend_ready
+                detail["runtime_configuration_pending"] = runtime_configuration_pending
                 if live_state:
                     detail["live"] = live_state
                 print(json.dumps(detail, indent=2, sort_keys=True))
@@ -2343,6 +2420,12 @@ def main(argv: list[str] | None = None) -> int:
                     f"Backend:   unavailable (persisted profile: {profile_id}; "
                     f"{backend_host}:{backend_port} is not accepting connections)"
                 )
+                recovery = state.get("recovery")
+                if isinstance(recovery, dict):
+                    attempts = recovery.get("attempts", 0)
+                    action = recovery.get("action", "unknown")
+                    error = str(recovery.get("error", "unknown failure"))
+                    print(f"Recovery:  {action}; attempts={attempts}; {error}")
             elif profile_id and phase == "active":
                 profile = registry.try_resolve(str(profile_id))
                 display = profile.display_name if profile else profile_id
@@ -2360,6 +2443,8 @@ def main(argv: list[str] | None = None) -> int:
                     utilisation = min(active / profile.parallel, 1.0) if profile.parallel else 0.0
                     print(f"Requests:  active={active} pending={pending} (pending transitions={pending_transitions})")
                     print(f"Slots:     {active}/{profile.parallel} in use ({utilisation:.0%})")
+                    if runtime_configuration_pending:
+                        print("Runtime configuration pending")
                 else:
                     print("Backend:   (unknown)")
                 print(f"Port:      {backend_port}")

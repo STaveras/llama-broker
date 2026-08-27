@@ -12,10 +12,15 @@ PRIVATE_PATH_PATTERNS = (
     re.compile(r"(^|/)profiles\.json(?:\.bak-.*)?$"),
     re.compile(r"(^|/)AGENTS\.md$"),
     re.compile(r"(^|/)DESIGN\.md$"),
-    re.compile(r"(^|/)docs/plans(?:/|$)"),
-    re.compile(r"(^|/)docs/broker-autotune-workstream\.md$"),
     re.compile(r"(^|/)state\.json$"),
     re.compile(r"(^|/)(?:security\.json|api-keys)$"),
+)
+PUBLIC_EXCLUDED_PATH_PATTERNS = (
+    # These maintainer-only prompts/plans are excluded by MANIFEST.in and are
+    # intentionally not part of the public source distribution.
+    re.compile(r"(^|/)docs/plans(?:/|$)"),
+    re.compile(r"(^|/)docs/goals(?:/|$)"),
+    re.compile(r"(^|/)docs/broker-autotune-workstream\.md$"),
 )
 HOST_PATTERNS = (
     re.compile(r"/home/[A-Za-z0-9_.-]+/"),
@@ -39,6 +44,8 @@ def check(root: Path) -> list[str]:
     failures: list[str] = []
     for path in tracked_files(root):
         rel = path.relative_to(root).as_posix()
+        if any(pattern.search(rel) for pattern in PUBLIC_EXCLUDED_PATH_PATTERNS):
+            continue
         if any(pattern.search(rel) for pattern in PRIVATE_PATH_PATTERNS):
             failures.append(f"private path: {rel}")
             continue

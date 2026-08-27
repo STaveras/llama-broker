@@ -26,6 +26,7 @@ from llama_broker import (
     ProfileCoordinator,
     apply_reasoning_policy,
     enforce_output_limit,
+    reasoning_policy_metadata,
     route_payload,
 )
 
@@ -175,7 +176,7 @@ class BrokerHttpTests(unittest.TestCase):
                     "alias": "main-27b",
                     "aliases": ["main", "main-27b"],
                     "display_name": "main",
-                    "role": "primary",
+                    "role": "persistent",
                     "capabilities": ["text"],
                     "model_path": str(main_model),
                     "model_sha256": sha256_file(main_model),
@@ -623,7 +624,7 @@ class BrokerHttpTests(unittest.TestCase):
             forwarded["chat_template_kwargs"], {"enable_thinking": True}
         )
         self.assertEqual(forwarded["reasoning_effort"], "high")
-        self.assertEqual(forwarded["reasoning_budget_tokens"], 32768)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 32768)
 
     def test_llamacpp_reasoning_policy_defaults_off_in_forwarded_payload(self) -> None:
         status, _ = self._post(
@@ -636,7 +637,7 @@ class BrokerHttpTests(unittest.TestCase):
             forwarded["chat_template_kwargs"], {"enable_thinking": False}
         )
         self.assertEqual(forwarded["reasoning_effort"], "none")
-        self.assertEqual(forwarded["reasoning_budget_tokens"], 0)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 0)
 
     def test_known_alias_is_rewritten_to_exact_backend_alias(self) -> None:
         status, response = self._post(
@@ -1148,8 +1149,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(transitions, ["vision", initial_profile])
         self.assertEqual(coordinator.active_profile, initial_profile)
 
-    def test_transient_lease_restores_primary_profile(self) -> None:
-        self._assert_transient_round_trip("primary")
+    def test_transient_lease_restores_persistent_profile(self) -> None:
+        self._assert_transient_round_trip("persistent")
 
     def test_transient_lease_restores_kvarn_equivalent_profile(self) -> None:
         self._assert_transient_round_trip("kvarn4")
@@ -1592,7 +1593,7 @@ class CoordinatorTests(unittest.TestCase):
             {
                 "chat_template_kwargs": {"enable_thinking": False},
                 "reasoning_effort": "none",
-                "reasoning_budget_tokens": 0,
+                "thinking_budget_tokens": 0,
             },
         )
         self.assertEqual(
@@ -1604,7 +1605,7 @@ class CoordinatorTests(unittest.TestCase):
             {
                 "reasoning": {"effort": "low"},
                 "chat_template_kwargs": {"enable_thinking": True},
-                "reasoning_budget_tokens": 4096,
+                "thinking_budget_tokens": 4096,
                 "reasoning_effort": "low",
             },
         )
@@ -1613,9 +1614,29 @@ class CoordinatorTests(unittest.TestCase):
                 {"reasoning": {"effort": "high"}},
                 runtime="llamacpp",
                 max_output_tokens=32768,
-            )["reasoning_budget_tokens"],
+            )["thinking_budget_tokens"],
             16384,
         )
+
+    def test_zero_thinking_budget_disables_reasoning_safely(self) -> None:
+        for payload in (
+            {"thinking_budget_tokens": 0},
+            {"reasoning_budget_tokens": 0},
+            {"thinking_budget_tokens": 0, "reasoning_budget_tokens": 5},
+            {"thinking_budget_tokens": 5, "reasoning_budget_tokens": 0},
+        ):
+            with self.subTest(payload=payload):
+                rewritten = apply_reasoning_policy(
+                    {"reasoning": {"effort": "high"}, **payload},
+                    runtime="llamacpp",
+                    max_output_tokens=32768,
+                )
+
+                self.assertEqual(rewritten["reasoning_effort"], "none")
+                self.assertEqual(rewritten["thinking_budget_tokens"], 0)
+                self.assertEqual(
+                    rewritten["chat_template_kwargs"], {"enable_thinking": False}
+                )
 
     def test_llamacpp_reasoning_policy_preserves_explicit_budget(self) -> None:
         payload = {
@@ -1640,11 +1661,59 @@ class CoordinatorTests(unittest.TestCase):
             max_output_tokens=32768,
         )
 
-        self.assertEqual(rewritten["reasoning_budget_tokens"], 2048)
+        self.assertEqual(rewritten["thinking_budget_tokens"], 2048)
+        self.assertNotIn("reasoning_budget_tokens", rewritten)
         self.assertEqual(
             rewritten["chat_template_kwargs"], {"enable_thinking": True}
         )
         self.assertNotIn("reasoning_effort", rewritten)
+
+    def test_llamacpp_reasoning_policy_maps_extended_efforts(self) -> None:
+        expected = {
+            "minimal": 2048,
+            "low": 4096,
+            "medium": 8192,
+            "high": 16384,
+            "extra high": 24576,
+            "max": 32768,
+        }
+        for effort, budget in expected.items():
+            with self.subTest(effort=effort):
+                rewritten = apply_reasoning_policy(
+                    {"reasoning_effort": effort},
+                    runtime="llamacpp",
+                    max_output_tokens=32768,
+                )
+                self.assertEqual(rewritten["reasoning_effort"], effort)
+                self.assertEqual(rewritten["thinking_budget_tokens"], budget)
+                self.assertEqual(
+                    rewritten["chat_template_kwargs"], {"enable_thinking": True}
+                )
+
+    def test_reasoning_policy_metadata_is_safe_and_normalized(self) -> None:
+        original = {
+            "reasoning": {"effort": "ultra"},
+            "messages": [{"role": "user", "content": "secret prompt"}],
+        }
+        rewritten = {
+            **original,
+            "reasoning_effort": "high",
+            "thinking_budget_tokens": 32768,
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+
+        self.assertEqual(
+            reasoning_policy_metadata(original, rewritten, runtime="llamacpp"),
+            {
+                "runtime": "llamacpp",
+                "effort": "high",
+                "budget_present": False,
+                "budget_tokens": 32768,
+            },
+        )
+        self.assertIsNone(
+            reasoning_policy_metadata(original, rewritten, runtime="vllm")
+        )
 
     def test_reasoning_policy_does_not_touch_non_llamacpp_payloads(self) -> None:
         payload = {"reasoning": {"effort": "high"}}

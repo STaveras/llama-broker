@@ -8,6 +8,7 @@ from typing import Any
 
 from .broker_profiles import Profile, ProfileError, _parse_profile
 from .profile_config import load_manifest, sha256_file
+from .runtime_builds import RuntimeBuildError, parse_runtime_builds
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,13 @@ def inspect_manifest(
     raw_profiles = payload.get("profiles")
     if not isinstance(raw_profiles, list):
         raise ProfileError("profile manifest must contain a profiles list")
+    try:
+        runtime_builds = parse_runtime_builds(
+            payload.get("runtime_builds", []),
+            allow_missing_artifacts=not verify_artifacts,
+        )
+    except RuntimeBuildError as error:
+        raise ProfileError(str(error)) from error
     inspections: list[ProfileInspection] = []
     for index, raw in enumerate(raw_profiles):
         if not isinstance(raw, dict):
@@ -59,7 +67,11 @@ def inspect_manifest(
             continue
         profile_id = str(raw.get("id", f"<index:{index}>")).strip()
         try:
-            profile = _parse_profile(raw, allow_missing_artifacts=not verify_artifacts)
+            profile = _parse_profile(
+                raw,
+                allow_missing_artifacts=not verify_artifacts,
+                runtime_builds=runtime_builds,
+            )
         except (ProfileError, ValueError, TypeError, OSError) as error:
             inspections.append(ProfileInspection(profile_id, "broken", record=raw, reason=str(error)))
             continue

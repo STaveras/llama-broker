@@ -1,10 +1,19 @@
 # Retrospective changelog
 
-Current assigned version: **0.4.0**.
+Current assigned version: **0.5.0**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.5.0] - 2026-08-27 — Runtime build profiles and lifecycle handoff
+
+Original checkpoint: `1a7f5b0de8fbca441dad4a4f5481d8f57c0db38f`.
+
+- Add an inline runtime-build catalog with executable/path/hash validation, build inference, explicit profile selection, setup integration, and concrete running-build identity in state/status.
+- Make the profile editor runtime-family/build aware, snapshot its catalog, merge concurrent manifest drafts, and keep active build edits from restarting the backend.
+- Preserve runtime services during normal daemon shutdown/handoff; add recovery-watchdog behavior and treat failed units without surviving processes as quiescent.
+- Extend reasoning efforts, normalize budgets to thinking_budget_tokens, make an explicit zero budget disable thinking, and emit normalized reasoning metadata. Reject the obsolete primary profile role.
 
 ## [0.4.0] - 2026-08-18 — llama.cpp reasoning policy
 

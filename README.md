@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.4.0
+## Retrospective version: 0.5.0
 
-**llama.cpp reasoning policy** — source checkpoint 240237bdbdb1 (2026-08-18).
+**Runtime build profiles and lifecycle handoff** — source checkpoint 1a7f5b0de8fb (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
@@ -50,8 +50,10 @@ shown there.
   different profile wait for active leases to drain; the new backend must
   advertise its exact configured alias before the switch commits.
   Successful transient profiles restore their prior profile after their
-  leases drain; failed transitions never restart the prior profile. Multiple
-  resident instances are a planned
+  leases drain. If the active backend crashes, the broker records the stale
+  profile and retries recovery through the same coordinator with bounded
+  exponential backoff; it never relies on systemd to restart profile units.
+  Multiple resident instances are a planned
   memory-managed capability, not a current release feature.
 - **Immutable, bounded profile units.** Every profile renders to its own
   systemd unit with explicit memory, swap, task, kill-signal, and timeout
@@ -94,7 +96,10 @@ Profiles resolve from `~/.config/llama-broker/profiles.json`
 and experimental runtimes separately, and requires explicit profile selection.
 It never downloads runtimes, copies models, or loads a backend implicitly. Use
 `brokerctl setup --check` for a non-mutating human-readable catalog report and
-`brokerctl integrate --dry-run` to review integration changes.
+`brokerctl integrate --dry-run` to review integration changes. When setup creates
+a profile from a verified runtime executable, it also registers that executable
+in the manifest's `runtime_builds` catalog using a stable SHA-256-derived ID, so
+later profile edits can select the discovered build without manual catalog work.
 
 The current release keeps one backing runtime active at a time because of the
 local hardware budget. The planned residency manager will allow multiple

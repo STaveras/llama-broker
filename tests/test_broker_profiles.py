@@ -37,7 +37,7 @@ class ProfileRegistryTests(unittest.TestCase):
             "alias": alias,
             "aliases": [alias],
             "display_name": profile_id,
-            "role": "primary",
+            "role": "persistent",
             "capabilities": ["text"],
             "server_binary": str(self.server),
             "server_sha256": "1" * 64,
@@ -340,15 +340,12 @@ class ProfileRegistryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProfileError, field_name):
                     ProfileRegistry.from_path(self._write([profile]))
 
-    def test_primary_budget_must_preserve_explicit_vision_vram_reserve(self) -> None:
-        profile = self._profile("main", "main-27b", self.main_model)
-        safety = dict(profile["safety"])  # type: ignore[arg-type]
-        admission = dict(safety["admission"])  # type: ignore[arg-type]
-        admission["vision_vram_reserve_mib"] = 0
-        safety["admission"] = admission
-        profile["safety"] = safety
+    def test_primary_role_is_rejected(self) -> None:
+        profile = self._profile(
+            "main", "main-27b", self.main_model, role="primary"
+        )
 
-        with self.assertRaisesRegex(ProfileError, "vision_vram_reserve_mib"):
+        with self.assertRaisesRegex(ProfileError, "invalid role"):
             ProfileRegistry.from_path(self._write([profile]))
 
     def test_post_ready_reserve_cannot_exceed_native_fit_reserve(self) -> None:
@@ -366,7 +363,7 @@ class ProfileRegistryTests(unittest.TestCase):
             ProfileRegistry.from_path(self._write([profile]))
 
     def test_transient_vision_budget_consumes_instead_of_reserving_vision_vram(self) -> None:
-        primary_safety = self._profile(
+        persistent_safety = self._profile(
             "main", "main-27b", self.main_model
         )["safety"]
         vision = self._profile(
@@ -382,7 +379,7 @@ class ProfileRegistryTests(unittest.TestCase):
             fit=True,
             fit_target_mib=3_072,
             fit_ctx=65_536,
-            safety=primary_safety,
+            safety=persistent_safety,
         )
 
         with self.assertRaisesRegex(ProfileError, "vision_vram_reserve_mib"):

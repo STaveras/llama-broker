@@ -28,6 +28,7 @@ class Profile(Protocol):
 
     id: str
     runtime: str
+    runtime_build: str | None
     alias: str
     display_name: str
     server_binary: str | os.PathLike[str]
@@ -168,8 +169,8 @@ class ServiceStateSnapshot:
     @property
     def is_quiescent(self) -> bool:
         return (
-            self.active_state == "inactive"
-            and self.sub_state == "dead"
+            self.active_state in {"inactive", "failed"}
+            and self.sub_state in {"dead", "failed"}
             and self.main_pid == 0
             and self.control_pid == 0
         )
@@ -959,6 +960,11 @@ class BackendController:
                 "profile": profile_id,
                 "phase": "active",
             }
+            runtime_build = getattr(target, "runtime_build", None)
+            server_sha256 = getattr(target, "server_sha256", None)
+            if isinstance(runtime_build, str) and runtime_build and isinstance(server_sha256, str) and server_sha256:
+                active_state["runtime_build"] = runtime_build
+                active_state["server_sha256"] = server_sha256
             self._write_state(active_state)
             self._update_alias(profile_id)
             self._emit(
@@ -980,6 +986,36 @@ class BackendController:
 
         with self._lock:
             return dict(self._read_state())
+
+    def record_recovery_failure(
+        self, profile_id: str, *, attempts: int, error: str
+    ) -> dict[str, Any]:
+        """Persist a bounded recovery attempt without starting a backend."""
+
+        with self._lock:
+            self._profile(profile_id)
+            state = self._read_state()
+            failure_state = {
+                "generation": state["generation"] + 1,
+                "profile": None,
+                "phase": "stale",
+                "stale_profile": profile_id,
+                "recovery": {
+                    "attempts": max(1, int(attempts)),
+                    "error": str(error),
+                    "action": "broker_watchdog_restart",
+                },
+            }
+            self._write_state(failure_state)
+            self._update_alias(None)
+            self._emit(
+                "profile_recovery",
+                decision="failed",
+                profile=profile_id,
+                attempts=failure_state["recovery"]["attempts"],
+                error=str(error),
+            )
+            return failure_state
 
     def stop_all(self) -> dict[str, Any]:
         """Cooperatively stop every broker unit without ever starting a model."""
@@ -1089,12 +1125,25 @@ class BackendController:
                     self._update_alias(profile_id)
                     return state
 
+                recovery: dict[str, Any] = {
+                    "attempts": 0,
+                    "action": "startup_reconcile",
+                    "error": "backend readiness probe failed",
+                }
+                if self.service_state_probe is not None:
+                    try:
+                        recovery["service"] = self.service_state_probe(
+                            self.unit_name(profile_id)
+                        ).as_dict()
+                    except Exception as service_error:
+                        recovery["service_error"] = str(service_error)
                 stale_state = {
                     "generation": state["generation"] + 1,
                     "profile": None,
                     "phase": "stale",
                     "stale_profile": profile_id,
                     "error": "backend readiness probe failed",
+                    "recovery": recovery,
                 }
                 self._write_state(stale_state)
                 self._update_alias(None)

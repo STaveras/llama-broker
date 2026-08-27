@@ -5,7 +5,7 @@
       "id": "example-llama",
       "alias": "example-llama",
       "display_name": "Example Llama.cpp profile",
-      "role": "primary",
+      "role": "persistent",
       "capabilities": ["chat"],
       "server_binary": "/path/to/llama-server",
       "server_sha256": "0000000000000000000000000000000000000000000000000000000000000000",

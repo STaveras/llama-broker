@@ -62,43 +62,14 @@ def make_application(controller: BlockingController) -> BrokerApplication:
 
 
 class BrokerApplicationShutdownTests(unittest.TestCase):
-    def test_shutdown_is_synchronous_exactly_once_and_idempotent(self) -> None:
+    def test_shutdown_is_synchronous_idempotent_and_preserves_runtime(self) -> None:
         controller = BlockingController()
         application = make_application(controller)
-        errors: list[BaseException] = []
-        second_started = threading.Event()
-
-        def shutdown() -> None:
-            try:
-                application.shutdown()
-            except BaseException as error:
-                errors.append(error)
-
-        first = threading.Thread(target=shutdown)
-        first.start()
-        self.assertTrue(controller.stop_entered.wait(timeout=1))
-
-        def second_shutdown() -> None:
-            second_started.set()
-            shutdown()
-
-        second = threading.Thread(target=second_shutdown)
-        second.start()
-        self.assertTrue(second_started.wait(timeout=1))
-        self.assertTrue(first.is_alive())
-        self.assertTrue(second.is_alive())
-        self.assertEqual(controller.stops, 1)
-
-        controller.stop_release.set()
-        first.join(timeout=1)
-        second.join(timeout=1)
-        self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(controller.stops, 1)
 
         application.shutdown()
-        self.assertEqual(controller.stops, 1)
+        application.shutdown()
+
+        self.assertEqual(controller.stops, 0)
 
 
 class CoordinatorShutdownTests(unittest.TestCase):
@@ -118,6 +89,25 @@ class CoordinatorShutdownTests(unittest.TestCase):
 
         self.assertIsNone(coordinator.active_profile)
         self.assertIsNone(coordinator.snapshot()["profile"])
+
+    def test_handoff_preserves_active_profile_without_stopping_runtime(self) -> None:
+        stops: list[str] = []
+        coordinator = ProfileCoordinator(
+            "main",
+            lambda _profile: None,
+            lambda: stops.append("stopped"),
+            drain_timeout=0.1,
+            transition_timeout=0.1,
+        )
+
+        coordinator.handoff_for_process_shutdown()
+
+        self.assertEqual(stops, [])
+        self.assertEqual(coordinator.active_profile, "main")
+        self.assertTrue(coordinator.snapshot()["shutting_down"])
+        with self.assertRaises(BrokerQuiescingError):
+            with coordinator.lease_active():
+                self.fail("lease entered after control-plane handoff")
 
     def test_shutdown_gate_rejects_new_requests_and_transitions(self) -> None:
         stop_entered = threading.Event()

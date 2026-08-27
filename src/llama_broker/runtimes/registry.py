@@ -68,6 +68,7 @@ _BASE_FIELDS = frozenset(
         "capabilities",
         "native_vision",
         "restore_profile",
+        "runtime_build",
         "server_binary",
         "server_sha256",
         "model_path",

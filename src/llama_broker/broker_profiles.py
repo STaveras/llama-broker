@@ -17,18 +17,18 @@ from typing import Any, Mapping
 
 from .runtimes import get_runtime, get_runtime_info
 from .runtimes.registry import RuntimeError as RuntimeRegistryError
+from .runtime_builds import RuntimeBuild, RuntimeBuildError, parse_runtime_builds
 
 
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-ALLOWED_ROLES = frozenset({"primary", "persistent", "transient"})
+ALLOWED_ROLES = frozenset({"persistent", "transient"})
 ALLOWED_CAPABILITIES = frozenset({"text", "vision", "tools"})
 ALLOWED_CACHE_TYPES = frozenset(
     {"f16", "f32", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "turbo4", "kvarn4"}
 )
-# The primary profile advertises a 262,144-token trained window.  Profiles may
-# request the full window, but the fail-closed single-slot, fit, and memory
-# controls below still apply.
+# Profiles may request the full trained window, but the fail-closed single-slot,
+# fit, and memory controls below still apply.
 MAX_CONTEXT_SIZE = 262_144
 MAX_PARALLEL = 2
 MAX_BATCH_SIZE = 512
@@ -432,6 +432,7 @@ class Profile:
     capabilities: frozenset[str]
     native_vision: bool
     restore_profile: str | None
+    runtime_build: str | None
     server_binary: Path
     server_sha256: str
     model_path: Path
@@ -531,7 +532,9 @@ class ProfileRegistry:
         self._by_alias = MappingProxyType(aliases)
 
     @classmethod
-    def from_path(cls, path: Path | str) -> "ProfileRegistry":
+    def from_path(
+        cls, path: Path | str, *, allow_missing_artifacts: bool = False
+    ) -> "ProfileRegistry":
         manifest_path = Path(path)
         try:
             from .profile_config import load_manifest
@@ -547,7 +550,20 @@ class ProfileRegistry:
         if not isinstance(raw_profiles, list) or not raw_profiles:
             raise ProfileError("profile manifest must contain a non-empty profiles list")
 
-        profiles = tuple(_parse_profile(item) for item in raw_profiles)
+        try:
+            runtime_builds = parse_runtime_builds(
+                payload.get("runtime_builds", []),
+                allow_missing_artifacts=allow_missing_artifacts,
+            )
+        except RuntimeBuildError as error:
+            raise ProfileError(str(error)) from error
+        profiles = tuple(
+            _parse_profile(
+                item,
+                allow_missing_artifacts=allow_missing_artifacts,
+                runtime_builds=runtime_builds,
+            ) for item in raw_profiles
+        )
         ids = [profile.id for profile in profiles]
         if len(ids) != len(set(ids)):
             raise ProfileError("duplicate profile id")
@@ -576,7 +592,12 @@ class ProfileRegistry:
         return profile
 
 
-def _parse_profile(raw: object, *, allow_missing_artifacts: bool = False) -> Profile:
+def _parse_profile(
+    raw: object,
+    *,
+    allow_missing_artifacts: bool = False,
+    runtime_builds: tuple[RuntimeBuild, ...] = (),
+) -> Profile:
     if not isinstance(raw, dict):
         raise ProfileError("every profile must be a JSON object")
     record: Mapping[str, Any] = raw
@@ -628,6 +649,28 @@ def _parse_profile(raw: object, *, allow_missing_artifacts: bool = False) -> Pro
     server_binary = _absolute_existing_path(
         record, "server_binary", allow_missing=allow_missing_artifacts
     )
+    server_sha256 = _sha256(record, "server_sha256")
+    runtime_build: str | None = None
+    if "runtime_build" in record:
+        raw_runtime_build = record["runtime_build"]
+        if not isinstance(raw_runtime_build, str) or not raw_runtime_build.strip():
+            raise ProfileError(f"runtime_build must be a non-empty string for {profile_id!r}")
+        runtime_build = raw_runtime_build.strip()
+        build = next((item for item in runtime_builds if item.id == runtime_build), None)
+        if build is None:
+            raise ProfileError(
+                f"unknown runtime build for profile {profile_id!r}: {runtime_build!r}"
+            )
+        if build.runtime != runtime:
+            raise ProfileError(
+                f"runtime build {runtime_build!r} does not match runtime {runtime!r} "
+                f"for profile {profile_id!r}"
+            )
+        if build.server_binary != server_binary.resolve() or build.server_sha256 != server_sha256:
+            raise ProfileError(
+                f"runtime build {runtime_build!r} does not match the pinned "
+                f"server binary/hash for profile {profile_id!r}"
+            )
     model_path = _absolute_existing_path(
         record,
         "model_path",
@@ -881,11 +924,6 @@ def _parse_profile(raw: object, *, allow_missing_artifacts: bool = False) -> Pro
             f"cache_ram_mib for {profile_id!r} cannot exceed half of "
             f"safety.service.memory_max_mib ({max_cache_ram_mib} MiB)"
         )
-    if role == "primary" and safety.admission.vision_vram_reserve_mib <= 0:
-        raise ProfileError(
-            f"primary profile {profile_id!r} must preserve a positive "
-            "vision_vram_reserve_mib"
-        )
     if (
         role == "transient"
         and "vision" in capabilities
@@ -923,8 +961,9 @@ def _parse_profile(raw: object, *, allow_missing_artifacts: bool = False) -> Pro
         capabilities=capabilities,
         native_vision=native_vision,
         restore_profile=(str(record.get("restore_profile", "")).strip() or None),
+        runtime_build=runtime_build,
         server_binary=server_binary,
-        server_sha256=_sha256(record, "server_sha256"),
+        server_sha256=server_sha256,
         model_path=model_path,
         model_sha256=_sha256(record, "model_sha256"),
         mmproj_path=mmproj_path,

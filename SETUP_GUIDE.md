@@ -2,7 +2,7 @@
 
 This guide describes the active local deployment as of 2026-07-30. It is
 specific to the reviewed files in `<repo>` and the
-Phase 2 KVarN runtime used by the primary Example 9B v3 profile.
+Phase 2 KVarN runtime used by the Example 9B v3 profile.
 The historical example-first sections remain available for generic rollback support;
 the active manifest and current operational guidance take precedence.
 
@@ -27,7 +27,7 @@ the active manifest and current operational guidance take precedence.
 | Stable legacy rollback link | `<llama.cpp-build>/hermes-runtime/bin/llama-server` (still points to Phase 1) |
 
 The stable legacy link remains preserved for rollback and is not the active
-primary profile executable. Do not substitute it for the Phase 2 binary merely
+profile executable. Do not substitute it for the Phase 2 binary merely
 because it can open a model; use the broker manifest for model-specific paths.
 
 ## Service architecture
@@ -98,7 +98,7 @@ The effective profile settings are:
 
 | ID | Alias | Total context / slots | Placement | Model and special behavior |
 | --- | --- | --- | --- | --- |
-| `example-9b-v3` | `example-9b-v3` | 262,144 / 1 | `-ngl all` | Example 9B v3 Q6_K; KVarN4; active primary |
+| `example-9b-v3` | `example-9b-v3` | 262,144 / 1 | `-ngl all` | Example 9B v3 Q6_K; KVarN4; active |
 | `example-27b` | `example-27b` | 262,144 / 1 | `-ngl auto` | Example 27B Q1_0; secondary rollback |
 | `example-9b-stock` | `example-9b-stock` | 262,144 / 2 | `-ngl all` | stock Example 9B text; 131,072 tokens per slot |
 | `example-9b` | `example-9b` | 262,144 / 2 | `-ngl all` | Example 9B v2 text; 131,072 tokens per slot |
@@ -177,12 +177,24 @@ python3 brokerctl.py profiles edit example-9b-v3
 ```
 
 The editor selects individual fields instead of walking through a fixed prompt
-sequence. Enter opens a text box, dropdown, or checklist; Tab reveals runtime
+sequence. Cataloged profiles expose one `Serving backend` selector, such as
+`BeeLlama (llamacpp)` or `Atomic (llamacpp)`; the separate runtime field is shown
+only for custom/manual configurations. Enter opens a text box, dropdown, or checklist; Tab reveals runtime
 and model paths, hashes, fit controls, safety budgets, environment, and extra
 arguments. Save runs complete `ProfileRegistry` validation, regenerates units
 from the manifest, and restarts the control plane only when the active profile
 changed. Explicit `profiles edit MODEL --field value` flags remain available
-for non-interactive callers.
+for non-interactive callers. To select a concrete build without opening the TUI:
+
+```bash
+python3 brokerctl.py profiles edit <model> --runtime-build beellama
+python3 brokerctl.py profiles edit <model> --runtime-build atomic
+```
+
+The runtime-build catalog is stored in `profiles.json`; selecting a build updates
+both the pinned `server_binary` and `server_sha256`. The build label is not
+execution authority by itself. The catalog currently distinguishes the
+BeeLlama and Atomic llama.cpp builds.
 
 Discovery is authoritative only as a source of candidates. Import/adoption
 requires a local GGUF and a broker-owned `llama-server` path; the profile editor
@@ -522,7 +534,7 @@ must be the Phase 2 primary runtime shown in the manifest.
 ### Transactional profile rollback
 
 A normal failed switch automatically attempts to restore the prior profile.
-To return manually to the primary profile after a successful alternate-model
+To return manually to the prior production profile after a successful alternate-model
 request:
 
 ```bash
@@ -608,7 +620,7 @@ bundle: <llama.cpp-build>/inventory/20260717-113345-broker-kv-overhaul/broker-or
 bundle SHA-256: (hash computed at profile add)
 ```
 
-The active primary profile uses the Phase 2 KVarN4 cache. Example 27B and legacy
+The active profile uses the Phase 2 KVarN4 cache. Example 27B and legacy
 profiles retain their pinned Turbo4/Prism-compatible formats. KVarN source refs,
 patches, qualification results, and remaining blockers are documented in
 `<llama.cpp-build>/inventory/20260730-implementation-preflight/` and the

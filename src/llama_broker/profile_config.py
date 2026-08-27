@@ -165,13 +165,19 @@ def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
     return manifest_path, payload
 
 
-def load_manifest_source(path: Path | str) -> dict[str, Any]:
+def load_manifest_source(
+    path: Path | str, *, allow_missing_artifacts: bool = False
+) -> dict[str, Any]:
     """Load the persisted manifest while preserving explicit inheritance links."""
 
     manifest_path, payload = _load_manifest_payload(path)
     try:
         resolve_manifest_inheritance(payload)
-        validate_manifest(payload, directory=manifest_path.parent)
+        validate_manifest(
+            payload,
+            directory=manifest_path.parent,
+            allow_missing_artifacts=allow_missing_artifacts,
+        )
     except ValueError as error:
         raise ProfileError(str(error)) from error
     return payload
@@ -288,6 +294,95 @@ def semantic_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[s
         if before.get(key) != after.get(key):
             changes.append(key)
     return changes
+
+
+def merge_manifest_drafts(
+    base: Mapping[str, Any],
+    disk: Mapping[str, Any],
+    draft: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Three-way merge a draft with changes made on disk since it was opened.
+
+    Draft edits win true conflicts.  The returned paths are intended for a
+    confirmation prompt; callers must still run normal manifest validation.
+    """
+
+    conflicts: list[str] = []
+
+    def merge_value(old: Any, current: Any, wanted: Any, path: str) -> Any:
+        if current == old:
+            return copy.deepcopy(wanted)
+        if wanted == old or current == wanted:
+            return copy.deepcopy(current)
+        if isinstance(old, Mapping) and isinstance(current, Mapping) and isinstance(wanted, Mapping):
+            result: dict[str, Any] = {}
+            for key in sorted(set(old) | set(current) | set(wanted)):
+                child_path = f"{path}.{key}" if path else str(key)
+                if key not in wanted:
+                    if key in old and key in current and current[key] != old[key]:
+                        result[key] = copy.deepcopy(current[key])
+                    continue
+                if key not in current:
+                    if key in old and wanted[key] != old[key]:
+                        conflicts.append(child_path)
+                        result[key] = copy.deepcopy(wanted[key])
+                    continue
+                result[key] = merge_value(
+                    old.get(key), current[key], wanted[key], child_path
+                )
+            return result
+        conflicts.append(path or "manifest")
+        return copy.deepcopy(wanted)
+
+    def merge_records(key: str) -> list[Any] | None:
+        old_items = base.get(key)
+        current_items = disk.get(key)
+        wanted_items = draft.get(key)
+        if not isinstance(old_items, list) or not isinstance(current_items, list) or not isinstance(wanted_items, list):
+            return None
+        old_by_id = {item.get("id"): item for item in old_items if isinstance(item, Mapping) and item.get("id")}
+        current_by_id = {item.get("id"): item for item in current_items if isinstance(item, Mapping) and item.get("id")}
+        wanted_by_id = {item.get("id"): item for item in wanted_items if isinstance(item, Mapping) and item.get("id")}
+        ordered_ids = list(current_by_id)
+        ordered_ids.extend(item_id for item_id in wanted_by_id if item_id not in current_by_id)
+        result: list[Any] = []
+        for item_id in ordered_ids:
+            child_path = f"{key}[{item_id}]"
+            if item_id not in wanted_by_id:
+                if item_id not in old_by_id:
+                    result.append(copy.deepcopy(current_by_id[item_id]))
+                elif current_by_id.get(item_id) == old_by_id[item_id]:
+                    continue
+                else:
+                    conflicts.append(child_path)
+                    result.append(copy.deepcopy(current_by_id[item_id]))
+                continue
+            if item_id not in current_by_id:
+                if item_id not in old_by_id:
+                    result.append(copy.deepcopy(wanted_by_id[item_id]))
+                else:
+                    conflicts.append(child_path)
+                    result.append(copy.deepcopy(wanted_by_id[item_id]))
+                continue
+            result.append(
+                merge_value(
+                    old_by_id.get(item_id),
+                    current_by_id[item_id],
+                    wanted_by_id[item_id],
+                    child_path,
+                )
+            )
+        return result
+
+    merged: dict[str, Any] = {}
+    for key in sorted(set(base) | set(disk) | set(draft)):
+        if key in {"profiles", "runtime_builds"}:
+            records = merge_records(key)
+            if records is not None:
+                merged[key] = records
+                continue
+        merged[key] = merge_value(base.get(key), disk.get(key), draft.get(key), key)
+    return merged, conflicts
 
 
 def changed_profile_ids(before: Mapping[str, Any], after: Mapping[str, Any]) -> set[str]:
@@ -450,13 +545,13 @@ def _template_record(manifest: Mapping[str, Any], selector: str | None = None) -
     raw_profiles = manifest.get("profiles", [])
     if not isinstance(raw_profiles, list) or not raw_profiles:
         raise ProfileError("cannot create a profile without a template profile")
-    primary = next(
-        (item for item in raw_profiles if isinstance(item, dict) and item.get("role") == "primary"),
-        raw_profiles[0],
+    template = next(
+        (item for item in raw_profiles if isinstance(item, dict)),
+        None,
     )
-    if not isinstance(primary, dict):
+    if template is None:
         raise ProfileError("profile template is not an object")
-    return clone_record(primary)
+    return clone_record(template)
 
 
 def _unique_id(manifest: Mapping[str, Any], proposed: str) -> str:
@@ -578,7 +673,12 @@ def draft_from_endpoint(
     )
 
 
-def validate_manifest(manifest: Mapping[str, Any], *, directory: Path | None = None) -> None:
+def validate_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    directory: Path | None = None,
+    allow_missing_artifacts: bool = False,
+) -> None:
     """Run the exact production registry validation against an in-memory draft."""
 
     parent = directory or Path.cwd()
@@ -593,7 +693,9 @@ def validate_manifest(manifest: Mapping[str, Any], *, directory: Path | None = N
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(effective_manifest, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
-        ProfileRegistry.from_path(temporary_path)
+        ProfileRegistry.from_path(
+            temporary_path, allow_missing_artifacts=allow_missing_artifacts
+        )
     finally:
         try:
             temporary_path.unlink()
@@ -652,6 +754,31 @@ def apply_manifest_transaction(
     validate_manifest(new_manifest, directory=path.parent)
     changed_ids = changed_profile_ids(old_manifest, new_manifest)
     active_changed = active_profile is not None and active_profile in changed_ids
+    active_build_changed = False
+    if active_changed:
+        def profile_record(manifest: Mapping[str, Any]) -> Mapping[str, Any] | None:
+            records = manifest.get("profiles", [])
+            if not isinstance(records, list):
+                return None
+            return next(
+                (
+                    record
+                    for record in records
+                    if isinstance(record, Mapping) and record.get("id") == active_profile
+                ),
+                None,
+            )
+
+        before_profile = profile_record(old_manifest)
+        after_profile = profile_record(new_manifest)
+        identity_fields = ("runtime", "runtime_build", "server_binary", "server_sha256")
+        if before_profile is not None and after_profile is not None:
+            active_build_changed = any(
+                before_profile.get(field) != after_profile.get(field)
+                for field in identity_fields
+            )
+    if active_build_changed:
+        active_changed = False
     writer(path, new_manifest)
     restart_attempted = False
     try:

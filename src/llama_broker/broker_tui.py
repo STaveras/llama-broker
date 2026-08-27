@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+import os
+import textwrap
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -19,11 +21,20 @@ from .profile_config import (
     draft_from_gguf,
     find_profile_record,
     load_manifest_source,
+    merge_manifest_drafts,
     semantic_diff,
     sha256_file,
     simple_projection,
     validate_manifest,
     write_manifest_atomically,
+)
+from .runtime_builds import (
+    apply_runtime_build,
+    catalog_from_manifest,
+    infer_runtime_build,
+    resolve_runtime_build,
+    runtime_build_label,
+    serving_backend_label,
 )
 from .runtimes import get_runtime_info, runtime_names
 
@@ -44,7 +55,9 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("display_name", "Display name", "text"),
     EditorField("alias", "Primary alias", "text"),
     EditorField("aliases", "Additional aliases", "csv"),
-    EditorField("role", "Role", "select", options=("primary", "persistent", "transient")),
+    EditorField("role", "Role", "select", options=("persistent", "transient")),
+    EditorField("runtime_family", "Runtime family", "select"),
+    EditorField("runtime_build", "Backend build", "select"),
     EditorField("runtime", "Serving runtime", "select", options=runtime_names()),
     EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools")),
     EditorField("context_size", "Context size", "int"),
@@ -150,7 +163,7 @@ def _edit_simple_fields(
     values: dict[str, Any] = {}
     values["display_name"] = _default_text(input_fn, "Display name", current.get("display_name", ""))
     values["alias"] = _default_text(input_fn, "Alias", current.get("alias", ""))
-    values["role"] = _default_text(input_fn, "Role (primary/persistent/transient)", current.get("role", "persistent"))
+    values["role"] = _default_text(input_fn, "Role (persistent/transient)", current.get("role", "persistent"))
     values["capabilities"] = _default_text(
         input_fn, "Capabilities (comma-separated)", ",".join(current.get("capabilities", ["text"]))
     )
@@ -258,7 +271,7 @@ def run_guided_wizard(
         input_fn = input
     if output is None:
         output = print
-    manifest = load_manifest_source(path)
+    manifest = load_manifest_source(path, allow_missing_artifacts=True)
     if selector is None:
         existing = manifest.get("profiles", [])
         output("Configured profiles:")
@@ -350,10 +363,19 @@ class TUIModel:
 
     def __init__(self, manifest: Mapping[str, Any]):
         self.manifest = copy.deepcopy(dict(manifest))
+        self.base_manifest = copy.deepcopy(self.manifest)
+        self._catalog = tuple(
+            sorted(
+                catalog_from_manifest(self.manifest, allow_missing_artifacts=True),
+                key=lambda build: build.id,
+            )
+        )
         self.index = 0
         self.field_index = 0
         self.advanced = False
         self.dirty = False
+        self._manual_profile_ids: set[str] = set()
+        self._valid_build_cache: tuple[Any, ...] | None = None
 
     @property
     def records(self) -> list[dict[str, Any]]:
@@ -370,13 +392,118 @@ class TUIModel:
         self.index = max(0, min(self.index, len(records) - 1))
         return records[self.index]
 
+    def _current_runtime_build(self, profile: Mapping[str, Any]) -> Any:
+        profile_id = str(profile.get("id", ""))
+        if profile_id in self._manual_profile_ids:
+            return None
+        selected = profile.get("runtime_build")
+        if selected:
+            wanted = str(selected).strip().casefold()
+            for build in self._catalog:
+                if build.id.casefold() == wanted and build.runtime == str(
+                    profile.get("runtime", "llamacpp")
+                ).strip().lower():
+                    return build
+        inferred = infer_runtime_build(
+            self.manifest, profile, allow_missing_artifacts=True
+        )
+        if inferred is not None:
+            return next(
+                (build for build in self._catalog if build.id == inferred.id), inferred
+            )
+        return None
+
+    def _valid_builds(self) -> tuple[Any, ...]:
+        if self._valid_build_cache is not None:
+            return self._valid_build_cache
+        valid: list[Any] = []
+        for build in self._catalog:
+            path = Path(build.server_binary)
+            if not path.is_file() or not os.access(path, os.X_OK):
+                continue
+            try:
+                if sha256_file(path) != build.server_sha256:
+                    continue
+            except OSError:
+                continue
+            valid.append(build)
+        self._valid_build_cache = tuple(valid)
+        return self._valid_build_cache
+
+    def _family_options(self) -> tuple[str, ...]:
+        families = sorted({build.runtime for build in self._valid_builds()})
+        if not families:
+            return ("(no valid catalog builds available)", "(custom/manual)")
+        return tuple(
+            f"{family} — {sum(build.runtime == family for build in self._catalog)} "
+            f"{'build' if sum(build.runtime == family for build in self._catalog) == 1 else 'builds'}"
+            for family in families
+        ) + ("(custom/manual)",)
+
+    def _family_for_value(self, value: Any) -> str:
+        selected = str(value).strip()
+        if selected == "(custom/manual)":
+            return selected
+        if selected == "(no valid catalog builds available)":
+            raise ValueError(selected)
+        for option in self._family_options():
+            if option == selected:
+                return option.split(" — ", 1)[0]
+        if any(build.runtime == selected for build in self._catalog):
+            return selected
+        return selected
+
+    def _build_for_value(self, value: Any) -> Any | None:
+        wanted = str(value).strip().casefold()
+        first_line = wanted.splitlines()[0].strip() if wanted else ""
+        for build in self._catalog:
+            labels = {
+                build.id.casefold(),
+                runtime_build_label(build).casefold(),
+                f"{build.display_name} — {build.id}".casefold(),
+            }
+            if wanted in labels or first_line in labels:
+                return build
+        return None
+
+    def _build_option(self, build: Any) -> str:
+        return (
+            f"{build.display_name} — {build.id}\n"
+            f"  runtime: {build.runtime}\n"
+            f"  binary: {build.server_binary}\n"
+            f"  sha256: {build.server_sha256}"
+        )
+
+    def _apply_build(self, draft: dict[str, Any], build: Any) -> dict[str, Any]:
+        updated = clone_record(draft)
+        updated.update(
+            {
+                "runtime": build.runtime,
+                "runtime_build": build.id,
+                "server_binary": str(build.server_binary),
+                "server_sha256": build.server_sha256,
+            }
+        )
+        return updated
+
     @property
     def visible_fields(self) -> list[EditorField]:
         current = self.current or {}
         runtime_info = get_runtime_info(str(current.get("runtime", "llamacpp")))
+        inferred = self._current_runtime_build(current)
+        family = inferred.runtime if inferred is not None else "(custom/manual)"
         fields = []
         for field in EDITOR_FIELDS:
-            if field.key not in runtime_info.editable_fields:
+            if field.key == "runtime_family":
+                field = replace(field, options=self._family_options())
+            elif field.key == "runtime_build":
+                if family == "(custom/manual)":
+                    continue
+                builds = tuple(build for build in self._catalog if build.runtime == family)
+                field = replace(field, options=tuple(self._build_option(build) for build in builds))
+            elif field.key == "runtime" and family != "(custom/manual)":
+                continue
+            elif field.key not in runtime_info.editable_fields:
                 continue
             if field.advanced and not self.advanced:
                 continue
@@ -427,6 +554,25 @@ class TUIModel:
             return json.dumps(current.get(key, {}), sort_keys=True)
         if key == "extra_args":
             return json.dumps(current.get(key, []))
+        if key == "runtime_family":
+            inferred = self._current_runtime_build(current)
+            if inferred is None:
+                return "(custom/manual)"
+            return next(
+                option
+                for option in self._family_options()
+                if option.startswith(f"{inferred.runtime} — ")
+            )
+        if key == "runtime_build":
+            inferred = self._current_runtime_build(current)
+            if inferred is not None:
+                return self._build_option(inferred)
+            selected = current.get("runtime_build")
+            if selected:
+                for build in self._catalog:
+                    if build.id == str(selected).strip():
+                        return self._build_option(build)
+            return "(custom/manual)"
         return current.get(key, "")
 
     def set_field(self, key: str, value: Any) -> dict[str, Any]:
@@ -435,7 +581,43 @@ class TUIModel:
             raise ValueError("no profile selected")
         draft = clone_record(current)
 
-        if key in self._PATH_FIELDS:
+        if key == "runtime_family":
+            selected = self._family_for_value(value)
+            if not selected or selected == "(custom/manual)":
+                draft.pop("runtime_build", None)
+                profile_id = str(current.get("id", ""))
+                if profile_id:
+                    self._manual_profile_ids.add(profile_id)
+            else:
+                profile_id = str(current.get("id", ""))
+                if profile_id:
+                    self._manual_profile_ids.discard(profile_id)
+                draft["runtime"] = selected
+                current_build = self._current_runtime_build(current)
+                if current_build is not None and current_build.runtime == selected:
+                    draft = self._apply_build(draft, current_build)
+                else:
+                    fallback = next(
+                        (build for build in self._valid_builds() if build.runtime == selected),
+                        None,
+                    )
+                    if fallback is not None:
+                        draft = self._apply_build(draft, fallback)
+        elif key == "runtime_build":
+            build = self._build_for_value(value)
+            if build is None:
+                raise ValueError(f"unknown runtime build: {value}")
+            profile_id = str(current.get("id", ""))
+            if profile_id:
+                self._manual_profile_ids.discard(profile_id)
+            draft = self._apply_build(draft, build)
+        elif key == "runtime":
+            draft["runtime"] = str(value).strip().lower()
+            draft.pop("runtime_build", None)
+            profile_id = str(current.get("id", ""))
+            if profile_id:
+                self._manual_profile_ids.add(profile_id)
+        elif key in self._PATH_FIELDS:
             raw = str(value).strip()
             if not raw:
                 if key == "mmproj_path":
@@ -537,23 +719,68 @@ def _curses_prompt(
     *,
     allow_empty: bool = False,
 ) -> str:
-    """Edit one selected field in a curses text box."""
+    """Edit one selected field with a curses-native single-line editor."""
 
     import curses
 
     height, width = stdscr.getmaxyx()
     row = max(height - 2, 0)
-    stdscr.addnstr(row, 0, f"{prompt} [{current}]", max(width - 1, 1))
-    stdscr.clrtoeol()
-    curses.echo()
-    try:
-        raw = stdscr.getstr(min(row + 1, max(height - 1, 0)), 0, max(width - 1, 1))
-    finally:
-        curses.noecho()
-    value = raw.decode("utf-8", errors="replace").strip()
-    if value or allow_empty:
-        return value
-    return str(current or "")
+    max_width = max(width - 1, 1)
+    prefix = f"{prompt}: "
+    original = str(current or "")
+    buffer = list(original)
+    cursor = len(buffer)
+
+    def render() -> None:
+        nonlocal cursor
+        text = "".join(buffer)
+        available = max(max_width - len(prefix), 1)
+        start = max(0, min(cursor - available + 1, max(len(text) - available, 0)))
+        visible = text[start : start + available]
+        line = prefix + visible
+        stdscr.move(row, 0)
+        stdscr.clrtoeol()
+        stdscr.addnstr(row, 0, line, max_width)
+        cursor_column = min(max_width - 1, len(prefix) + cursor - start)
+        stdscr.move(row, cursor_column)
+        stdscr.refresh()
+
+    render()
+    while True:
+        try:
+            key = stdscr.getch()
+        except KeyboardInterrupt:
+            return original
+
+        if key in (10, 13, curses.KEY_ENTER):
+            value = "".join(buffer).strip()
+            return value if value or allow_empty else original
+        if key in (27, 3):  # Escape or Ctrl-C cancels the field edit.
+            return original
+        if key in (curses.KEY_BACKSPACE, 8, 127):
+            if cursor > 0:
+                del buffer[cursor - 1]
+                cursor -= 1
+        elif key == getattr(curses, "KEY_DC", -1):
+            if cursor < len(buffer):
+                del buffer[cursor]
+        elif key in (curses.KEY_LEFT,):
+            cursor = max(0, cursor - 1)
+        elif key in (curses.KEY_RIGHT,):
+            cursor = min(len(buffer), cursor + 1)
+        elif key in (curses.KEY_HOME, 1):
+            cursor = 0
+        elif key in (curses.KEY_END, 5):
+            cursor = len(buffer)
+        elif key == 21:  # Ctrl-U clears the current line.
+            buffer.clear()
+            cursor = 0
+        elif 0 <= key <= 255:
+            character = chr(key)
+            if character.isprintable():
+                buffer.insert(cursor, character)
+                cursor += 1
+        render()
 
 
 def _curses_confirm(stdscr: Any, prompt: str, *, default: bool = True) -> bool:
@@ -587,9 +814,32 @@ def _curses_select(stdscr: Any, label: str, current: Any, options: Iterable[str]
         height, width = stdscr.getmaxyx()
         stdscr.addnstr(0, 0, f"{label} — choose a value" , max(width - 1, 1), curses.A_BOLD)
         stdscr.addnstr(1, 0, "↑/↓ move  Enter select  Esc cancel", max(width - 1, 1))
-        for row, choice in enumerate(choices, 3):
-            marker = "●" if row - 3 == selected else "○"
-            stdscr.addnstr(row, 2, f"{marker} {choice}", max(width - 3, 1), curses.A_REVERSE if row - 3 == selected else 0)
+        row = 3
+        for choice_index, choice in enumerate(choices):
+            choice_lines: list[str] = []
+            for line in str(choice).splitlines() or [""]:
+                choice_lines.extend(
+                    textwrap.wrap(
+                        line,
+                        width=max(width - 7, 1),
+                        replace_whitespace=False,
+                        drop_whitespace=False,
+                    )
+                    or [""]
+                )
+            for line_index, line in enumerate(choice_lines):
+                marker = (
+                    "●" if choice_index == selected else "○"
+                ) if line_index == 0 else " "
+                prefix = f"{marker} " if line_index == 0 else "  "
+                stdscr.addnstr(
+                    row,
+                    2,
+                    f"{prefix}{line}",
+                    max(width - 3, 1),
+                    curses.A_REVERSE if choice_index == selected else 0,
+                )
+                row += 1
         key = stdscr.getch()
         if key in (27, ord("q")):
             return str(current)
@@ -598,6 +848,8 @@ def _curses_select(stdscr: Any, label: str, current: Any, options: Iterable[str]
         elif key in (curses.KEY_DOWN, ord("j")):
             selected = (selected + 1) % len(choices)
         elif key in (10, 13):
+            if choices[selected] == "(no valid catalog builds available)":
+                continue
             return choices[selected]
 
 
@@ -676,7 +928,7 @@ def run_tui(
     import curses
 
     path = Path(profiles_path)
-    manifest = load_manifest_source(path)
+    manifest = load_manifest_source(path, allow_missing_artifacts=True)
     model = TUIModel(manifest)
     if selector:
         found = find_profile_record(model.manifest, selector)
@@ -755,15 +1007,32 @@ def run_tui(
                     status = "No changes to save."
                     continue
                 try:
-                    validate_manifest(model.manifest, directory=path.parent)
+                    latest = load_manifest_source(path, allow_missing_artifacts=True)
+                    merged, conflicts = merge_manifest_drafts(
+                        model.base_manifest, latest, model.manifest
+                    )
+                    if conflicts:
+                        conflict_text = ", ".join(conflicts[:4])
+                        if len(conflicts) > 4:
+                            conflict_text += ", …"
+                        if not _curses_confirm(
+                            stdscr,
+                            f"External conflicts ({conflict_text}); keep draft values?",
+                            default=False,
+                        ):
+                            status = "Save cancelled; external conflicts remain."
+                            continue
+                    validate_manifest(merged, directory=path.parent)
                     if not _curses_confirm(stdscr, "Apply changes?", default=True):
                         status = "Save cancelled."
                         continue
                     if apply_callback is not None:
                         changed_ids = {str(current.get("id"))}
-                        apply_callback(model.manifest, changed_ids)
+                        apply_callback(merged, changed_ids)
                     else:
-                        write_manifest_atomically(path, model.manifest)
+                        write_manifest_atomically(path, merged)
+                    model.manifest = merged
+                    model.base_manifest = copy.deepcopy(merged)
                     model.dirty = False
                     status = "Applied successfully."
                 except Exception as error:

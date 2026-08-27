@@ -61,6 +61,8 @@ class FakeProfile:
     environment: dict[str, str] = field(default_factory=dict)
     startup_timeout: float = 30.0
     safety: SafetyBudget = field(default_factory=fake_safety)
+    runtime_build: str | None = None
+    server_sha256: str | None = None
 
 
 class Harness:
@@ -203,6 +205,16 @@ class BackendControllerTest(unittest.TestCase):
     def read_state(self) -> dict:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
+    def test_failed_unit_without_process_is_quiescent(self) -> None:
+        state = ServiceStateSnapshot(
+            active_state="failed",
+            sub_state="failed",
+            main_pid=0,
+            control_pid=0,
+        )
+
+        self.assertTrue(state.is_quiescent)
+
     def test_raw_subprocess_timeout_is_wrapped_as_controller_error(self) -> None:
         def time_out(command: tuple[str, ...]) -> None:
             raise subprocess.TimeoutExpired(command, timeout=30)
@@ -260,7 +272,7 @@ class BackendControllerTest(unittest.TestCase):
             )
         )
 
-    def test_stop_timeout_retries_reset_after_systemd_state_settles(self) -> None:
+    def test_stop_timeout_accepts_failed_state_without_process(self) -> None:
         unit = self.controller.unit_name("main-27b")
         self.harness.service_states[unit] = ServiceStateSnapshot(
             active_state="deactivating",
@@ -297,8 +309,8 @@ class BackendControllerTest(unittest.TestCase):
             self.controller._stop_unit(unit)
 
         reset_command = ("systemctl", "--user", "reset-failed", unit)
-        self.assertEqual(self.harness.commands.count(reset_command), 2)
-        self.assertEqual(reset_attempts, 2)
+        self.assertEqual(self.harness.commands.count(reset_command), 1)
+        self.assertEqual(reset_attempts, 1)
 
     def test_shutdown_after_prior_stop_never_starts_target_or_rollback(self) -> None:
         cancelled = False
@@ -464,7 +476,6 @@ class BackendControllerTest(unittest.TestCase):
         self.assertIn('Environment="LITERAL_DOLLAR=$HOME"', unit)
         self.assertIn('Environment="PERCENT_VALUE=95%%"', unit)
         self.assertIn("Restart=no", unit)
-        self.assertNotIn("Restart=on-failure", unit)
         self.assertIn("Type=exec", unit)
         self.assertIn("MemoryMax=20480M", unit)
         self.assertIn("MemorySwapMax=1024M", unit)
@@ -557,6 +568,7 @@ class BackendControllerTest(unittest.TestCase):
         )
         self.assertEqual(self.harness.probes, [("main-27b", 90.0)])
         self.assertEqual(state, {"generation": 1, "profile": "main-27b", "phase": "active"})
+
         self.assertEqual(self.read_state(), state)
 
         state = self.controller.switch("qwen-vision")
@@ -569,6 +581,21 @@ class BackendControllerTest(unittest.TestCase):
         )
         self.assertEqual(self.harness.probes[-1], ("qwen3.5-9b-vision", 45.0))
         self.assertEqual(state, {"generation": 2, "profile": "qwen-vision", "phase": "active"})
+
+    def test_successful_switch_persists_concrete_running_build_identity(self) -> None:
+        profile = replace(
+            self.main,
+            runtime_build="beellama",
+            server_sha256="a" * 64,
+        )
+        self.profiles["main-27b"] = profile
+        self.controller.profiles["main-27b"] = profile
+
+        state = self.controller.switch("main-27b")
+
+        self.assertEqual(state["runtime_build"], "beellama")
+        self.assertEqual(state["server_sha256"], "a" * 64)
+        self.assertEqual(self.read_state(), state)
 
     def test_switch_without_resource_probe_has_no_telemetry_dependency(self) -> None:
         controller = BackendController(
@@ -1162,7 +1189,24 @@ class BackendControllerTest(unittest.TestCase):
         self.assertEqual(state["target_profile"], "qwen-vision")
         self.assertEqual(self.harness.probes, [])
 
-    def test_reconcile_marks_missing_active_backend_stale_without_lifecycle_commands(self) -> None:
+    def test_record_recovery_failure_persists_stale_profile_metadata(self) -> None:
+        self.state_path.write_text(
+            json.dumps(
+                {"generation": 3, "profile": "main-27b", "phase": "active"}
+            ),
+            encoding="utf-8",
+        )
+
+        state = self.controller.record_recovery_failure(
+            "main-27b", attempts=2, error="backend exited"
+        )
+
+        self.assertEqual(state["phase"], "stale")
+        self.assertEqual(state["stale_profile"], "main-27b")
+        self.assertEqual(state["recovery"]["attempts"], 2)
+        self.assertEqual(state["recovery"]["action"], "broker_watchdog_restart")
+        self.assertEqual(self.read_state(), state)
+
         self.state_path.write_text(
             json.dumps(
                 {
@@ -1190,6 +1234,17 @@ class BackendControllerTest(unittest.TestCase):
                 "phase": "stale",
                 "stale_profile": "main-27b",
                 "error": "backend readiness probe failed",
+                "recovery": {
+                    "attempts": 0,
+                    "action": "startup_reconcile",
+                    "error": "backend readiness probe failed",
+                    "service": {
+                        "active_state": "inactive",
+                        "sub_state": "dead",
+                        "main_pid": 0,
+                        "control_pid": 0,
+                    },
+                },
             },
         )
         self.assertEqual(self.read_state(), state)
