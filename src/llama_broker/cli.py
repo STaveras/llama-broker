@@ -2288,7 +2288,9 @@ def build_parser() -> argparse.ArgumentParser:
     revoke_security.add_argument("key")
 
     # Profiles remain the authoritative model-to-runtime binding manifest.
-    profiles = subparsers.add_parser("profiles", help="profile manifest management")
+    profiles = subparsers.add_parser(
+        "profile", aliases=["profiles"], help="profile manifest management"
+    )
     profiles_sub = profiles.add_subparsers(dest="profiles_command", required=True)
 
     profiles_sub.add_parser("list", help="list profiles with status")
@@ -2488,7 +2490,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_model_list(args)
         if args.command == "runtime" and args.runtime_command == "list":
             return _cmd_runtime_list(args)
-        if args.command == "profiles":
+        if args.command in {"profile", "profiles"}:
             if args.profiles_command == "list":
                 return _cmd_profiles_list(args)
             if args.profiles_command == "show":
