@@ -41,15 +41,12 @@ HIGH_VARIANCE_CV = 0.20
 # This is the only set of fields the engine may alter.  The omitted fields are
 # intentionally forbidden even if a runtime exposes a similarly named flag.
 LLAMACPP_KNOBS = (
-    "parallel",
     "batch_size",
     "ubatch_size",
-    "flash_attention",
     "gpu_layers",
     "max_output_tokens",
 )
 VLLM_KNOBS = (
-    "tensor_parallel_size",
     "gpu_memory_utilization",
     "max_output_tokens",
 )

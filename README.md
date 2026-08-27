@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.11
+## Retrospective version: 0.6.12
 
-**Remove deferred README note** — source checkpoint 480db28c41e1 (2026-08-27).
+**Keep parallelism and flash attention fixed** — source checkpoint 52bdd25d0dcc (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
