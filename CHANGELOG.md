@@ -1,10 +1,19 @@
 # Retrospective changelog
 
-Current assigned version: **0.6.3**.
+Current assigned version: **0.6.4**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.6.4] - 2026-08-27 — Live on-demand autotune
+
+Original checkpoint: `699922468afe536e2a0d8ad5723f816256210b1f`.
+
+- Replace the CLI replay workflow with live isolated candidate runs using a local HTTP workload for text, tools/JSON, and vision-capable profiles.
+- Run benchmarks when the engine requests each candidate; collect JSON/stream response measurements and reject malformed, empty, context-rejected, or failed responses.
+- Persist per-profile reports, completion metadata and revision fingerprints; skip unchanged completed profiles unless --force is supplied.
+- Add active-profile stop confirmation, --yes, experiment/time limits, failure reporting, and real-benchmark --dry-run behavior that avoids persisting winners.
 
 ## [0.6.3] - 2026-08-27 — Profile edits preserve the running backend
 

@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.3
+## Retrospective version: 0.6.4
 
-**Profile edits preserve the running backend** — source checkpoint d79a64aca542 (2026-08-27).
+**Live on-demand autotune** — source checkpoint 699922468afe (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
