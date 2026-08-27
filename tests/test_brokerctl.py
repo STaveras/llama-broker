@@ -22,7 +22,7 @@ class BrokerctlStatusTests(unittest.TestCase):
             patch.object(brokerctl, "discover_backends", return_value=DiscoveryResult()),
             redirect_stdout(output),
         ):
-            result = brokerctl.main(["profiles", "discover", "--json"])
+            result = brokerctl.main(["profile", "discover", "--json"])
 
         self.assertEqual(result, 1)
         self.assertEqual(json.loads(output.getvalue())["schema_version"], 1)
@@ -639,7 +639,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                 [
                     "--profiles",
                     str(self.profiles),
-                    "profiles",
+                    "profile",
                     "edit",
                     "fixture-text-7b",
                     "--fit",
@@ -678,7 +678,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                 [
                     "--profiles",
                     str(self.profiles),
-                    "profiles",
+                    "profile",
                     "edit",
                     "fixture-text-7b",
                     "--runtime-build",
@@ -720,7 +720,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                     [
                         "--profiles",
                         str(self.profiles),
-                        "profiles",
+                        "profile",
                         "edit",
                         "fixture-text-7b",
                         "--runtime-build",
@@ -755,7 +755,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                 [
                     "--profiles",
                     str(self.profiles),
-                    "profiles",
+                    "profile",
                     "show",
                     "fixture-text-7b",
                 ]
@@ -782,7 +782,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                 [
                     "--profiles",
                     str(self.profiles),
-                    "profiles",
+                    "profile",
                     "add",
                     "unreviewed-model",
                 ]
@@ -805,7 +805,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                 [
                     "--profiles",
                     str(self.profiles),
-                    "profiles",
+                    "profile",
                     "add",
                     "new-profile",
                     "--model",
@@ -837,7 +837,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
         with redirect_stdout(shown):
             self.assertEqual(
                 brokerctl.main(
-                    ["--profiles", str(self.profiles), "profiles", "show", "new-profile"]
+                    ["--profiles", str(self.profiles), "profile", "show", "new-profile"]
                 ),
                 0,
             )
@@ -851,7 +851,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                 [
                     "--profiles",
                     str(self.profiles),
-                    "profiles",
+                    "profile",
                     "set",
                     "new-profile",
                     "startup-timeout",
@@ -862,13 +862,13 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
         )
         self.assertEqual(
             brokerctl.main(
-                ["--profiles", str(self.profiles), "profiles", "alias", "add", "new-profile", "new-alias"]
+                ["--profiles", str(self.profiles), "profile", "alias", "add", "new-profile", "new-alias"]
             ),
             0,
         )
         self.assertEqual(
             brokerctl.main(
-                ["--profiles", str(self.profiles), "profiles", "env", "set", "new-profile", "OTHER=2"]
+                ["--profiles", str(self.profiles), "profile", "env", "set", "new-profile", "OTHER=2"]
             ),
             0,
         )
@@ -877,7 +877,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                 [
                     "--profiles",
                     str(self.profiles),
-                    "profiles",
+                    "profile",
                     "args",
                     "add",
                     "new-profile",
@@ -889,13 +889,13 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
         )
         self.assertEqual(
             brokerctl.main(
-                ["--profiles", str(self.profiles), "profiles", "rename", "new-profile", "renamed"]
+                ["--profiles", str(self.profiles), "profile", "rename", "new-profile", "renamed"]
             ),
             0,
         )
         self.assertEqual(
             brokerctl.main(
-                ["--profiles", str(self.profiles), "profiles", "unset", "renamed", "extra-args"]
+                ["--profiles", str(self.profiles), "profile", "unset", "renamed", "extra-args"]
             ),
             0,
         )
@@ -908,7 +908,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
                     [
                         "--profiles",
                         str(self.profiles),
-                        "profiles",
+                        "profile",
                         "set",
                         "renamed",
                         "cache-k",
@@ -921,7 +921,7 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
         self.assertIn("invalid cache-k", errors.getvalue())
 
         self.assertEqual(
-            brokerctl.main(["--profiles", str(self.profiles), "profiles", "remove", "renamed"]),
+            brokerctl.main(["--profiles", str(self.profiles), "profile", "remove", "renamed"]),
             0,
         )
         registry = ProfileRegistry.from_path(self.profiles)
@@ -932,23 +932,23 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
 class BrokerctlProfileEditorTests(unittest.TestCase):
     def test_edit_parser_accepts_runtime_build(self) -> None:
         args = brokerctl.build_parser().parse_args(
-            ["profiles", "edit", "fixture-text-7b", "--runtime-build", "beellama"]
+            ["profile", "edit", "fixture-text-7b", "--runtime-build", "beellama"]
         )
 
         self.assertEqual(args.runtime_build, "beellama")
 
     def test_edit_parser_targets_field_editor_and_configure_is_removed(self) -> None:
-        args = brokerctl.build_parser().parse_args(["profiles", "edit"])
-        self.assertEqual(args.command, "profiles")
+        args = brokerctl.build_parser().parse_args(["profile", "edit"])
+        self.assertEqual(args.command, "profile")
         self.assertEqual(args.profiles_command, "edit")
         self.assertIsNone(args.model)
 
         with self.assertRaises(SystemExit):
-            brokerctl.build_parser().parse_args(["profiles", "configure"])
+            brokerctl.build_parser().parse_args(["profile", "configure"])
 
     def test_profiles_state_command_is_removed(self) -> None:
         with self.assertRaises(SystemExit):
-            brokerctl.build_parser().parse_args(["profiles", "state"])
+            brokerctl.build_parser().parse_args(["profile", "state"])
 
 
 class BrokerctlCommandLayoutTests(unittest.TestCase):
