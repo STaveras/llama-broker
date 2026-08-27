@@ -1742,9 +1742,7 @@ def _cmd_profiles_autotune(args: argparse.Namespace) -> int:
     active_state = _broker_admin_get("/admin/status")
     backend_state = active_state.get("backend", {})
     previous_active = backend_state.get("profile") if isinstance(backend_state, dict) else None
-    active_to_stop = previous_active if isinstance(previous_active, str) and any(
-        profile.id == previous_active for profile in eligible
-    ) else None
+    active_to_stop = previous_active if isinstance(previous_active, str) and eligible else None
     if active_to_stop is not None and not args.yes:
         estimated = sum(
             len(generate_candidates(

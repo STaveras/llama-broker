@@ -1688,6 +1688,9 @@ class BrokerApplication:
         replace_profiles = getattr(self.controller, "replace_profiles", None)
         if callable(replace_profiles):
             replace_profiles({profile.id: profile for profile in new_registry.profiles})
+        install_units = getattr(self.controller, "install_units", None)
+        if callable(install_units):
+            install_units()
         self._remember_controller_state(dict(self.controller.state()))
         return self.health()
 
