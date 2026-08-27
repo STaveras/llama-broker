@@ -88,7 +88,7 @@ class AutotuneEngineTests(unittest.TestCase):
         self.assertEqual(schema.runtime, "llamacpp")
         self.assertEqual(
             schema.names,
-            ("batch_size", "ubatch_size", "max_output_tokens"),
+            ("batch_size", "ubatch_size"),
         )
         self.assertNotIn("context_size", schema.names)
         self.assertNotIn("cache_type_k", schema.names)
