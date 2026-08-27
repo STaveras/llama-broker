@@ -87,11 +87,13 @@ class AutotuneEngineTests(unittest.TestCase):
         self.assertEqual(schema.runtime, "llamacpp")
         self.assertEqual(
             schema.names,
-            ("parallel", "batch_size", "ubatch_size", "flash_attention", "max_output_tokens"),
+            ("batch_size", "ubatch_size", "max_output_tokens"),
         )
         self.assertNotIn("context_size", schema.names)
         self.assertNotIn("cache_type_k", schema.names)
         self.assertNotIn("cache_type_v", schema.names)
+        self.assertNotIn("parallel", schema.names)
+        self.assertNotIn("flash_attention", schema.names)
         self.assertFalse(schema.fit_enabled)
         self.assertEqual(schema.confidence, "high")
 
@@ -107,7 +109,8 @@ class AutotuneEngineTests(unittest.TestCase):
         )
         self.assertEqual(schema.source, "runtime-help-fallback")
         self.assertEqual(schema.confidence, "low")
-        self.assertEqual(schema.names, ("batch_size", "flash_attention"))
+        self.assertEqual(schema.names, ("batch_size",))
+        self.assertNotIn("flash_attention", schema.names)
 
     def test_candidate_order_cap_and_interaction_are_deterministic(self) -> None:
         schema = TuningSchema(
