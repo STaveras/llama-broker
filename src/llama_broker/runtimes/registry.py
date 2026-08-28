@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
+from .freetoken import FreeTokenRuntime
 from .llamacpp import LlamaCppRuntime
 from .vllm import VllmRuntime
 
@@ -120,9 +121,17 @@ _VLLM_FIELDS = _BASE_FIELDS | frozenset(
     }
 )
 
+_FREETOKEN_FIELDS = _BASE_FIELDS | frozenset(
+    {
+        "context_size",
+        "parallel",
+    }
+)
+
 
 _LLAMACPP = LlamaCppRuntime()
 _VLLM = VllmRuntime()
+_FREETOKEN = FreeTokenRuntime()
 
 RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
     "llamacpp": RuntimeInfo(
@@ -138,6 +147,13 @@ RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
         capabilities=("text", "vision", "tools", "tensor-parallel", "kv-cache-dtype"),
         editable_fields=_VLLM_FIELDS,
         adapter=_VLLM,
+    ),
+    "freetoken": RuntimeInfo(
+        name="freetoken",
+        binaries=("python", "python3"),
+        capabilities=_FREETOKEN.capabilities,
+        editable_fields=_FREETOKEN_FIELDS,
+        adapter=_FREETOKEN,
     ),
 }
 

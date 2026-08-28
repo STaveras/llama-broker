@@ -54,7 +54,33 @@ class BrokerSecurityTests(unittest.TestCase):
             ),
         )
 
-    def test_non_loopback_binding_requires_native_auth_and_tls(self) -> None:
+    def test_freetoken_backend_args_use_wrapper_tls_and_key_paths(self) -> None:
+        config = SecurityConfig(
+            api_key_file=self.root / "api-keys",
+            backend_tls_cert_file=self.root / "backend.crt",
+            backend_tls_key_file=self.root / "backend.key",
+        )
+
+        self.assertEqual(
+            config.backend_server_args(
+                listen_host="0.0.0.0",
+                listen_port=10000,
+                runtime="freetoken",
+            ),
+            (
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "10000",
+                "--freetoken-api-key-file",
+                str(self.root / "api-keys"),
+                "--freetoken-tls-cert",
+                str(self.root / "backend.crt"),
+                "--freetoken-tls-key",
+                str(self.root / "backend.key"),
+            ),
+        )
+
         with self.assertRaisesRegex(ValueError, "broker TLS"):
             SecurityConfig().validate_network_binding("0.0.0.0", "127.0.0.1")
         with self.assertRaisesRegex(ValueError, "API-key"):

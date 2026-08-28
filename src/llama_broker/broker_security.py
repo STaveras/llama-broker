@@ -267,6 +267,19 @@ class SecurityConfig:
             if self.backend_tls_ca_file is not None:
                 args.extend(["--ssl-ca-certs", str(self.backend_tls_ca_file)])
             return tuple(args)
+        if runtime == "freetoken":
+            if self.api_key_file is not None:
+                args.extend(["--freetoken-api-key-file", str(self.api_key_file)])
+            if self.backend_tls_cert_file is not None:
+                args.extend(
+                    [
+                        "--freetoken-tls-cert",
+                        str(self.backend_tls_cert_file),
+                        "--freetoken-tls-key",
+                        str(self.backend_tls_key_file),
+                    ]
+                )
+            return tuple(args)
         raise SecurityError(f"unsupported backend runtime for security args: {runtime}")
 
     def broker_tls_context(self) -> ssl.SSLContext | None:

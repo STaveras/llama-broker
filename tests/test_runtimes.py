@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import llama_broker.cli as brokerctl
 from llama_broker.backend_controller import BackendController
 from llama_broker.broker_profiles import ProfileError, ProfileRegistry
-from llama_broker.runtimes import list_runtimes, runtime_names
+from llama_broker.runtimes import get_runtime, list_runtimes, runtime_names
 
 
 class RuntimeDispatchTests(unittest.TestCase):
@@ -89,10 +89,66 @@ class RuntimeDispatchTests(unittest.TestCase):
         return path
 
     def test_registry_lists_only_supported_runtimes(self) -> None:
-        self.assertEqual(runtime_names(), ("llamacpp", "vllm"))
-        self.assertEqual({runtime.name for runtime in list_runtimes()}, {"llamacpp", "vllm"})
+        self.assertEqual(runtime_names(), ("llamacpp", "vllm", "freetoken"))
+        self.assertEqual({runtime.name for runtime in list_runtimes()}, {"llamacpp", "vllm", "freetoken"})
         self.assertIn("llama-server", list_runtimes()[0].binaries)
         self.assertIn("vllm", list_runtimes()[1].binaries)
+        self.assertIn("python", list_runtimes()[2].binaries)
+
+    def test_freetoken_command_uses_python_module_and_ftw_flags(self) -> None:
+        ftw = self.root / "model.ftw"
+        ftw.mkdir()
+        profile = SimpleNamespace(
+            server_binary=self.binary,
+            model_path=ftw,
+            alias="qwen3.6-35b-a3b",
+            context_size=65536,
+            parallel=1,
+            max_output_tokens=2048,
+            extra_args=(
+                "--moe-backend", "offload",
+                "--nvfp4-backend", "triton",
+                "--expert-load", "serial",
+                "--reasoning-parser", "qwen3",
+            ),
+        )
+        command = get_runtime("freetoken").build_command(
+            profile, host="0.0.0.0", port=10000
+        )
+
+        self.assertEqual(command[:2], (str(self.binary), "--model-path"))
+        self.assertIn(("--served-model-name", "qwen3.6-35b-a3b"), tuple(zip(command, command[1:])))
+        self.assertIn(("--max-seq-len-override", "65536"), tuple(zip(command, command[1:])))
+        self.assertIn(("--tensor-parallel-size", "1"), tuple(zip(command, command[1:])))
+        self.assertIn(("--moe-backend", "offload"), tuple(zip(command, command[1:])))
+        self.assertIn(("--freetoken-external-host", "0.0.0.0"), tuple(zip(command, command[1:])))
+        self.assertIn(("--freetoken-external-port", "10000"), tuple(zip(command, command[1:])))
+        self.assertIn(("--freetoken-upstream-port", "10001"), tuple(zip(command, command[1:])))
+        self.assertNotIn("llama-server", command)
+
+    def test_freetoken_profile_accepts_model_directory_and_rejects_unknown_flag(self) -> None:
+        model_dir = self.root / "ftw"
+        model_dir.mkdir()
+        record = self._vllm_profile(
+            id="freetoken-main",
+            alias="freetoken-main",
+            display_name="FreeToken main",
+            runtime="freetoken",
+            model_path=str(model_dir),
+            extra_args=["--moe-backend", "offload", "--expert-load", "serial"],
+        )
+        for field in (
+            "gpu_memory_utilization", "kv_cache_dtype", "batch_size", "ubatch_size",
+            "cache_type_k", "cache_type_v", "flash_attention", "gpu_layers",
+        ):
+            record.pop(field, None)
+        parsed = ProfileRegistry.from_path(self._write([record])).get("freetoken-main")
+        self.assertEqual(parsed.model_path, model_dir.resolve())
+        self.assertEqual(parsed.command(host="127.0.0.1", port=10000)[1], "--model-path")
+
+        record["extra_args"] = ["--not-a-freetoken-flag"]
+        with self.assertRaisesRegex(ProfileError, "unsupported token"):
+            ProfileRegistry.from_path(self._write([record]))
 
     def test_runtime_field_defaults_to_llamacpp_and_preserves_command_shape(self) -> None:
         llama = self._vllm_profile(

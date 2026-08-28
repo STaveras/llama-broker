@@ -112,6 +112,48 @@ VLLM_LLAMA_ONLY_FIELDS = frozenset(
         "model_draft",
     }
 )
+FREETOKEN_FLAG_ONLY_EXTRA_ARGS = frozenset(
+    {
+        "--disable-pynccl",
+        "--moe-cache-auto",
+        "--disable-moe-prefill-overlap",
+        "--enable-special-token-ckpt",
+        "--moe-prefill-hit-d2d",
+        "--enable-cache-report",
+    }
+)
+FREETOKEN_VALUE_EXTRA_ARGS = frozenset(
+    {
+        "--dtype",
+        "--max-running-requests",
+        "--max-seq-len-override",
+        "--max-output-tokens",
+        "--memory-ratio",
+        "--cuda-graph-max-bs",
+        "--num-tokenizer",
+        "--max-prefill-length",
+        "--num-pages",
+        "--num-tokens",
+        "--page-size",
+        "--attention-backend",
+        "--cache-type",
+        "--served-model-name",
+        "--tool-call-parser",
+        "--reasoning-parser",
+        "--sampling-defaults",
+        "--moe-backend",
+        "--nvfp4-backend",
+        "--expert-load",
+        "--moe-cache-size",
+        "--moe-cache-rate",
+        "--kv-reserve-tokens",
+        "--moe-cache-policy",
+        "--moe-cpu-threads",
+        "--moe-cpu-layers",
+        "--moe-hybrid-max-fetch",
+        "--cors-origins",
+    }
+)
 LLAMACPP_VLLM_ONLY_FIELDS = frozenset(
     {
         "tensor_parallel_size",
@@ -186,6 +228,33 @@ def _parse_vllm_extra_args(
     return args, frozenset()
 
 
+def _parse_freetoken_extra_args(
+    args: tuple[str, ...], profile_id: str
+) -> tuple[tuple[str, ...], frozenset[str]]:
+    seen_flags: set[str] = set()
+    index = 0
+    while index < len(args):
+        flag = args[index]
+        if flag in seen_flags:
+            raise ProfileError(f"duplicate extra_args flag for {profile_id!r}: {flag}")
+        if flag in FREETOKEN_FLAG_ONLY_EXTRA_ARGS:
+            seen_flags.add(flag)
+            index += 1
+            continue
+        if flag not in FREETOKEN_VALUE_EXTRA_ARGS:
+            raise ProfileError(
+                f"extra_args for freetoken profile {profile_id!r} contain unsupported "
+                f"token: {flag!r}"
+            )
+        if index + 1 >= len(args) or args[index + 1].startswith("--"):
+            raise ProfileError(
+                f"extra_args flag {flag} for {profile_id!r} requires a value"
+            )
+        seen_flags.add(flag)
+        index += 2
+    return args, frozenset()
+
+
 def _parse_extra_args(
     raw: object, profile_id: str, *, runtime: str
 ) -> tuple[tuple[str, ...], frozenset[str]]:
@@ -197,6 +266,8 @@ def _parse_extra_args(
     args = tuple(raw)
     if runtime == "vllm":
         return _parse_vllm_extra_args(args, profile_id)
+    if runtime == "freetoken":
+        return _parse_freetoken_extra_args(args, profile_id)
 
     speculative_types: set[str] = set()
     seen_flags: set[str] = set()
@@ -678,7 +749,7 @@ def _parse_profile(
     model_path = _absolute_existing_path(
         record,
         "model_path",
-        allow_directory=runtime == "vllm",
+        allow_directory=runtime in {"vllm", "freetoken"},
         allow_missing=allow_missing_artifacts,
     )
     mmproj_path: Path | None = None
@@ -828,7 +899,7 @@ def _parse_profile(
         chat_template = None
         limit_mm_per_prompt = None
         allowed_local_media_path = None
-    else:
+    elif runtime == "vllm":
         batch_size = None
         ubatch_size = None
         cache_type_k = None
@@ -903,6 +974,26 @@ def _parse_profile(
         else:
             limit_mm_per_prompt = None
         allowed_local_media_path = optional_text("allowed_local_media_path")
+    else:
+        batch_size = None
+        ubatch_size = None
+        cache_type_k = None
+        cache_type_v = None
+        flash_attention = None
+        gpu_layers = None
+        fit = None
+        fit_target_mib = None
+        fit_ctx = None
+        ctx_checkpoints = None
+        cache_ram_mib = None
+        tensor_parallel_size = parallel
+        gpu_memory_utilization = None
+        kv_cache_dtype = None
+        tool_call_parser = None
+        tool_parser_plugin = None
+        chat_template = None
+        limit_mm_per_prompt = None
+        allowed_local_media_path = None
 
     raw_environment = record.get("environment", {})
     if not isinstance(raw_environment, dict) or not all(
@@ -929,7 +1020,7 @@ def _parse_profile(
                 f"{profile_id!r} uses KVarN with parallel={parallel}; "
                 "set LLAMA_KVARN_MULTI_STREAM=1 explicitly"
             )
-    elif any(
+    elif runtime == "vllm" and any(
         key.startswith(("GGML_", "LLAMA_")) for key in environment
     ):
         raise ProfileError(
