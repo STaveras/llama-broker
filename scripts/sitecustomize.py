@@ -38,11 +38,7 @@ if os.environ.get("FREETOKEN_BROKER_PAGEABLE_MOE") == "1":
             rows = per_layer[layer_id].index_select(0, source_ids)
             # non_blocking=False makes PyTorch stage pageable memory safely before
             # the GPU expert GEMM consumes the slot cache.
-            cache.index_copy_(
-                0,
-                slot_ids_gpu,
-                rows.to(device=self.device, non_blocking=False),
-            )
+            cache[slot_ids_gpu] = rows.to(device=self.device, non_blocking=False)
 
     HostBank.pin = _pageable_pin
     OffloadMoeCache.copy_missing = _pageable_copy_missing
