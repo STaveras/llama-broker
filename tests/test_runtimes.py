@@ -142,8 +142,14 @@ class RuntimeDispatchTests(unittest.TestCase):
             "cache_type_k", "cache_type_v", "flash_attention", "gpu_layers",
         ):
             record.pop(field, None)
+        safety = record["safety"]
+        assert isinstance(safety, dict)
+        service = safety["service"]
+        assert isinstance(service, dict)
+        service["memory_swap_max_mib"] = 4096
         parsed = ProfileRegistry.from_path(self._write([record])).get("freetoken-main")
         self.assertEqual(parsed.model_path, model_dir.resolve())
+        self.assertEqual(parsed.safety.service.memory_swap_max_mib, 4096)
         self.assertEqual(parsed.command(host="127.0.0.1", port=10000)[1], "--model-path")
         controller = BackendController(
             profiles={parsed.id: parsed},

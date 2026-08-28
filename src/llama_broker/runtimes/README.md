@@ -15,7 +15,10 @@ FreeToken FTW model directories. Its `extra_args` are checked against an
 explicit allowlist covering memory/cache sizing, MoE/NVFP4 backends, tokenizer
 and context settings, reasoning/tool parsers, and supported feature toggles.
 The broker still owns host/port, artifact hashes, systemd limits, readiness,
-and lifecycle transitions.
+and lifecycle transitions. The FreeToken venv should track the
+`FlashML-org/FreeToken` upstream checkout; its WSL-aware residency planner can
+keep GPU MoE layers pinned while routing only pin-budget overflow layers through
+its CPU executor. Do not force the old broker-side pageable monkeypatch.
 
 The profile parser rejects runtime-specific fields and unsupported passthrough
 flags. Runtime-specific options should be added to the adapter and parser
