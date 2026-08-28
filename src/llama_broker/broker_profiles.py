@@ -35,8 +35,10 @@ MAX_BATCH_SIZE = 512
 MAX_UBATCH_SIZE = 128
 MAX_FIT_TARGET_MIB = 8_192
 MAX_TASKS_MAX = 512
-MAX_MEMORY_MAX_MIB = 22_528
-MAX_MEMORY_SWAP_MAX_MIB = 4_096
+MAX_MEMORY_MAX_MIB = 20_480
+MAX_MEMORY_SWAP_MAX_MIB = 1_024
+FREETOKEN_MEMORY_MAX_MIB = 22_528
+FREETOKEN_MEMORY_SWAP_MAX_MIB = 4_096
 MAX_TIMEOUT_STOP_SEC = 20
 MAX_SPECULATIVE_DRAFT_TOKENS = 64
 MAX_CACHE_RAM_SHARE_DIVISOR = 2
@@ -388,7 +390,13 @@ class SafetyBudget:
     admission: AdmissionSafetyBudget
 
 
-def _parse_safety(record: Mapping[str, Any], profile_id: str) -> SafetyBudget:
+def _parse_safety(
+    record: Mapping[str, Any],
+    profile_id: str,
+    *,
+    max_memory_max_mib: int = MAX_MEMORY_MAX_MIB,
+    max_memory_swap_max_mib: int = MAX_MEMORY_SWAP_MAX_MIB,
+) -> SafetyBudget:
     raw_safety = _required(record, "safety")
     if not isinstance(raw_safety, dict):
         raise ProfileError(f"safety must be an object for {profile_id!r}")
@@ -419,15 +427,15 @@ def _parse_safety(record: Mapping[str, Any], profile_id: str) -> SafetyBudget:
             f"safety.service.memory_swap_max_mib cannot exceed memory_max_mib "
             f"for {profile_id!r}"
         )
-    if service.memory_max_mib > MAX_MEMORY_MAX_MIB:
+    if service.memory_max_mib > max_memory_max_mib:
         raise ProfileError(
             f"safety.service.memory_max_mib for {profile_id!r} exceeds "
-            f"fail-closed limit {MAX_MEMORY_MAX_MIB}"
+            f"fail-closed limit {max_memory_max_mib}"
         )
-    if service.memory_swap_max_mib > MAX_MEMORY_SWAP_MAX_MIB:
+    if service.memory_swap_max_mib > max_memory_swap_max_mib:
         raise ProfileError(
             f"safety.service.memory_swap_max_mib for {profile_id!r} exceeds "
-            f"fail-closed limit {MAX_MEMORY_SWAP_MAX_MIB}"
+            f"fail-closed limit {max_memory_swap_max_mib}"
         )
     if service.tasks_max > MAX_TASKS_MAX:
         raise ProfileError(
@@ -1042,7 +1050,14 @@ def _parse_profile(
             "MTP heads"
         )
 
-    safety = _parse_safety(record, profile_id)
+    safety = _parse_safety(
+        record,
+        profile_id,
+        max_memory_max_mib=(FREETOKEN_MEMORY_MAX_MIB if runtime == "freetoken" else MAX_MEMORY_MAX_MIB),
+        max_memory_swap_max_mib=(
+            FREETOKEN_MEMORY_SWAP_MAX_MIB if runtime == "freetoken" else MAX_MEMORY_SWAP_MAX_MIB
+        ),
+    )
     max_cache_ram_mib = safety.service.memory_max_mib // MAX_CACHE_RAM_SHARE_DIVISOR
     if cache_ram_mib is not None and cache_ram_mib > max_cache_ram_mib:
         raise ProfileError(
