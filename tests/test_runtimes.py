@@ -145,6 +145,17 @@ class RuntimeDispatchTests(unittest.TestCase):
         parsed = ProfileRegistry.from_path(self._write([record])).get("freetoken-main")
         self.assertEqual(parsed.model_path, model_dir.resolve())
         self.assertEqual(parsed.command(host="127.0.0.1", port=10000)[1], "--model-path")
+        controller = BackendController(
+            profiles={parsed.id: parsed},
+            state_path=self.root / "state.json",
+            systemd_dir=self.root / "systemd",
+            service_prefix="llama-broker-profile",
+            command_runner=lambda _command: None,
+            readiness_probe=lambda _alias, _timeout: True,
+            resource_probe=None,
+            event_logger=lambda _event: None,
+        )
+        self.assertIn("LimitMEMLOCK=infinity", controller.render_unit(parsed.id))
 
         record["extra_args"] = ["--not-a-freetoken-flag"]
         with self.assertRaisesRegex(ProfileError, "unsupported token"):
