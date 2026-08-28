@@ -213,7 +213,7 @@ def main() -> int:
     )
     child_env["FREETOKEN_BROKER_PAGEABLE_MOE"] = "1"
     child_env["FREETOKEN_FUSED_COPY"] = "0"
-    child_env["TVM_FFI_CUDA_ARCH_LIST"] = "120"
+    child_env["TVM_FFI_CUDA_ARCH_LIST"] = "12.0"
     child = subprocess.Popen(child_command, env=child_env)
     server: ProxyServer | None = None
     try:
