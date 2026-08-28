@@ -30,8 +30,8 @@ if os.environ.get("FREETOKEN_BROKER_PAGEABLE_MOE") == "1":
         count = int(self.num_indices.detach().cpu().reshape(-1)[0].item())
         if count <= 0:
             return
-        source_ids = self.src_indices.detach().cpu().reshape(-1)[:count]
-        slot_ids = self.evict_slots.detach().cpu().reshape(-1)[:count]
+        source_ids = self.src_indices.detach().cpu().reshape(-1)[:count].long()
+        slot_ids = self.evict_slots.detach().cpu().reshape(-1)[:count].long()
         slot_ids_gpu = slot_ids.to(device=self.device)
 
         for per_layer, cache in self.banks:
