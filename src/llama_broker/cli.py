@@ -1407,17 +1407,15 @@ def _render_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> s
 
 
 def _model_payload(profile: Profile) -> dict[str, object]:
-    """Return the profile-backed model fields intended for CLI consumers."""
+    """Return one canonical, client-facing model record for CLI consumers."""
 
     return {
         "id": profile.alias,
-        "profile": profile.id,
         "display_name": profile.display_name,
         "runtime": profile.runtime,
         "capabilities": sorted(profile.capabilities),
         "context_size": profile.context_size,
         "parallel": profile.parallel,
-        "aliases": [alias for alias in profile.aliases if alias != profile.alias],
     }
 
 

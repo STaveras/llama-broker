@@ -1002,6 +1002,26 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
         self.assertNotIn("model_path", rendered)
         self.assertNotIn(tempdir, rendered)
 
+    def test_model_list_json_advertises_only_canonical_model_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = brokerctl.main(
+                    ["--profiles", str(profiles), "model", "list", "--json"]
+                )
+
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["object"], "model_list")
+        self.assertTrue(payload["data"])
+        for model in payload["data"]:
+            self.assertIn("id", model)
+            self.assertNotIn("profile", model)
+            self.assertNotIn("aliases", model)
+
     def test_runtime_list_is_profile_centric_and_does_not_print_binary_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             from tests.fixtures import materialize_fixture  # noqa: PLC0415
