@@ -11,6 +11,7 @@ from llama_broker.broker_tui import (
     EDITOR_FIELDS,
     TUIModel,
     _curses_prompt,
+    _read_curses_key,
     run_guided_wizard,
 )
 from llama_broker.profile_config import merge_manifest_drafts
@@ -189,6 +190,51 @@ class BrokerTUIModelTests(unittest.TestCase):
         model.set_field("display_name", value)
         assert model.current is not None
         self.assertEqual(model.current["display_name"], "New display name")
+
+    def test_alt_arrow_sequences_do_not_become_escape(self) -> None:
+        import curses
+
+        class FakeWindow:
+            def __init__(self, keys: list[int]) -> None:
+                self.keys = iter(keys)
+                self.timeouts: list[int] = []
+
+            def getch(self) -> int:
+                try:
+                    return next(self.keys)
+                except StopIteration:
+                    return -1
+
+            def timeout(self, milliseconds: int) -> None:
+                self.timeouts.append(milliseconds)
+
+        sequences = (
+            (bytes([27]) + b"[1;3A", curses.KEY_UP),
+            (bytes([27]) + b"[1;3B", curses.KEY_DOWN),
+            (bytes([27]) + b"[1;3C", curses.KEY_RIGHT),
+            (bytes([27]) + b"[1;3D", curses.KEY_LEFT),
+            (bytes([27]) + b"OA", curses.KEY_UP),
+        )
+        for raw_sequence, expected in sequences:
+            with self.subTest(sequence=raw_sequence):
+                window = FakeWindow(list(raw_sequence))
+                self.assertEqual(_read_curses_key(window), expected)
+                self.assertEqual(window.timeouts, [50, -1])
+
+    def test_standalone_escape_remains_escape(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.timeouts: list[int] = []
+
+            def getch(self) -> int:
+                return 27 if not self.timeouts else -1
+
+            def timeout(self, milliseconds: int) -> None:
+                self.timeouts.append(milliseconds)
+
+        window = FakeWindow()
+        self.assertEqual(_read_curses_key(window), 27)
+        self.assertEqual(window.timeouts, [50, -1])
 
     def test_curses_prompt_cancels_cleanly_on_keyboard_interrupt(self) -> None:
         class InterruptingWindow:

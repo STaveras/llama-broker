@@ -952,6 +952,30 @@ class BrokerctlProfileEditorTests(unittest.TestCase):
 
 
 class BrokerctlCommandLayoutTests(unittest.TestCase):
+    def test_profile_render_is_namespaced_and_dispatches(self) -> None:
+        args = brokerctl.build_parser().parse_args(["profile", "render", "main"])
+        self.assertEqual((args.command, args.profiles_command, args.model), ("profile", "render", "main"))
+
+        with self.assertRaises(SystemExit):
+            brokerctl.build_parser().parse_args(["render", "main"])
+
+        registry = Mock()
+        registry.resolve.return_value = SimpleNamespace(id="main")
+        controller = Mock()
+        controller.render_unit.return_value = "[Unit]\nDescription=main\n"
+        output = io.StringIO()
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=registry),
+            patch.object(brokerctl, "create_production_controller", return_value=controller),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["profile", "render", "main"])
+
+        self.assertEqual(result, 0)
+        registry.resolve.assert_called_once_with("main")
+        controller.render_unit.assert_called_once_with("main")
+        self.assertEqual(output.getvalue(), "[Unit]\nDescription=main\n")
+
     def test_explicit_command_namespaces_replace_ambiguous_top_level_commands(self) -> None:
         model = brokerctl.build_parser().parse_args(["model", "list"])
         self.assertEqual((model.command, model.model_command), ("model", "list"))

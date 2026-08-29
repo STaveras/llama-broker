@@ -364,16 +364,33 @@ def _verify_profile_artifacts(profile: Any) -> None:
 
 
 def apply_reasoning_policy(
-    payload: Mapping[str, Any], *, runtime: str, max_output_tokens: int | None = None
+    payload: Mapping[str, Any],
+    *,
+    runtime: str,
+    max_output_tokens: int | None = None,
+    request_max_output_tokens: int | None = None,
+    batch_size: int = 1,
+    ubatch_size: int = 1,
 ) -> dict[str, Any]:
-    """Apply the client reasoning policy for runtimes with template controls."""
+    """Apply the experimental client reasoning policy for llama.cpp templates."""
 
     rewritten = dict(payload)
     if runtime != "llamacpp":
         return rewritten
     if max_output_tokens is None or max_output_tokens <= 0:
         raise ValueError("llamacpp reasoning policy requires a positive output limit")
+    if request_max_output_tokens is not None and (
+        isinstance(request_max_output_tokens, bool)
+        or not isinstance(request_max_output_tokens, int)
+        or request_max_output_tokens <= 0
+    ):
+        raise ValueError("request output limit must be a positive integer")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if isinstance(ubatch_size, bool) or not isinstance(ubatch_size, int) or ubatch_size <= 0:
+        raise ValueError("ubatch_size must be a positive integer")
 
+    budget_limit = request_max_output_tokens or max_output_tokens
     raw_kwargs = rewritten.get("chat_template_kwargs")
     kwargs = dict(raw_kwargs) if isinstance(raw_kwargs, Mapping) else {}
     explicit_template = "enable_thinking" in kwargs
@@ -387,6 +404,8 @@ def apply_reasoning_policy(
     raw_effort = rewritten.get("reasoning_effort")
     if effort is None and isinstance(raw_effort, str):
         effort = raw_effort
+    if effort is not None:
+        effort = {"min": "minimal"}.get(effort.strip().casefold(), effort.strip().casefold())
 
     explicit_budget = (
         "reasoning_budget_tokens" in rewritten
@@ -441,17 +460,18 @@ def apply_reasoning_policy(
             and "reasoning_budget_tokens" not in rewritten
             and "thinking_budget_tokens" not in rewritten
         ):
-            divisor = {
-                "minimal": 16,
-                "low": 8,
-                "medium": 4,
-                "high": 2,
-                "extra high": 4 / 3,
-                "max": 1,
-            }[effort]
-            rewritten["thinking_budget_tokens"] = max(
-                1, int(max_output_tokens / divisor)
-            )
+            levels = ("minimal", "low", "medium", "high", "extra high", "max")
+            index = levels.index(effort)
+            low_budget = max(1, budget_limit // ubatch_size)
+            if effort == "minimal":
+                budget = min(batch_size, budget_limit)
+            elif effort == "low":
+                budget = low_budget
+            elif effort == "max":
+                budget = budget_limit
+            else:
+                budget = min(budget_limit, low_budget * (2 ** (index + 1)))
+            rewritten["thinking_budget_tokens"] = max(1, budget)
         rewritten["reasoning_effort"] = effort
     else:
         # Be tolerant of client-specific effort enums. Unsupported values
@@ -528,6 +548,16 @@ def route_payload(
     rewritten = dict(payload)
     rewritten["model"] = profile.alias
     return profile, rewritten
+
+
+def _requested_output_tokens(payload: Mapping[str, Any]) -> int | None:
+    """Return a valid client output budget, if one was supplied."""
+
+    for key in ("max_tokens", "max_completion_tokens"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
 
 
 def enforce_output_limit(
@@ -1357,6 +1387,21 @@ class BrokerApplication:
             thread.join(timeout=max(1.0, RECOVERY_INTERVAL + 1.0))
         self._recovery_thread = None
 
+    def restart_when_idle(self) -> Any:
+        """Restart the active profile or recover the last failed target."""
+
+        if self.coordinator.active_profile is None:
+            state = self._controller_state_snapshot()
+            if state.get("phase") == "failed":
+                target_profile = state.get("target_profile")
+                if isinstance(target_profile, str) and target_profile:
+                    _log(
+                        f"[broker] restart requested with no active profile; "
+                        f"recovering failed target {target_profile!r}"
+                    )
+                    return self.coordinator.switch_when_idle(target_profile)
+        return self.coordinator.restart_when_idle()
+
     def max_output_tokens_for(self, profile: Profile) -> int:
         """Return the maximum client-requested output for a profile."""
 
@@ -1903,6 +1948,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         rewritten,
                         runtime=profile.runtime,
                         max_output_tokens=self.application.max_output_tokens_for(profile),
+                        request_max_output_tokens=_requested_output_tokens(payload),
+                        batch_size=profile.batch_size or 1,
+                        ubatch_size=profile.ubatch_size or 1,
                     )
                 except ValueError:
                     rejected_metadata = reasoning_policy_metadata(
@@ -2031,7 +2079,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             elif path == "/admin/restart":
                 model = payload.get("model")
                 if model is None:
-                    self.application.coordinator.restart_when_idle()
+                    self.application.restart_when_idle()
                 else:
                     profile = self.application.registry.resolve(model)
                     if self.application.coordinator.active_profile == profile.id:
