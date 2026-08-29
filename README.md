@@ -120,7 +120,7 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 | `brokerctl` (bare) | (planned) launches the interactive TUI |
 | `brokerctl model list` | list client-facing model references from canonical profiles (`--json` for a schema-versioned report) |
 | `brokerctl status` | show durable/live backend state (`--json` for schema-versioned JSON) |
-| `brokerctl render <model>` | render a profile unit without installing |
+| `brokerctl profile render <model>` | render a profile unit without installing |
 | `brokerctl load <model>` | queue a profile load (`start` is an alias) |
 | `brokerctl restart` | reload the active model or start a new one |
 | `brokerctl unload` | stop the current backing backend |
