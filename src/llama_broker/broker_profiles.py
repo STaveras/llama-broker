@@ -39,6 +39,7 @@ MAX_MEMORY_MAX_MIB = 20_480
 MAX_MEMORY_SWAP_MAX_MIB = 1_024
 MAX_TIMEOUT_STOP_SEC = 20
 MAX_SPECULATIVE_DRAFT_TOKENS = 64
+MAX_MOE_CACHE_SLOTS = 8
 MAX_CACHE_RAM_SHARE_DIVISOR = 2
 MIN_ADMISSION_RAM_AVAILABLE_MIB = 8_192
 MAX_ADMISSION_SWAP_USED_MIB = 1_024
@@ -50,6 +51,9 @@ ALLOWED_REASONING_MODES = frozenset({"off"})
 ALLOWED_SPECULATIVE_TYPES = frozenset({"mtp", "draft-mtp", "nextn"})
 SPECULATIVE_COUNT_FLAGS = frozenset(
     {"--draft-max", "--spec-draft-n-max", "--draft-min"}
+)
+MOE_CACHE_VALUE_FLAGS = frozenset(
+    {"--moe-cache-profile", "--moe-cache-slots"}
 )
 VLLM_KV_CACHE_DTYPES = frozenset(
     {
@@ -213,6 +217,7 @@ def _parse_extra_args(
             "--reasoning",
             "--spec-type",
             *SPECULATIVE_COUNT_FLAGS,
+            *MOE_CACHE_VALUE_FLAGS,
         }:
             raise ProfileError(
                 f"extra_args for {profile_id!r} contain unsupported token: {flag!r}"
@@ -224,7 +229,26 @@ def _parse_extra_args(
 
         value = args[i + 1]
         seen_flags.add(flag)
-        if flag == "--reasoning":
+        if flag == "--moe-cache-profile":
+            path = Path(value).expanduser()
+            if not path.is_absolute() or not path.is_file():
+                raise ProfileError(
+                    f"extra_args flag {flag} for {profile_id!r} requires an "
+                    f"absolute existing file: {value!r}"
+                )
+        elif flag == "--moe-cache-slots":
+            if not re.fullmatch(r"[0-9]+", value):
+                raise ProfileError(
+                    f"extra_args flag {flag} for {profile_id!r} must be a "
+                    "non-negative integer"
+                )
+            slots = int(value, 10)
+            if slots > MAX_MOE_CACHE_SLOTS:
+                raise ProfileError(
+                    f"extra_args flag {flag} for {profile_id!r} exceeds "
+                    f"fail-closed limit {MAX_MOE_CACHE_SLOTS}"
+                )
+        elif flag == "--reasoning":
             if value not in ALLOWED_REASONING_MODES:
                 raise ProfileError(
                     f"extra_args flag {flag} for {profile_id!r} has unsupported "

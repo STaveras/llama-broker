@@ -21,6 +21,8 @@ class ProfileRegistryTests(unittest.TestCase):
         self.vision_model.write_bytes(b"vision")
         self.mmproj = self.root / "mmproj.gguf"
         self.mmproj.write_bytes(b"projector")
+        self.moe_profile = self.root / "routing.csv"
+        self.moe_profile.write_text("0,0,1\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -304,6 +306,61 @@ class ProfileRegistryTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ProfileError, "unsupported token"):
                     ProfileRegistry.from_path(self._write([profile]))
+
+    def test_moe_cache_flags_are_allowlisted_and_rendered(self) -> None:
+        profile = self._profile(
+            "moe",
+            "moe",
+            self.main_model,
+            extra_args=[
+                "--no-warmup",
+                "--moe-cache-profile",
+                str(self.moe_profile),
+                "--moe-cache-slots",
+                "1",
+            ],
+        )
+
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("moe")
+        args = parsed.server_args(host="127.0.0.1", port=10000)
+
+        self.assertEqual(
+            args[args.index("--moe-cache-profile") + 1], str(self.moe_profile)
+        )
+        self.assertEqual(args[args.index("--moe-cache-slots") + 1], "1")
+
+    def test_moe_cache_profile_must_be_an_absolute_existing_file(self) -> None:
+        for value in ("routing.csv", str(self.root / "missing.csv")):
+            with self.subTest(value=value):
+                profile = self._profile(
+                    "moe",
+                    "moe",
+                    self.main_model,
+                    extra_args=["--moe-cache-profile", value],
+                )
+                with self.assertRaisesRegex(ProfileError, "absolute existing file"):
+                    ProfileRegistry.from_path(self._write([profile]))
+
+    def test_moe_cache_slots_are_nonnegative_and_bounded(self) -> None:
+        for value in ("-1", "one", "9"):
+            with self.subTest(value=value):
+                profile = self._profile(
+                    "moe",
+                    "moe",
+                    self.main_model,
+                    extra_args=["--moe-cache-slots", value],
+                )
+                with self.assertRaisesRegex(ProfileError, "moe-cache-slots"):
+                    ProfileRegistry.from_path(self._write([profile]))
+
+        profile = self._profile(
+            "moe",
+            "moe",
+            self.main_model,
+            extra_args=["--moe-cache-slots", "8"],
+        )
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("moe")
+        self.assertEqual(parsed.extra_args[-1], "8")
 
     def test_native_vision_profile_does_not_require_projector(self) -> None:
         profile = self._profile(
