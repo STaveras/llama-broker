@@ -53,7 +53,7 @@ class HermesProvider(ToolProvider):
             changes.append("base_url: updated for llama-broker provider")
 
         if model:
-            default_model = model
+            default_model = self._canonical_model_name(registry, model)
             for field, value in (
                 ("default", default_model),
                 ("provider", "llama-broker"),
@@ -69,6 +69,26 @@ class HermesProvider(ToolProvider):
             )
             if provider_status in {"added", "updated"}:
                 changes.append("llama-broker.default_model: selected explicit broker model")
+        else:
+            # ``default_model`` may have been written by an older integration
+            # pass using the internal profile ID.  Normalize it even when the
+            # caller did not explicitly select a model, otherwise the stale ID
+            # is advertised alongside the canonical alias in ``models:``.
+            configured_default = self._get_provider_field(content, "default_model")
+            if configured_default:
+                canonical_default = self._canonical_model_name(
+                    registry, configured_default
+                )
+                if canonical_default and canonical_default != configured_default:
+                    content, provider_status = self._set_provider_field(
+                        content,
+                        "default_model",
+                        canonical_default,
+                    )
+                    if provider_status in {"added", "updated"}:
+                        changes.append(
+                            "llama-broker.default_model: normalized to canonical model alias"
+                        )
 
         if registry.api_key:
             content, field_status = self._set_provider_field(
@@ -124,6 +144,43 @@ class HermesProvider(ToolProvider):
             self._write_yaml(config_path, content)
 
         return result
+
+    @staticmethod
+    def _canonical_model_name(registry: ToolRegistry, reference: str) -> str:
+        """Return the public alias while retaining compatibility resolution."""
+        resolver = getattr(registry, "canonical_model_name", None)
+        if callable(resolver):
+            canonical = resolver(reference)
+            if isinstance(canonical, str) and canonical:
+                return canonical
+        return reference
+
+    def _get_provider_field(self, content: str, field: str) -> str | None:
+        """Read one scalar field from Hermes' llama-broker provider block."""
+        lines = content.splitlines(keepends=True)
+        provider_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if line.rstrip("\r\n") == "  llama-broker:"
+            ),
+            None,
+        )
+        if provider_index is None:
+            return None
+
+        end = len(lines)
+        for index in range(provider_index + 1, len(lines)):
+            if lines[index].strip() and not lines[index].startswith((" ", "\t")):
+                end = index
+                break
+
+        field_prefix = f"    {field}:"
+        for index in range(provider_index + 1, end):
+            if lines[index].startswith(field_prefix):
+                value = lines[index][len(field_prefix):].strip()
+                return value or None
+        return None
 
     def _set_provider_field(
         self,
