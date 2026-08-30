@@ -129,7 +129,9 @@ halve the per-slot window and is not the canonical profile.
 
 The stock and Example 9B text profiles use two slots in a 262,144-token server
 context, yielding 131,072 tokens per slot. Vision and MTP retain their smaller
-single-slot windows. `/v1/models` reports these profile-specific values.
+single-slot windows. `/v1/models` reports the aggregate server context as
+`context_length`, the configured slot count as `parallel`, and the per-slot
+window as `slot_context_window`.
 
 Qwen 3.5 MRoPE KV shifting is unsupported. `--no-context-shift` is therefore a
 required invariant; the configured contexts are fixed windows rather than

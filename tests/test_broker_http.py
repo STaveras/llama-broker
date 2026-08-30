@@ -213,6 +213,7 @@ class BrokerHttpTests(unittest.TestCase):
                     "mmproj_path": str(mmproj),
                     "mmproj_sha256": sha256_file(mmproj),
                     "context_size": 32768,
+                    "parallel": 2,
                     "gpu_layers": "auto",
                     "safety": {
                         "service": {
@@ -871,7 +872,10 @@ class BrokerHttpTests(unittest.TestCase):
             self.assertIsInstance(model["permission"], list)
         self.assertEqual(by_id["main-27b"]["context_length"], 65536)
         self.assertEqual(by_id["main-27b"]["max_output_tokens"], 65536)
-        self.assertEqual(by_id["qwen3.5-9b-vision"]["max_output_tokens"], 32768)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["context_length"], 32768)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["parallel"], 2)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["slot_context_window"], 16384)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["max_output_tokens"], 16384)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["capabilities"], ["text", "vision"])
 
     def test_admin_switch_uses_coordinator_and_reports_consistent_health(self) -> None:

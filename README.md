@@ -143,7 +143,7 @@ The stable additive OpenAI-compatible subset is under `/v1`:
 
 | Route | Contract |
 | --- | --- |
-| `GET /v1/models` | Authenticated list of currently healthy/serving models; stopped broken or unverifiable profiles are hidden. |
+| `GET /v1/models` | Authenticated list of currently healthy/serving broker profiles; stopped, broken, or unverifiable profiles are hidden. Each model reports aggregate `context_length` (the profile's `-c` value), `parallel` (the profile's `-np` value), and per-slot `slot_context_window`. |
 | `GET /v1/models/{model}` | Authenticated model metadata for a verified profile, or the currently healthy active backend. |
 | `POST /v1/chat/completions` | Authenticated chat request; an explicit `model` id/alias is routed to the matching profile, while an omitted model uses the currently loaded profile. `stream: true` preserves SSE streaming. |
 | `POST /v1/completions` | Authenticated completion request with the same explicit/currently-loaded model routing and streaming behavior. |

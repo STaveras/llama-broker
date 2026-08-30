@@ -1462,8 +1462,12 @@ def _cmd_profiles_list(args: argparse.Namespace) -> int:
     registry = ProfileRegistry.from_path(args.profiles)
     for profile in registry.profiles:
         caps = ",".join(sorted(profile.capabilities))
-        ctx_k = profile.context_size // profile.parallel if profile.parallel else profile.context_size
-        print(f"{profile.alias:<30} role={profile.role:<12} ctx={ctx_k:<8} parallel={profile.parallel} caps=[{caps}]")
+        slot_ctx = profile.slot_context_window
+        print(
+            f"{profile.alias:<30} role={profile.role:<12} "
+            f"ctx={profile.context_size:<8} parallel={profile.parallel} "
+            f"slot_ctx={slot_ctx:<8} caps=[{caps}]"
+        )
     return 0
 
 
