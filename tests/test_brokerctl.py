@@ -1046,6 +1046,26 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
             self.assertNotIn("profile", model)
             self.assertNotIn("aliases", model)
 
+    def test_profile_list_reports_total_and_slot_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            manifest = json.loads(profiles.read_text(encoding="utf-8"))
+            manifest["profiles"][0].update({"context_size": 65536, "parallel": 2})
+            profiles.write_text(json.dumps(manifest), encoding="utf-8")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = brokerctl.main(["--profiles", str(profiles), "profile", "list"])
+
+        self.assertEqual(result, 0)
+        line = next(
+            line for line in output.getvalue().splitlines() if line.startswith("fixture-text-7b")
+        )
+        self.assertIn("ctx=65536", line)
+        self.assertIn("parallel=2", line)
+        self.assertIn("slot_ctx=32768", line)
+
     def test_runtime_list_is_profile_centric_and_does_not_print_binary_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             from tests.fixtures import materialize_fixture  # noqa: PLC0415
