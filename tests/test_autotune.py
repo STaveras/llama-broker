@@ -29,7 +29,7 @@ from llama_broker.autotune import (
     parse_runtime_help,
     patch_autotune_extra_args,
 )
-from llama_broker.cli import _autotune_report
+from llama_broker.cli import _autotune_report, _autotune_unit_directives
 
 
 class FakeSession:
@@ -79,6 +79,34 @@ class AutotuneEngineTests(unittest.TestCase):
             extra_args=("--jinja", "--custom-manual", "keep"),
             capabilities=frozenset({"text", "tools"}),
         )
+
+    def test_autotune_unit_directives_force_graph_disable(self) -> None:
+        profile = SimpleNamespace(
+            runtime="llamacpp",
+            environment={
+                "CUSTOM": "keep",
+                "GGML_CUDA_DISABLE_GRAPHS": "0",
+                "GGML_CUDA_GRAPH_OPT": "1",
+                "LLAMA_GRAPH_REUSE_DISABLE": "0",
+            },
+            safety=SimpleNamespace(
+                service=SimpleNamespace(
+                    memory_max_mib=20_480,
+                    memory_swap_max_mib=1_024,
+                    tasks_max=512,
+                )
+            ),
+        )
+
+        directives = _autotune_unit_directives(profile)
+
+        self.assertIn("Environment=GGML_CUDA_DISABLE_GRAPHS=1", directives)
+        self.assertIn("Environment=GGML_CUDA_GRAPH_OPT=0", directives)
+        self.assertIn("Environment=LLAMA_GRAPH_REUSE_DISABLE=1", directives)
+        self.assertIn("Environment=CUSTOM=keep", directives)
+        self.assertNotIn("Environment=GGML_CUDA_DISABLE_GRAPHS=0", directives)
+        self.assertNotIn("Environment=GGML_CUDA_GRAPH_OPT=1", directives)
+        self.assertNotIn("Environment=LLAMA_GRAPH_REUSE_DISABLE=0", directives)
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()

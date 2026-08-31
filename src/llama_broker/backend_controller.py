@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from .broker_profiles import launch_environment
+
 
 class Profile(Protocol):
     """Minimum profile shape consumed by :class:`BackendController`.
@@ -719,9 +721,13 @@ class BackendController:
             "ExecStart="
             + " ".join(_unit_quote(word, escape_dollar=True) for word in command),
         ]
+        environment = launch_environment(
+            profile.environment,
+            runtime=str(getattr(profile, "runtime", "llamacpp")),
+        )
         lines.extend(
             f"Environment={_unit_quote(f'{name}={value}')}"
-            for name, value in sorted(profile.environment.items())
+            for name, value in sorted(environment.items())
         )
         lines.extend(
             [
