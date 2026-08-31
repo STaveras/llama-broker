@@ -125,6 +125,26 @@ class ProfileConfigTests(unittest.TestCase):
             load_manifest(self.manifest_path)
         self.assertEqual(self.manifest_path.read_text(encoding="utf-8"), unsupported)
 
+    def test_active_apply_refreshes_broker_registry_after_install(self) -> None:
+        updated = json.loads(json.dumps(self.data))
+        record = next(item for item in updated["profiles"] if item["id"] == "fixture-vision-12b")
+        record["batch_size"] = 32
+        record["ubatch_size"] = 32
+        reload_broker = Mock()
+
+        result = apply_manifest_transaction(
+            self.manifest_path,
+            updated,
+            active_profile="fixture-vision-12b",
+            install_units=Mock(),
+            restart_broker=Mock(),
+            reload_broker=reload_broker,
+        )
+
+        self.assertTrue(result.changed)
+        self.assertFalse(result.restarted)
+        reload_broker.assert_called_once_with()
+
     def test_active_apply_updates_without_restarting(self) -> None:
         updated = json.loads(json.dumps(self.data))
         record = next(item for item in updated["profiles"] if item["id"] == "fixture-vision-12b")

@@ -295,14 +295,45 @@ def _record_for_selector(
     raise ProfileError(f"profile record not found: {profile.id}")
 
 
+def _is_authoritative_manifest(profiles_path: Path) -> bool:
+    return profiles_path.resolve() == PROFILES_PATH.resolve()
+
+
+def _refresh_live_profile_registry(profiles_path: Path) -> None:
+    if not _is_authoritative_manifest(profiles_path):
+        return
+    try:
+        _broker_admin("/admin/autotune/reload", {})
+    except Exception as error:
+        raise ApplyError(f"live broker profile registry refresh failed: {error}") from error
+
+
 def _publish_profile_change(
     profiles_path: Path,
     data: dict[str, object],
     description: str,
 ) -> int:
+    old_manifest = json.loads(profiles_path.read_text(encoding="utf-8"))
+    if not isinstance(old_manifest, dict):
+        raise ApplyError("profile manifest must contain a JSON object")
+    live_manifest = _is_authoritative_manifest(profiles_path)
     _write_validated_manifest(profiles_path, data)
+    try:
+        _refresh_live_profile_registry(profiles_path)
+    except Exception:
+        try:
+            _write_validated_manifest(profiles_path, old_manifest)
+        except Exception as rollback_error:
+            raise ApplyError(
+                "profile mutation failed and manifest rollback also failed: "
+                f"{rollback_error}"
+            ) from rollback_error
+        raise
     print(f"{description} in {profiles_path}")
-    print(PROFILE_MUTATION_REMINDER)
+    if live_manifest:
+        print("Live broker profile registry refreshed.")
+    else:
+        print(PROFILE_MUTATION_REMINDER)
     return 0
 
 
@@ -719,9 +750,11 @@ def _interactive_edit(
             print(f"  {field_label}: {current} -> {new_value}")
 
     if changed:
-        _write_validated_manifest(profiles_path, data)
-        print(f"\nUpdated {profile_id} in {profiles_path}")
-        print(PROFILE_MUTATION_REMINDER)
+        return _publish_profile_change(
+            profiles_path,
+            data,
+            f"Updated {profile_id}",
+        )
     else:
         print("\nNo changes.")
 
@@ -2506,6 +2539,10 @@ def _apply_profile_configuration(
             active_profile = None
 
         def install_units() -> object:
+            if _is_authoritative_manifest(profiles_path):
+                # The live broker reload endpoint installs its own generated
+                # units after replacing the in-memory registry.
+                return None
             registry = ProfileRegistry.from_path(profiles_path)
             return create_production_controller(registry).install_units()
 
@@ -2516,6 +2553,7 @@ def _apply_profile_configuration(
                 active_profile=active_profile,
                 install_units=install_units,
                 restart_broker=_restart_broker_control_plane,
+                reload_broker=lambda: _refresh_live_profile_registry(profiles_path),
             )
         except ApplyError:
             raise

@@ -620,6 +620,54 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_live_profile_mutation_refreshes_broker_registry(self) -> None:
+        output = io.StringIO()
+        admin = Mock(return_value={"status": "ok"})
+        with (
+            patch.object(brokerctl, "PROFILES_PATH", self.profiles),
+            patch.object(brokerctl, "_broker_admin", admin),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profile",
+                    "set",
+                    "fixture-text-7b",
+                    "startup-timeout",
+                    "600",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        admin.assert_called_once_with("/admin/autotune/reload", {})
+
+    def test_live_profile_mutation_rolls_back_if_registry_refresh_fails(self) -> None:
+        before = self.profiles.read_bytes()
+        admin = Mock(side_effect=RuntimeError("broker unavailable"))
+        error = io.StringIO()
+        with (
+            patch.object(brokerctl, "PROFILES_PATH", self.profiles),
+            patch.object(brokerctl, "_broker_admin", admin),
+            redirect_stderr(error),
+        ):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profile",
+                    "set",
+                    "fixture-text-7b",
+                    "startup-timeout",
+                    "600",
+                ]
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(self.profiles.read_bytes(), before)
+        self.assertIn("live broker profile registry refresh failed", error.getvalue())
+
     def test_fit_unset_removes_every_fit_field_and_round_trips(self) -> None:
         main = next(profile for profile in self.data["profiles"] if profile["id"] == "fixture-text-7b")
         main.update(
