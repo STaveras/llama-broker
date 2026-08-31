@@ -744,8 +744,9 @@ def apply_manifest_transaction(
     install_units: Callable[[], Any],
     restart_broker: Callable[[], Any],
     writer: Callable[[Path, Mapping[str, Any]], None] = write_manifest_atomically,
+    reload_broker: Callable[[], Any] | None = None,
 ) -> ApplyResult:
-    """Publish a profile edit without restarting a running backend."""
+    """Publish a profile edit and refresh the broker registry without restarting the backend."""
 
     path = Path(profiles_path)
     old_manifest = load_manifest_source(path)
@@ -753,14 +754,20 @@ def apply_manifest_transaction(
         return ApplyResult(changed=False, restarted=False)
     validate_manifest(new_manifest, directory=path.parent)
     writer(path, new_manifest)
+    reload_attempted = False
     try:
         install_units()
+        if reload_broker is not None:
+            reload_attempted = True
+            reload_broker()
         return ApplyResult(changed=True, restarted=False)
     except Exception as error:
         rollback_errors: list[str] = []
         try:
             writer(path, old_manifest)
             install_units()
+            if reload_broker is not None and reload_attempted:
+                reload_broker()
         except Exception as rollback_error:
             rollback_errors.append(str(rollback_error))
         detail = f"profile apply failed: {error}"
