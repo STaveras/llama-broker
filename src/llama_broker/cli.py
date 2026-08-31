@@ -57,6 +57,7 @@ from .broker_profiles import (
     Profile,
     ProfileError,
     ProfileRegistry,
+    launch_environment,
 )
 from .discovery import discover_backends
 from .profile_config import (
@@ -250,9 +251,7 @@ PROFILE_MUTATION_REMINDER = (
 CLI_CACHE_TYPES = ("f16", "kvarn4", "turbo4")
 KNOWN_CACHE_TYPES = ALLOWED_CACHE_TYPES
 ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-REQUIRED_LLAMACPP_ENVIRONMENT = frozenset(
-    {"GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_OPT", "GGML_CUDA_PDL"}
-)
+REQUIRED_LLAMACPP_ENVIRONMENT = frozenset({"GGML_CUDA_PDL"})
 
 
 def _load_editable_manifest(
@@ -355,6 +354,7 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         "ubatch": "ubatch_size",
         "cache-k": "cache_type_k",
         "cache-v": "cache_type_v",
+        "moe-cache-slots-limit": "moe_cache_slots_limit",
         "flash": "flash_attention",
         "gpu-layers": "gpu_layers",
         "mmproj": "mmproj_path",
@@ -378,7 +378,14 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         if not value:
             raise ProfileError("alias must not be empty")
         record[key] = value
-    elif field in {"context", "parallel", "batch", "ubatch", "startup-timeout"}:
+    elif field in {
+        "context",
+        "parallel",
+        "batch",
+        "ubatch",
+        "startup-timeout",
+        "moe-cache-slots-limit",
+    }:
         try:
             value = int(raw_value, 10)
         except ValueError as error:
@@ -1477,6 +1484,29 @@ def _autotune_loopback_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _autotune_unit_directives(profile: Profile) -> Sequence[str]:
+    service = profile.safety.service
+    lines = [
+        f"MemoryMax={service.memory_max_mib}M",
+        f"MemorySwapMax={service.memory_swap_max_mib}M",
+        f"TasksMax={service.tasks_max}",
+        "KillMode=control-group",
+        "SendSIGKILL=no",
+    ]
+    import shlex
+
+    environment = launch_environment(
+        profile.environment,
+        runtime=profile.runtime,
+        autotune=True,
+    )
+    lines.extend(
+        f"Environment={shlex.quote(f'{key}={value}')}"
+        for key, value in sorted(environment.items())
+    )
+    return lines
+
+
 def _run_live_autotune(
     profile: Profile,
     schema: Any,
@@ -1599,21 +1629,7 @@ def _run_live_autotune(
         return False
 
     def unit_directives(_candidate: Candidate) -> Sequence[str]:
-        service = profile.safety.service
-        lines = [
-            f"MemoryMax={service.memory_max_mib}M",
-            f"MemorySwapMax={service.memory_swap_max_mib}M",
-            f"TasksMax={service.tasks_max}",
-            "KillMode=control-group",
-            "SendSIGKILL=no",
-        ]
-        import shlex
-
-        lines.extend(
-            f"Environment={shlex.quote(f'{key}={value}')}"
-            for key, value in sorted(profile.environment.items())
-        )
-        return lines
+        return _autotune_unit_directives(profile)
 
     lifecycle = SystemdCandidateLifecycle(
         command_for,

@@ -40,6 +40,7 @@ MAX_MEMORY_SWAP_MAX_MIB = 1_024
 MAX_TIMEOUT_STOP_SEC = 20
 MAX_SPECULATIVE_DRAFT_TOKENS = 64
 MAX_MOE_CACHE_SLOTS = 8
+MAX_QUALIFIED_MOE_CACHE_SLOTS = 112
 MAX_CACHE_RAM_SHARE_DIVISOR = 2
 MIN_ADMISSION_RAM_AVAILABLE_MIB = 8_192
 MAX_ADMISSION_SWAP_USED_MIB = 1_024
@@ -55,6 +56,41 @@ SPECULATIVE_COUNT_FLAGS = frozenset(
 MOE_CACHE_VALUE_FLAGS = frozenset(
     {"--moe-cache-profile", "--moe-cache-slots"}
 )
+LLAMACPP_AUTOTUNE_ENVIRONMENT = MappingProxyType(
+    {
+        "GGML_CUDA_DISABLE_GRAPHS": "1",
+        "GGML_CUDA_GRAPH_OPT": "0",
+        "LLAMA_GRAPH_REUSE_DISABLE": "1",
+    }
+)
+LLAMACPP_AUTOTUNE_ONLY_ENVIRONMENT = frozenset(LLAMACPP_AUTOTUNE_ENVIRONMENT)
+
+
+def launch_environment(
+    environment: Mapping[str, str],
+    *,
+    runtime: str,
+    autotune: bool = False,
+) -> dict[str, str]:
+    """Return the environment for a normal or autotune runtime launch.
+
+    CUDA graph controls are deliberately candidate-only.  Strip legacy values
+    from normal llama.cpp launches, then force the conservative values for
+    autotune candidates so profile data cannot leak the tuning policy into
+    production units.
+    """
+
+    effective = dict(environment)
+    if runtime != "llamacpp":
+        return effective
+
+    for name in LLAMACPP_AUTOTUNE_ONLY_ENVIRONMENT:
+        effective.pop(name, None)
+    if autotune:
+        effective.update(LLAMACPP_AUTOTUNE_ENVIRONMENT)
+    return effective
+
+
 VLLM_KV_CACHE_DTYPES = frozenset(
     {
         "auto",
@@ -191,7 +227,11 @@ def _parse_vllm_extra_args(
 
 
 def _parse_extra_args(
-    raw: object, profile_id: str, *, runtime: str
+    raw: object,
+    profile_id: str,
+    *,
+    runtime: str,
+    moe_cache_slots_limit: int = MAX_MOE_CACHE_SLOTS,
 ) -> tuple[tuple[str, ...], frozenset[str]]:
     if not isinstance(raw, list) or not all(
         isinstance(item, str) and item for item in raw
@@ -243,10 +283,10 @@ def _parse_extra_args(
                     "non-negative integer"
                 )
             slots = int(value, 10)
-            if slots > MAX_MOE_CACHE_SLOTS:
+            if slots > moe_cache_slots_limit:
                 raise ProfileError(
                     f"extra_args flag {flag} for {profile_id!r} exceeds "
-                    f"fail-closed limit {MAX_MOE_CACHE_SLOTS}"
+                    f"profile cache-slot limit {moe_cache_slots_limit}"
                 )
         elif flag == "--reasoning":
             if value not in ALLOWED_REASONING_MODES:
@@ -489,6 +529,7 @@ class Profile:
     environment: Mapping[str, str]
     extra_args: tuple[str, ...]
     model_draft: Path | None
+    moe_cache_slots_limit: int
     max_output_tokens: int | None = None
     autotune: Mapping[str, Any] | None = None
 
@@ -936,10 +977,6 @@ def _parse_profile(
         raise ProfileError(f"environment must be a string mapping for {profile_id!r}")
     environment = MappingProxyType(dict(raw_environment))
     if runtime == "llamacpp":
-        if environment.get("GGML_CUDA_DISABLE_GRAPHS") != "1":
-            raise ProfileError(f"{profile_id!r} must disable CUDA graph capture")
-        if environment.get("GGML_CUDA_GRAPH_OPT") != "0":
-            raise ProfileError(f"{profile_id!r} must disable CUDA graph optimization")
         if environment.get("GGML_CUDA_PDL") != "0":
             raise ProfileError(f"{profile_id!r} must disable CUDA PDL")
         if (
@@ -960,8 +997,24 @@ def _parse_profile(
             f"vllm profile {profile_id!r} contains llama.cpp-only environment settings"
         )
 
+    if runtime == "llamacpp":
+        if "moe_cache_slots_limit" in record:
+            moe_cache_slots_limit = _positive_int(record, "moe_cache_slots_limit")
+        else:
+            moe_cache_slots_limit = MAX_MOE_CACHE_SLOTS
+        if moe_cache_slots_limit > MAX_QUALIFIED_MOE_CACHE_SLOTS:
+            raise ProfileError(
+                f"moe_cache_slots_limit for {profile_id!r} exceeds fail-closed limit "
+                f"{MAX_QUALIFIED_MOE_CACHE_SLOTS}"
+            )
+    else:
+        moe_cache_slots_limit = MAX_MOE_CACHE_SLOTS
+
     extra_args, speculative_types = _parse_extra_args(
-        record.get("extra_args", []), profile_id, runtime=runtime
+        record.get("extra_args", []),
+        profile_id,
+        runtime=runtime,
+        moe_cache_slots_limit=moe_cache_slots_limit,
     )
 
     if (
@@ -1052,6 +1105,7 @@ def _parse_profile(
         environment=environment,
         extra_args=extra_args,
         model_draft=model_draft,
+        moe_cache_slots_limit=moe_cache_slots_limit,
         max_output_tokens=max_output_tokens,
         autotune=autotune,
     )

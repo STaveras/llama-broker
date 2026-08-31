@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from llama_broker.broker_profiles import ProfileError, ProfileRegistry
+from llama_broker.broker_profiles import (
+    ProfileError,
+    ProfileRegistry,
+    launch_environment,
+)
 
 
 class ProfileRegistryTests(unittest.TestCase):
@@ -75,8 +79,6 @@ class ProfileRegistryTests(unittest.TestCase):
                 },
             },
             "environment": {
-                "GGML_CUDA_DISABLE_GRAPHS": "1",
-                "GGML_CUDA_GRAPH_OPT": "0",
                 "GGML_CUDA_PDL": "0",
             },
             "extra_args": ["--no-warmup"],
@@ -329,6 +331,32 @@ class ProfileRegistryTests(unittest.TestCase):
         )
         self.assertEqual(args[args.index("--moe-cache-slots") + 1], "1")
 
+    def test_moe_cache_slots_accept_explicit_profile_limit(self) -> None:
+        profile = self._profile(
+            "moe-qualified",
+            "moe-qualified",
+            self.main_model,
+            moe_cache_slots_limit=88,
+            extra_args=["--moe-cache-slots", "88"],
+        )
+
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("moe-qualified")
+
+        self.assertEqual(parsed.moe_cache_slots_limit, 88)
+        self.assertEqual(parsed.extra_args[-1], "88")
+
+    def test_moe_cache_slots_limit_has_hard_ceiling(self) -> None:
+        profile = self._profile(
+            "moe-qualified",
+            "moe-qualified",
+            self.main_model,
+            moe_cache_slots_limit=113,
+            extra_args=["--moe-cache-slots", "88"],
+        )
+
+        with self.assertRaisesRegex(ProfileError, "moe_cache_slots_limit"):
+            ProfileRegistry.from_path(self._write([profile]))
+
     def test_moe_cache_profile_must_be_an_absolute_existing_file(self) -> None:
         for value in ("routing.csv", str(self.root / "missing.csv")):
             with self.subTest(value=value):
@@ -533,9 +561,44 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertNotIn("--ctx-checkpoints", args)
         self.assertNotIn("--mmproj", args)
         self.assertNotIn("-np 2", " ".join(args))
-        self.assertEqual(profile.environment["GGML_CUDA_DISABLE_GRAPHS"], "1")
-        self.assertEqual(profile.environment["GGML_CUDA_GRAPH_OPT"], "0")
         self.assertEqual(profile.environment["GGML_CUDA_PDL"], "0")
+        self.assertNotIn("GGML_CUDA_DISABLE_GRAPHS", profile.environment)
+        self.assertNotIn("GGML_CUDA_GRAPH_OPT", profile.environment)
+
+    def test_llamacpp_graph_controls_are_not_profile_requirements(self) -> None:
+        profile = self._profile("main", "main-27b", self.main_model)
+        profile["environment"] = {"GGML_CUDA_PDL": "0"}
+
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("main")
+
+        self.assertEqual(dict(parsed.environment), {"GGML_CUDA_PDL": "0"})
+
+    def test_launch_environment_scopes_graph_controls_to_autotune(self) -> None:
+        environment = {
+            "CUSTOM": "keep",
+            "GGML_CUDA_DISABLE_GRAPHS": "legacy",
+            "GGML_CUDA_GRAPH_OPT": "legacy",
+            "GGML_CUDA_PDL": "0",
+            "LLAMA_GRAPH_REUSE_DISABLE": "legacy",
+        }
+
+        normal = launch_environment(environment, runtime="llamacpp")
+        autotune = launch_environment(environment, runtime="llamacpp", autotune=True)
+
+        self.assertEqual(
+            normal,
+            {"CUSTOM": "keep", "GGML_CUDA_PDL": "0"},
+        )
+        self.assertEqual(
+            autotune,
+            {
+                "CUSTOM": "keep",
+                "GGML_CUDA_DISABLE_GRAPHS": "1",
+                "GGML_CUDA_GRAPH_OPT": "0",
+                "GGML_CUDA_PDL": "0",
+                "LLAMA_GRAPH_REUSE_DISABLE": "1",
+            },
+        )
 
     def test_vision_launch_prioritizes_mmproj_with_native_auto_placement(self) -> None:
         main = self._profile("main", "main-27b", self.main_model)
@@ -648,14 +711,6 @@ class ProfileRegistryTests(unittest.TestCase):
             8192,
         )
 
-    def test_cuda_graph_capture_disable_is_mandatory(self) -> None:
-        profile = self._profile("main", "main-27b", self.main_model)
-        environment = dict(profile["environment"])  # type: ignore[arg-type]
-        environment.pop("GGML_CUDA_DISABLE_GRAPHS")
-        profile["environment"] = environment
-        with self.assertRaisesRegex(ProfileError, "graph capture"):
-            ProfileRegistry.from_path(self._write([profile]))
-
     def test_kvarn_parallel_requires_explicit_multi_stream_opt_in(self) -> None:
         profile = self._profile(
             "kvarn",
@@ -674,10 +729,6 @@ class ProfileRegistryTests(unittest.TestCase):
         parsed = ProfileRegistry.from_path(self._write([profile])).get("kvarn")
         self.assertEqual(parsed.parallel, 2)
         self.assertEqual(parsed.environment["LLAMA_KVARN_MULTI_STREAM"], "1")
-
-        environment["GGML_CUDA_DISABLE_GRAPHS"] = "0"
-        with self.assertRaisesRegex(ProfileError, "graph capture"):
-            ProfileRegistry.from_path(self._write([profile]))
 
     def test_extra_args_cannot_override_broker_owned_safety_controls(self) -> None:
         profile = self._profile(

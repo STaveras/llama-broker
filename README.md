@@ -50,8 +50,10 @@ shown there.
   bounds from a validated manifest budget.
 - **Fail-closed profiles.** Each entry pins the runtime, model, optional
   projector (mmproj), SHA-256 hashes, context, cache types, and safety
-  environment. CUDA graph capture/optimization/PDL must be explicitly
-  disabled; unknown or empty model requests are rejected, never substituted.
+  environment. `GGML_CUDA_PDL=0` remains an explicit llama.cpp safety
+  invariant; CUDA graph capture/optimization controls are scoped to autotune
+  candidate units and are omitted from production units. Unknown or empty model
+  requests are rejected, never substituted.
 - **llama.cpp + vLLM runtimes.** A small runtime registry
   (`runtimes/`) owns each backend's complete command shape, so vLLM profiles
   emit `vllm serve MODEL` and llama.cpp profiles emit llama-server flags —

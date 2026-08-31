@@ -238,8 +238,6 @@ def _profile_record(runtime: RuntimeCandidate, model: ModelCandidate) -> dict[st
             },
         },
         "environment": {
-            "GGML_CUDA_DISABLE_GRAPHS": "1",
-            "GGML_CUDA_GRAPH_OPT": "0",
             "GGML_CUDA_PDL": "0",
         },
         "extra_args": ["--no-warmup", "--reasoning", "off"],
