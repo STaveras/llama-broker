@@ -235,6 +235,13 @@ def backend_endpoint_ready(host: str, port: int, timeout: float = 0.25) -> bool:
         return False
 
 
+def _backend_auth_headers(security: SecurityConfig) -> dict[str, str]:
+    keys = read_api_keys(security.api_key_file) if security.api_key_file else []
+    if not keys and security.api_key:
+        keys = [security.api_key]
+    return {"Authorization": f"Bearer {keys[-1]}"} if keys else {}
+
+
 def backend_serves_alias(
     host: str,
     port: int,
@@ -243,6 +250,7 @@ def backend_serves_alias(
     *,
     scheme: str = "http",
     ca_file: str | Path | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> bool:
     """Return whether the private backend advertises *alias* exactly."""
 
@@ -253,6 +261,7 @@ def backend_serves_alias(
         f"{scheme}://{host_for_url}:{port}",
         timeout=timeout,
         ca_file=ca_file,
+        default_headers=headers,
     )
     try:
         payload = client.list_models()
@@ -1282,6 +1291,7 @@ class BrokerApplication:
                 probe_timeout,
                 scheme=backend_parts.scheme or "http",
                 ca_file=self._backend_ca_file,
+                headers=_backend_auth_headers(self.security),
             )
         )
 
@@ -1505,6 +1515,7 @@ class BrokerApplication:
             self._backend_url,
             timeout=self.backend_timeout if timeout is None else timeout,
             ca_file=self._backend_ca_file,
+            default_headers=_backend_auth_headers(self.security),
         )
 
     def authentication_keys(self) -> tuple[str, ...]:
@@ -2539,6 +2550,7 @@ def _readiness_probe(
             backend_url,
             timeout=min(1.0, remaining),
             ca_file=security.backend_tls_ca_file,
+            default_headers=_backend_auth_headers(security),
         )
         try:
             payload = client.list_models()
