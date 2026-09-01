@@ -58,6 +58,7 @@ from .paths import (
     PROFILES_PATH as XDG_PROFILES_PATH,
     STATE_PATH as XDG_STATE_PATH,
     SYSTEMD_USER_DIR as XDG_SYSTEMD_USER_DIR,
+    migrate_legacy_state,
 )
 
 
@@ -724,6 +725,7 @@ class ProfileCoordinator:
         operation_name: str,
         *,
         force_after_drain_timeout: bool = False,
+        force_immediately: bool = False,
     ) -> bool:
         deadline = time.monotonic() + self._drain_timeout
         forced = False
@@ -734,6 +736,9 @@ class ProfileCoordinator:
                 while self._transitioning or self._active_requests > 0:
                     if self._shutdown_requested:
                         raise BrokerQuiescingError("Llama-Broker is shutting down")
+                    if force_immediately and not self._transitioning:
+                        forced = True
+                        break
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         if force_after_drain_timeout and not self._transitioning:
@@ -1079,7 +1084,7 @@ class ProfileCoordinator:
             raise
 
     def restart_when_idle(self, profile_id: str | None = None) -> Any:
-        """Drain active requests, then restart the currently active profile."""
+        """Immediately interrupt active requests, then restart the active profile."""
 
         with self._condition:
             target_profile = profile_id or self._active_profile
@@ -1093,7 +1098,17 @@ class ProfileCoordinator:
             self._condition.notify_all()
         self._queue_transition()
         operation_name = f"restart active profile {target_profile!r}"
-        self._wait_for_transition_slot(operation_name)
+        forced = self._wait_for_transition_slot(
+            operation_name,
+            force_immediately=True,
+        )
+        if forced:
+            with self._condition:
+                active_requests = self._active_requests
+            _log(
+                f"[broker] {operation_name} interrupting "
+                f"{active_requests} active request(s); restarting immediately"
+            )
         return self._run_transition(
             operation_name,
             lambda: self._restart_profile(target_profile),
@@ -2582,6 +2597,8 @@ def create_production_controller(
     shutdown_requested: threading.Event | None = None,
     security: SecurityConfig | None = None,
 ) -> BackendController:
+    if migrate_legacy_state():
+        _log(f"[broker] migrated controller state to {STATE_PATH}")
     security = security or load_security_config()
     security.validate()
     backend_listen_host = effective_backend_listen_host(security)
