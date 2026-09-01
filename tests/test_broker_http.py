@@ -1492,6 +1492,67 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(transitions, ["vision"])
         self.assertEqual(coordinator.active_profile, "vision")
 
+    def test_administrative_restart_interrupts_active_lease(self) -> None:
+        transitions: list[str] = []
+        restart_started = threading.Event()
+        release = threading.Event()
+
+        def restart(profile: str) -> None:
+            transitions.append(f"restart:{profile}")
+            restart_started.set()
+
+        coordinator = ProfileCoordinator(
+            "main",
+            lambda _profile: None,
+            restart_profile=restart,
+            drain_timeout=1,
+            transition_timeout=1,
+        )
+        entered = threading.Event()
+        request = threading.Thread(
+            target=lambda: self._hold_active_lease(coordinator, entered, release)
+        )
+        request.start()
+        self.assertTrue(entered.wait(timeout=1))
+
+        errors: list[BaseException] = []
+
+        def administrative_restart() -> None:
+            try:
+                coordinator.restart_when_idle()
+            except BaseException as error:
+                errors.append(error)
+
+        admin = threading.Thread(target=administrative_restart)
+        admin.start()
+        try:
+            self.assertTrue(
+                restart_started.wait(timeout=0.2),
+                "administrative restart must not drain an active request first",
+            )
+            self.assertEqual(transitions, ["restart:main"])
+            self.assertEqual(coordinator.active_requests, 1)
+        finally:
+            release.set()
+            admin.join(timeout=1)
+            request.join(timeout=1)
+
+        self.assertFalse(admin.is_alive())
+        self.assertFalse(request.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(coordinator.active_profile, "main")
+        self.assertEqual(coordinator.active_requests, 0)
+
+    @staticmethod
+    def _hold_active_lease(
+        coordinator: ProfileCoordinator,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        with coordinator.lease("main"):
+            entered.set()
+            release.wait(timeout=2)
+
     def test_administrative_stop_waits_for_active_lease(self) -> None:
         stops: list[str] = []
         coordinator = ProfileCoordinator(

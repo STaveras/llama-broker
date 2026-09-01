@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
+import tempfile
 
 
 def _home_path(env_name: str, fallback: Path) -> Path:
@@ -62,8 +64,9 @@ API_KEY_PATH = _override(
 )
 STATE_PATH = _override(
     "LLAMA_BROKER_STATE_FILE",
-    DATA_DIR / "state.json",
+    CONFIG_DIR / "state.json",
 )
+LEGACY_STATE_PATH = DATA_DIR / "state.json"
 LOCK_PATH = _override(
     "LLAMA_BROKER_LOCK_FILE",
     RUNTIME_STATE_DIR / "model-switch.lock",
@@ -72,3 +75,34 @@ PROCESS_LOCK_PATH = _override(
     "LLAMA_BROKER_PROCESS_LOCK_FILE",
     RUNTIME_STATE_DIR / "instance.lock",
 )
+
+
+def migrate_legacy_state() -> bool:
+    """Move the pre-config state file without overwriting a new state file."""
+
+    if STATE_PATH == LEGACY_STATE_PATH or STATE_PATH.exists() or not LEGACY_STATE_PATH.exists():
+        return False
+
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{STATE_PATH.name}.migrate-",
+        dir=STATE_PATH.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            with LEGACY_STATE_PATH.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        shutil.copymode(LEGACY_STATE_PATH, temporary)
+        try:
+            # A hard link creates the destination atomically and fails rather
+            # than overwriting state created by another process meanwhile.
+            os.link(temporary, STATE_PATH)
+        except FileExistsError:
+            return False
+        LEGACY_STATE_PATH.unlink(missing_ok=True)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
