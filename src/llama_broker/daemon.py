@@ -2512,6 +2512,14 @@ class LockedController:
     def state(self) -> dict[str, Any]:
         return self.controller.state()
 
+    def replace_profiles(self, profiles: Mapping[str, Profile]) -> None:
+        with _operation_lock(self.lock_path):
+            self.controller.replace_profiles(profiles)
+
+    def install_units(self) -> dict[str, Path]:
+        with _operation_lock(self.lock_path):
+            return self.controller.install_units()
+
     def switch(self, profile_id: str) -> dict[str, Any]:
         with _operation_lock(self.lock_path):
             return self.controller.switch(profile_id)
