@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .broker_profiles import Profile, ProfileError, _parse_profile
 from .profile_config import load_manifest, sha256_file
-from .runtime_builds import RuntimeBuildError, parse_runtime_builds
+from .runtime_builds import (
+    RuntimeBuildError,
+    external_catalog_for_manifest,
+    parse_runtime_builds,
+    resolve_profile_runtime,
+)
 
 
 @dataclass(frozen=True)
@@ -20,11 +26,22 @@ class ProfileInspection:
     reason: str = ""
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "profile_id": self.profile_id,
             "status": self.status,
             "reason": self.reason,
         }
+        if self.profile is not None:
+            result.update(
+                {
+                    "runtime": self.profile.runtime,
+                    "runtime_build": self.profile.runtime_build,
+                    "deployment_revision": self.profile.deployment_revision,
+                    "warnings": list(self.profile.warnings),
+                    "degraded_features": list(self.profile.degraded_features),
+                }
+            )
+        return result
 
 
 def _verify(profile: Profile) -> str | None:
@@ -54,9 +71,17 @@ def inspect_manifest(
     if not isinstance(raw_profiles, list):
         raise ProfileError("profile manifest must contain a profiles list")
     try:
-        runtime_builds = parse_runtime_builds(
-            payload.get("runtime_builds", []),
+        runtime_catalog = external_catalog_for_manifest(
+            payload,
             allow_missing_artifacts=not verify_artifacts,
+        )
+        runtime_builds = (
+            runtime_catalog.builds
+            if runtime_catalog is not None
+            else parse_runtime_builds(
+                payload.get("runtime_builds", []),
+                allow_missing_artifacts=not verify_artifacts,
+            )
         )
     except RuntimeBuildError as error:
         raise ProfileError(str(error)) from error
@@ -67,12 +92,19 @@ def inspect_manifest(
             continue
         profile_id = str(raw.get("id", f"<index:{index}>")).strip()
         try:
-            profile = _parse_profile(
+            resolved_raw, resolved_build = resolve_profile_runtime(
+                payload,
                 raw,
                 allow_missing_artifacts=not verify_artifacts,
-                runtime_builds=runtime_builds,
             )
-        except (ProfileError, ValueError, TypeError, OSError) as error:
+            profile = _parse_profile(
+                resolved_raw,
+                allow_missing_artifacts=not verify_artifacts,
+                runtime_builds=runtime_builds,
+                runtime_catalog=runtime_catalog,
+                resolved_runtime_build=resolved_build,
+            )
+        except (ProfileError, RuntimeBuildError, ValueError, TypeError, OSError) as error:
             inspections.append(ProfileInspection(profile_id, "broken", record=raw, reason=str(error)))
             continue
         failure = _verify(profile) if verify_artifacts else None
@@ -100,4 +132,10 @@ def filtered_manifest(payload: dict[str, Any], inspections: tuple[ProfileInspect
     records = [item.record for item in inspections if item.status == "ready" and item.record is not None]
     if not records:
         return None
-    return {"schema_version": 1, "profiles": records}
+    result = {
+        key: json.loads(json.dumps(value))
+        for key, value in payload.items()
+        if key != "profiles"
+    }
+    result["profiles"] = records
+    return result

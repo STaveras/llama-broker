@@ -12,7 +12,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-MODELS_DIR = Path(os.environ.get("MODELS_DIR", Path.home() / ".local/share/models")).expanduser()
+_models_dir_value = os.environ.get("LLAMA_BROKER_MODELS_DIR") or os.environ.get(
+    "MODELS_DIR", str(Path.home() / ".local/share/models")
+)
+MODELS_DIR = Path(_models_dir_value).expanduser()
 GENERATED_DIR = Path(os.environ.get("LLAMA_BROKER_GENERATED_DIR", ROOT / "generated"))
 AUXILIARY_PREFIXES = ("mmproj-", "mtp-")
 
@@ -124,6 +127,51 @@ def simple_alias(name: str, path: Path, metadata: dict[str, object]) -> str:
     return alias or slugify(path.stem)
 
 
+def canonical_model_target(
+    path: Path,
+    display_name: str,
+    metadata: dict[str, object],
+) -> str:
+    """Infer a variant-aware serving path; ambiguity is a hard error."""
+    source = f"{re.sub(r'[-_]copy$', '', path.stem)} {display_name}"
+    lowered = source.casefold()
+    family_match = re.search(r"(qwen[-_]?3[._-]?[568]|gemma[-_]?4)", lowered)
+    if family_match is None:
+        raise ValueError(f"ambiguous model family for {path}")
+    raw_family = family_match.group(1).replace("_", ".").replace("-", ".")
+    raw_family = re.sub(r"\.+", ".", raw_family)
+    family = "qwen-" + raw_family[4:] if raw_family.startswith("qwen") else "gemma-4"
+    parameter_match = re.search(
+        r"(?<![a-z0-9])([0-9]+(?:[._][0-9]+)?b)(?:[-_]([a-z][0-9]+b))?",
+        lowered,
+    )
+    if parameter_match is None:
+        raise ValueError(f"ambiguous model parameter count for {path}")
+    parameters = parameter_match.group(1).replace("_", ".")
+    if parameter_match.group(2):
+        parameters += "-" + parameter_match.group(2)
+    quant_match = re.search(
+        r"(?:^|[-_])(ud[-_]q[0-9]+(?:[-_][a-z0-9]+)*|q[0-9]+(?:[-_][a-z0-9]+)*|iq[0-9]+(?:[-_][a-z0-9]+)*|bf16|f16|f32)(?:[-_.]|$)",
+        re.sub(r"[-_]copy$", "", path.stem.casefold()),
+    )
+    if quant_match is None:
+        raise ValueError(f"ambiguous model quantization for {path}")
+    quant = quant_match.group(1).replace("_", "-")
+    variant = ""
+    if "antidoom" in lowered:
+        if quant.startswith("ud-"):
+            quant = quant.removeprefix("ud-")
+        if quant.endswith("-k"):
+            quant = quant[:-2]
+        variant = "-antidoom"
+        version = re.search(r"antidoom[-_]?v([0-9]+)", lowered)
+        if version:
+            variant += f"-v{version.group(1)}"
+    if "mtp" in lowered:
+        variant += "-mtp"
+    return f"{family}/{parameters}/{quant}{variant}.gguf"
+
+
 def discover() -> list[dict[str, object]]:
     if not MODELS_DIR.is_dir():
         return []
@@ -138,9 +186,17 @@ def discover() -> list[dict[str, object]]:
 
     used_aliases: set[str] = set()
     used_slugs: set[str] = set()
+    used_canonical: dict[str, Path] = {}
     records: list[dict[str, object]] = []
     for path in candidates:
         name, metadata = model_display_name(path)
+        canonical = canonical_model_target(path, name, metadata)
+        previous = used_canonical.get(canonical)
+        if previous is not None and previous != path:
+            raise ValueError(
+                f"canonical model target collision: {canonical} for {previous} and {path}"
+            )
+        used_canonical[canonical] = path
         slug_base = slugify(path.stem)
         slug = slug_base
         number = 2
@@ -163,6 +219,7 @@ def discover() -> list[dict[str, object]]:
                 "alias": alias,
                 "name": name,
                 "architecture": metadata.get("general.architecture", ""),
+                "canonical_path": str(MODELS_DIR / canonical),
                 # Keep the standardized models-root path even when it is a symlink.
                 "path": str(path.absolute()),
                 "size": path.stat().st_size,

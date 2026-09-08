@@ -126,7 +126,7 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 | `brokerctl integrate configure [TOOLS...]` | configure coding tools only |
 | `brokerctl integrate --dry-run` | show the combined integration plan and ask before applying it |
 | `brokerctl update` | deferred from 0.1.0; runtime acquisition is never automatic |
-| `brokerctl profiles list\|discover\|edit\|add` | profile management; profiles remain the canonical model-to-runtime binding and client naming source |
+| `brokerctl profiles list\|discover\|edit\|add` | profile management; `profile edit` opens a numbered selection menu when no model ID/alias is supplied; profiles remain the canonical model-to-runtime binding and client naming source |
 | `brokerctl profiles calibrate ... --autotemp` | (planned) hardware calibration with optional model-keyed behavioral evaluation |
 
 ## API and security
@@ -214,7 +214,46 @@ directly.
   target, clear the active alias, and do not automatically restore or restart
   the previous profile; structured `[broker-event]` JSON records the outcome.
 
-## Development
+## Canonical model and runtime store
+
+Broker-served artifacts use the XDG roots below:
+
+```text
+~/.local/share/models/
+~/.local/share/runtimes/catalog.json
+~/.local/share/runtimes/<runtime-bundle-id>/
+~/.cache/llama-broker/<family>/<model>/
+```
+
+The canonical overrides are `LLAMA_BROKER_MODELS_DIR`,
+`LLAMA_BROKER_RUNTIMES_DIR`, `LLAMA_BROKER_CACHE_DIR`, and
+`LLAMA_BROKER_RUNTIME_CATALOG`. Existing scripts retain `MODELS_DIR` as a
+compatibility fallback. The superseded `/home/stan/local/share/models` path is not used.
+
+Schema-v1 manifests with inline `runtime_builds` remain readable. Schema-v2
+manifests use `runtime_build` IDs and resolve executable, hash, bundle root,
+launch environment, repository, and provenance metadata from the external
+catalog. The manifest and catalog share a `deployment_revision`; mismatches
+fail closed. Profile IDs, aliases, restore targets, and serving settings are
+not rewritten by normal loading.
+
+The reusable migration tool is non-destructive by default:
+
+```bash
+python3 tools/model_store_migrate.py plan --profiles ~/.config/llama-broker/profiles.json --output migration-plan.json
+python3 tools/model_store_migrate.py stage --plan migration-plan.json
+python3 tools/model_store_migrate.py verify --plan migration-plan.json
+python3 tools/model_store_migrate.py apply --plan migration-plan.json --apply
+python3 tools/model_store_migrate.py cleanup --plan migration-plan.json --cleanup --confirm
+```
+
+`apply` and `cleanup` are separate gates. Staging verifies hashes and loader
+resolution without changing the manifest. Cleanup removes only exact paths
+recorded in the verified plan, after paired backups, broker-coordinated live
+smoke tests, and provenance checks succeed. Missing optional drafts or MoE
+cache files degrade the affected profile with warnings; missing required
+models, projectors, or runtimes fail closed.
+
 
 Offline-only regression suite — never starts a model, never touches systemd,
 and does not require GPUs, CUDA, model files, runtime binaries, drivers,

@@ -994,6 +994,45 @@ class BrokerctlProfileEditorTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             brokerctl.build_parser().parse_args(["profile", "configure"])
 
+    def test_edit_without_model_selects_from_numbered_menu(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            expected = json.loads(profiles.read_text(encoding="utf-8"))["profiles"][1]["id"]
+            output = io.StringIO()
+            with (
+                patch("builtins.input", return_value="2"),
+                redirect_stdout(output),
+            ):
+                selected = brokerctl._select_profile_for_edit(profiles)
+
+        self.assertEqual(selected, expected)
+        self.assertIn("Select a profile to edit", output.getvalue())
+        self.assertIn(expected, output.getvalue())
+
+    def test_edit_without_model_passes_menu_selection_to_tui(self) -> None:
+        from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+        class TTYBuffer(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            profiles = materialize_fixture(Path(tempdir))
+            output = TTYBuffer()
+            with (
+                patch.object(brokerctl, "_select_profile_for_edit", return_value="fixture-vision-12b"),
+                patch("llama_broker.broker_tui.run_tui", return_value=0) as run_tui,
+                patch.object(brokerctl.sys.stdin, "isatty", return_value=True),
+                redirect_stdout(output),
+            ):
+                result = brokerctl.main(["--profiles", str(profiles), "profile", "edit"])
+
+        self.assertEqual(result, 0)
+        run_tui.assert_called_once()
+        self.assertEqual(run_tui.call_args.args[1], "fixture-vision-12b")
+
     def test_profiles_state_command_is_removed(self) -> None:
         with self.assertRaises(SystemExit):
             brokerctl.build_parser().parse_args(["profile", "state"])

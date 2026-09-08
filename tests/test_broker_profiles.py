@@ -357,17 +357,25 @@ class ProfileRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "moe_cache_slots_limit"):
             ProfileRegistry.from_path(self._write([profile]))
 
-    def test_moe_cache_profile_must_be_an_absolute_existing_file(self) -> None:
+    def test_invalid_moe_cache_profile_degrades_without_blocking_profile(self) -> None:
         for value in ("routing.csv", str(self.root / "missing.csv")):
             with self.subTest(value=value):
                 profile = self._profile(
                     "moe",
                     "moe",
                     self.main_model,
-                    extra_args=["--moe-cache-profile", value],
+                    extra_args=[
+                        "--moe-cache-profile",
+                        value,
+                        "--moe-cache-slots",
+                        "4",
+                    ],
                 )
-                with self.assertRaisesRegex(ProfileError, "absolute existing file"):
-                    ProfileRegistry.from_path(self._write([profile]))
+                parsed = ProfileRegistry.from_path(self._write([profile])).get("moe")
+                self.assertTrue(parsed.warnings)
+                self.assertIn("moe", " ".join(parsed.warnings).lower())
+                self.assertIn("--moe-cache-profile", parsed.declared_extra_args)
+                self.assertNotIn("--moe-cache-profile", parsed.extra_args)
 
     def test_moe_cache_slots_are_nonnegative_and_bounded(self) -> None:
         for value in ("-1", "one", "9"):

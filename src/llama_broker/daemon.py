@@ -1728,15 +1728,37 @@ class BrokerApplication:
                 else "degraded"
             )
         )
+        profile = (
+            self.registry.try_resolve(str(profile_id))
+            if isinstance(profile_id, str)
+            else None
+        )
+        backend_state = {
+            "host": self.backend_host,
+            "port": self.backend_port,
+            **state,
+            "ready": ready,
+        }
+        if profile is not None:
+            backend_state.update(
+                {
+                    "runtime": getattr(profile, "runtime", None),
+                    "runtime_build": getattr(profile, "runtime_build", None),
+                    "deployment_revision": getattr(profile, "deployment_revision", None),
+                    "warnings": list(getattr(profile, "warnings", ())),
+                    "degraded_features": list(getattr(profile, "degraded_features", ())),
+                }
+            )
+        catalog_path = getattr(self.registry, "runtime_catalog_path", None)
+        deployment_revision = getattr(self.registry, "deployment_revision", None)
         return {
             "name": "Llama-Broker",
             "status": health_status,
-            "backend": {
-                "host": self.backend_host,
-                "port": self.backend_port,
-                **state,
-                "ready": ready,
+            "catalog": {
+                "path": str(catalog_path) if catalog_path else None,
+                "deployment_revision": deployment_revision,
             },
+            "backend": backend_state,
             "leases": self.coordinator.snapshot(),
             "maintenance": {
                 "autotune": self._autotune_lease.status(),

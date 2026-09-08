@@ -7,6 +7,7 @@ confirmation; these functions are deterministic and safe to exercise offline.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -129,6 +130,128 @@ def _iter_candidates(paths: Iterable[Path]) -> Iterable[Path]:
         for child in children:
             if child.is_file():
                 yield child
+
+
+def _inventory_metadata(path: Path, *, kind: str) -> dict[str, object]:
+    stat_result = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "kind": kind,
+        "size": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+    }
+
+
+def _initial_inventory(roots: Iterable[Path]) -> list[dict[str, object]]:
+    candidates: dict[Path, dict[str, object]] = {}
+    for raw in roots:
+        root = Path(raw).expanduser()
+        if not root.exists() and not root.is_symlink():
+            continue
+        paths: Iterable[Path]
+        if root.is_file():
+            paths = (root,)
+        elif root.is_dir():
+            try:
+                paths = root.rglob("*")
+            except OSError:
+                continue
+        else:
+            continue
+        try:
+            for candidate in paths:
+                if any(part.startswith(".") for part in candidate.relative_to(root).parts):
+                    continue
+                if ".git" in candidate.parts or not candidate.is_file():
+                    continue
+                resolved = candidate.resolve()
+                runtime = _runtime_for_path(resolved)
+                if runtime is not None and os.access(resolved, os.X_OK):
+                    candidates[resolved] = _inventory_metadata(resolved, kind="runtime")
+                elif resolved.suffix.casefold() in MODEL_SUFFIXES and os.access(resolved, os.R_OK):
+                    basename = resolved.name.casefold()
+                    kind = (
+                        "deferred"
+                        if basename.startswith(("ggml-vocab", "mmproj-", "mtp-"))
+                        else ("serving-candidate" if resolved.suffix.casefold() == ".gguf" else "deferred")
+                    )
+                    candidates[resolved] = _inventory_metadata(resolved, kind=kind)
+        except OSError:
+            continue
+    return [candidates[path] for path in sorted(candidates, key=lambda item: str(item))]
+
+
+def _write_catalog_atomically(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def ensure_runtime_catalog(
+    catalog_path: Path | str,
+    *,
+    inventory_roots: Iterable[Path],
+    referenced_paths: Iterable[Path] = (),
+    explicit_paths: Iterable[Path] = (),
+) -> dict[str, object]:
+    """Create the one-time inventory, then use the catalog as setup authority."""
+    path = Path(catalog_path).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"runtime catalog must be an absolute path: {path}")
+    path = path.resolve()
+    if not path.exists():
+        inventory = _initial_inventory(inventory_roots)
+        digest = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+        payload: dict[str, object] = {
+            "schema_version": 2,
+            "deployment_revision": "inventory-" + hashlib.sha256(digest).hexdigest()[:16],
+            "temporary_aliases": {},
+            "runtimes": [],
+            "inventory": inventory,
+        }
+        _write_catalog_atomically(path, payload)
+        return {
+            "mode": "initial-inventory",
+            "broad_scan": True,
+            "inventory_count": len(inventory),
+            "inventory_added": inventory,
+            "inspected_paths": [],
+        }
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"could not read runtime catalog {path}: {error}") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("runtimes", []), list):
+        raise ValueError(f"runtime catalog is invalid: {path}")
+    inspected: list[str] = []
+    for raw in (*referenced_paths, *explicit_paths):
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            inspected.append(str(candidate.resolve()))
+        else:
+            inspected.append(str(candidate))
+    inventory = payload.get("inventory", [])
+    inventory_count = len(inventory) if isinstance(inventory, list) else 0
+    return {
+        "mode": "catalog-first",
+        "broad_scan": False,
+        "inventory_count": inventory_count,
+        "inventory_added": [],
+        "inspected_paths": list(dict.fromkeys(inspected)),
+    }
 
 
 def discover_candidates(paths: Iterable[Path]) -> DiscoveryReport:

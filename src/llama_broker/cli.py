@@ -75,11 +75,12 @@ from .runtime_builds import (
 )
 from .runtimes import get_runtime_info, list_runtimes, runtime_names
 from .integration import filtered_manifest, inspect_manifest, report_for
-from .paths import MODELS_DIR
+from .paths import MODELS_DIR, RUNTIME_CATALOG_PATH, RUNTIMES_DIR
 from .setup_wizard import (
     apply_profile_plan,
     build_setup_plan,
     discover_candidates,
+    ensure_runtime_catalog,
     render_report,
 )
 from .autotune import (
@@ -221,6 +222,33 @@ def _service_exec_start() -> str:
     if installed:
         return installed
     return f"{sys.executable} {BROKER_DIR / 'llama_broker.py'}"
+
+
+def _profile_verification_result(
+    profile: Profile, *, verify_artifacts: bool = True
+) -> dict[str, object]:
+    failures = _verify_profile(profile) if verify_artifacts else []
+    return {
+        "id": profile.id,
+        "status": "ok" if not failures else "unverified",
+        "errors": failures,
+        "runtime": profile.runtime,
+        "runtime_build": profile.runtime_build,
+        "deployment_revision": profile.deployment_revision,
+        "bundle_root": str(profile.bundle_root) if profile.bundle_root else None,
+        "source_repository": (
+            str(profile.source_repository) if profile.source_repository else None
+        ),
+        "provenance_file": (
+            str(profile.provenance_file) if profile.provenance_file else None
+        ),
+        "source_branch": profile.source_branch,
+        "source_commit": profile.source_commit,
+        "dirty": profile.dirty,
+        "selected_profile_ids": list(profile.selected_profile_ids),
+        "warnings": list(profile.warnings),
+        "degraded_features": list(profile.degraded_features),
+    }
 
 
 def _verify_profile(profile: Profile) -> list[str]:
@@ -1104,24 +1132,93 @@ def _confirm_setup_plan(plan: object) -> bool:
     return answer in {"y", "yes"}
 
 
+def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
+    references: list[Path] = []
+    if profiles_path.is_file():
+        try:
+            payload = json.loads(profiles_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict) and isinstance(payload.get("profiles"), list):
+            for profile in payload["profiles"]:
+                if not isinstance(profile, dict):
+                    continue
+                for field_name in ("server_binary", "model_path", "mmproj_path", "model_draft"):
+                    value = profile.get(field_name)
+                    if isinstance(value, str):
+                        references.append(Path(value).expanduser())
+                extra_args = profile.get("extra_args", [])
+                if isinstance(extra_args, list):
+                    for index, value in enumerate(extra_args):
+                        if value == "--moe-cache-profile" and index + 1 < len(extra_args):
+                            references.append(Path(str(extra_args[index + 1])).expanduser())
+    try:
+        if RUNTIME_CATALOG_PATH.is_file() and profiles_path.is_file():
+            registry = ProfileRegistry.from_path(profiles_path, allow_missing_artifacts=True)
+            for profile in registry.profiles:
+                references.extend(
+                    path
+                    for path in (
+                        profile.server_binary,
+                        profile.model_path,
+                        profile.mmproj_path,
+                        profile.model_draft,
+                    )
+                    if path is not None
+                )
+    except (ProfileError, OSError, ValueError):
+        pass
+    unique: dict[str, Path] = {}
+    for path in references:
+        unique[str(path)] = path
+    return list(unique.values())
+
+
 def _cmd_setup_wizard(args: argparse.Namespace) -> int:
     """Discover existing artifacts and apply only an explicitly reviewed plan."""
+
+    catalog_was_missing = not RUNTIME_CATALOG_PATH.is_file()
+    referenced_paths = _setup_referenced_paths(args.profiles)
+    explicit_paths: list[Path] = []
+    if getattr(args, "runtime_path", None) is not None:
+        explicit_paths.append(Path(args.runtime_path).expanduser())
+    if getattr(args, "model_path", None) is not None:
+        explicit_paths.append(Path(args.model_path).expanduser())
+    try:
+        catalog_report = ensure_runtime_catalog(
+            RUNTIME_CATALOG_PATH,
+            inventory_roots=[RUNTIMES_DIR, MODELS_DIR],
+            referenced_paths=referenced_paths,
+            explicit_paths=explicit_paths,
+        )
+        print(
+            f"Runtime catalog: {catalog_report['mode']} "
+            f"(broad_scan={catalog_report['broad_scan']})"
+        )
+    except (OSError, ValueError) as error:
+        print(f"ERROR: runtime catalog setup failed: {error}", file=sys.stderr)
+        return 1
 
     scan_paths = [Path(item).expanduser() for item in getattr(args, "scan_path", [])]
     runtime_path = getattr(args, "runtime_path", None)
     model_path = getattr(args, "model_path", None)
     if runtime_path is not None:
-        scan_paths.append(Path(runtime_path).expanduser().parent)
+        runtime_candidate = Path(runtime_path).expanduser()
+        scan_paths.append(runtime_candidate.parent if catalog_was_missing else runtime_candidate)
     if model_path is not None:
-        scan_paths.append(Path(model_path).expanduser().parent)
+        model_candidate = Path(model_path).expanduser()
+        scan_paths.append(model_candidate.parent if catalog_was_missing else model_candidate)
     if not scan_paths:
-        scan_paths = [
-            Path.home() / "bin",
-            Path.home() / ".local" / "bin",
-            Path.home() / ".local" / "share" / "runtimes",
-            MODELS_DIR,
-        ]
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if catalog_was_missing:
+            scan_paths = [
+                Path.home() / "bin",
+                Path.home() / ".local" / "bin",
+                RUNTIMES_DIR,
+                MODELS_DIR,
+            ]
+        else:
+            scan_paths = [path for path in referenced_paths if path.exists()]
+        if catalog_was_missing and sys.stdin.isatty() and sys.stdout.isatty():
             print("Enter additional scan paths one at a time; press Enter when finished.")
             while True:
                 try:
@@ -2247,38 +2344,68 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
     """List registered runtimes and the profile-backed models selecting each."""
 
     registry = ProfileRegistry.from_path(args.profiles)
-    runtime_rows: list[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]]] = []
+    catalog_builds = registry.runtime_builds
+    runtime_rows: list[dict[str, object]] = []
     for runtime in list_runtimes():
         profiles = [
             profile
             for profile in registry.profiles
             if profile.runtime == runtime.name
         ]
-        runtime_rows.append(
-            (
-                runtime.name,
-                runtime.capabilities,
-                tuple((profile.id, profile.alias) for profile in profiles),
+        builds: list[dict[str, object]] = []
+        seen_builds: set[str] = set()
+        for build in catalog_builds:
+            if build.runtime != runtime.name or build.id in seen_builds:
+                continue
+            seen_builds.add(build.id)
+            builds.append(
+                {
+                    "id": build.id,
+                    "display_name": build.display_name,
+                    "runtime": build.runtime,
+                    "bundle_root": str(build.bundle_root) if build.bundle_root else None,
+                    "server_binary": str(build.server_binary),
+                    "server_sha256": build.server_sha256,
+                    "environment": dict(build.environment),
+                    "source_repository": (
+                        str(build.source_repository) if build.source_repository else None
+                    ),
+                    "provenance_file": (
+                        str(build.provenance_file) if build.provenance_file else None
+                    ),
+                    "source_branch": build.source_branch,
+                    "source_commit": build.source_commit,
+                    "dirty": build.dirty,
+                    "selected_profile_ids": list(build.selected_profile_ids),
+                    "aliases": list(build.aliases),
+                    "deprecated": build.deprecated,
+                }
             )
+        runtime_rows.append(
+            {
+                "name": runtime.name,
+                "capabilities": list(runtime.capabilities),
+                "profiles": [
+                    {"id": profile.id, "model": profile.alias}
+                    for profile in profiles
+                ],
+                "builds": builds,
+            }
         )
 
     if getattr(args, "json", False):
         print(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "object": "runtime_list",
-                    "data": [
-                        {
-                            "name": name,
-                            "capabilities": list(capabilities),
-                            "profiles": [
-                                {"id": profile_id, "model": model_id}
-                                for profile_id, model_id in profiles
-                            ],
-                        }
-                        for name, capabilities, profiles in runtime_rows
-                    ],
+                    "catalog_path": (
+                        str(registry.runtime_catalog_path)
+                        if registry.runtime_catalog_path
+                        else None
+                    ),
+                    "deployment_revision": registry.deployment_revision,
+                    "data": runtime_rows,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2292,11 +2419,13 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
 
     rows = [
         (
-            name,
-            ", ".join(model_id for _profile_id, model_id in profiles) or "(none)",
-            ", ".join(capabilities),
+            str(row["name"]),
+            ", ".join(
+                str(profile["model"]) for profile in row["profiles"]
+            ) or "(none)",
+            ", ".join(str(capability) for capability in row["capabilities"]),
         )
-        for name, capabilities, profiles in runtime_rows
+        for row in runtime_rows
     ]
     print(_render_table(("RUNTIME", "PROFILES", "CAPABILITIES"), rows))
     return 0
@@ -2380,6 +2509,55 @@ def _cmd_profiles_discover(args: argparse.Namespace) -> int:
 
 # ── Subcommand: profiles edit ───────────────────────────────────────────────
 
+def _select_profile_for_edit(profiles_path: Path) -> str | None:
+    """Prompt for an explicit profile selection before opening the editor."""
+    manifest = load_manifest_source(profiles_path, allow_missing_artifacts=True)
+    profiles = [
+        profile
+        for profile in manifest.get("profiles", [])
+        if isinstance(profile, dict) and isinstance(profile.get("id"), str)
+    ]
+    if not profiles:
+        print("No profiles configured.", file=sys.stderr)
+        return None
+
+    print("Select a profile to edit:")
+    for index, profile in enumerate(profiles, start=1):
+        profile_id = str(profile["id"])
+        alias = str(profile.get("alias", ""))
+        display_name = str(profile.get("display_name", alias or profile_id))
+        runtime_build = str(profile.get("runtime_build", profile.get("runtime", "")))
+        labels = [display_name, profile_id]
+        if alias and alias not in labels:
+            labels.append(alias)
+        if runtime_build:
+            labels.append(f"runtime={runtime_build}")
+        print(f"  {index}. {' | '.join(labels)}")
+
+    by_selector = {
+        selector: str(profile["id"])
+        for profile in profiles
+        for selector in (profile["id"], profile.get("alias"))
+        if isinstance(selector, str) and selector
+    }
+    while True:
+        try:
+            choice = input("Profile number or ID (blank/q to cancel): ").strip()
+        except EOFError:
+            print("\nEdit cancelled.")
+            return None
+        if not choice or choice.casefold() in {"q", "quit", "cancel"}:
+            print("Edit cancelled.")
+            return None
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(profiles):
+                return str(profiles[index - 1]["id"])
+        elif choice in by_selector:
+            return by_selector[choice]
+        print("Invalid selection; choose a listed number, profile ID, or alias.", file=sys.stderr)
+
+
 def _cmd_profiles_edit(args: argparse.Namespace) -> int:
     """Open the field-oriented editor or apply a compatibility flag edit."""
     flags = {
@@ -2418,10 +2596,16 @@ def _cmd_profiles_edit(args: argparse.Namespace) -> int:
 
     from .broker_tui import run_tui
 
+    selected_model = args.model
+    if selected_model is None:
+        selected_model = _select_profile_for_edit(args.profiles)
+        if selected_model is None:
+            return 0
+
     def apply_callback(updated: dict[str, object], changed_ids: set[str]) -> object:
         return _apply_profile_configuration(args.profiles, updated, changed_ids)
 
-    return run_tui(args.profiles, args.model, apply_callback=apply_callback)
+    return run_tui(args.profiles, selected_model, apply_callback=apply_callback)
 
 
 # ── Subcommand: profiles add ────────────────────────────────────────────────
@@ -3130,21 +3314,26 @@ def main(argv: list[str] | None = None) -> int:
             failures: list[str] = []
             results: list[dict[str, object]] = []
             for profile in profiles:
-                profile_failures = _verify_profile(profile)
+                result = _profile_verification_result(profile)
+                profile_failures = result["errors"]
+                assert isinstance(profile_failures, list)
                 failures.extend(profile_failures)
-                results.append(
-                    {
-                        "id": profile.id,
-                        "status": "ok" if not profile_failures else "unverified",
-                        "errors": profile_failures,
-                    }
-                )
+                results.append(result)
                 if not profile_failures and not getattr(args, "json", False):
                     print(f"verified: {profile.id}")
             if getattr(args, "json", False):
                 print(
                     json.dumps(
-                        {"schema_version": 1, "profiles": results},
+                        {
+                            "schema_version": 2,
+                            "catalog_path": (
+                                str(registry.runtime_catalog_path)
+                                if registry.runtime_catalog_path
+                                else None
+                            ),
+                            "deployment_revision": registry.deployment_revision,
+                            "profiles": results,
+                        },
                         indent=2,
                         sort_keys=True,
                     )
