@@ -912,13 +912,26 @@ def _curses_select(
 
     choices = list(dict.fromkeys([str(current), *options]))
     selected = choices.index(str(current)) if str(current) in choices else 0
+    scroll = 0
     while True:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
-        stdscr.addnstr(0, 0, f"{label} — choose a value" , max(width - 1, 1), curses.A_BOLD)
-        stdscr.addnstr(1, 0, "↑/↓ move  Enter select  Esc cancel", max(width - 1, 1))
-        row = 3
-        for choice_index, choice in enumerate(choices):
+
+        def draw_line(row: int, column: int, text: str, attr: int = 0) -> None:
+            # addnstr() raises curses.error when its starting cell is outside
+            # the window.  Dropdown entries can be taller than the viewport,
+            # so clip both the row and the available columns explicitly.
+            if not (0 <= row < height and 0 <= column < width):
+                return
+            count = width - column - 1
+            if count > 0:
+                stdscr.addnstr(row, column, text, count, attr)
+
+        draw_line(0, 0, f"{label} — choose a value", curses.A_BOLD)
+        draw_line(1, 0, "↑/↓ move  Enter select  Esc cancel")
+
+        rendered_choices: list[list[str]] = []
+        for choice in choices:
             choice_lines: list[str] = []
             for line in str(choice).splitlines() or [""]:
                 choice_lines.extend(
@@ -930,19 +943,40 @@ def _curses_select(
                     )
                     or [""]
                 )
-            for line_index, line in enumerate(choice_lines):
-                marker = (
-                    "●" if choice_index == selected else "○"
-                ) if line_index == 0 else " "
-                prefix = f"{marker} " if line_index == 0 else "  "
-                stdscr.addnstr(
-                    row,
-                    2,
-                    f"{prefix}{line}",
-                    max(width - 3, 1),
-                    curses.A_REVERSE if choice_index == selected else 0,
-                )
-                row += 1
+            rendered_choices.append(choice_lines or [""])
+
+        viewport_height = max(height - 3, 0)
+        if viewport_height:
+            starts: list[int] = []
+            line_count = 0
+            for choice_lines in rendered_choices:
+                starts.append(line_count)
+                line_count += len(choice_lines)
+
+            selected_start = starts[selected]
+            selected_end = selected_start + len(rendered_choices[selected])
+            if selected_start < scroll:
+                scroll = selected_start
+            elif selected_end > scroll + viewport_height:
+                scroll = selected_end - viewport_height
+            scroll = max(0, min(scroll, max(line_count - viewport_height, 0)))
+
+            line_number = 0
+            for choice_index, choice_lines in enumerate(rendered_choices):
+                for line_index, line in enumerate(choice_lines):
+                    if scroll <= line_number < scroll + viewport_height:
+                        marker = (
+                            "●" if choice_index == selected else "○"
+                        ) if line_index == 0 else " "
+                        prefix = f"{marker} " if line_index == 0 else "  "
+                        draw_line(
+                            3 + line_number - scroll,
+                            2,
+                            f"{prefix}{line}",
+                            curses.A_REVERSE if choice_index == selected else 0,
+                        )
+                    line_number += 1
+
         key = _read_curses_key(stdscr)
         if key in (27, ord("q")):
             return str(current), True

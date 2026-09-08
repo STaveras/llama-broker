@@ -11,6 +11,7 @@ from llama_broker.broker_tui import (
     EDITOR_FIELDS,
     TUIModel,
     _curses_prompt,
+    _curses_select,
     _read_curses_key,
     run_guided_wizard,
 )
@@ -190,6 +191,58 @@ class BrokerTUIModelTests(unittest.TestCase):
         model.set_field("display_name", value)
         assert model.current is not None
         self.assertEqual(model.current["display_name"], "New display name")
+
+    def test_curses_select_clips_multiline_choices_to_window(self) -> None:
+        import curses
+
+        class BoundsWindow:
+            def __init__(self, height: int, width: int, keys: list[int]) -> None:
+                self.height = height
+                self.width = width
+                self.keys = iter(keys)
+                self.rows: list[int] = []
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return self.height, self.width
+
+            def erase(self) -> None:
+                pass
+
+            def addnstr(self, row: int, column: int, _text: str, _count: int, *_args: int) -> None:
+                if not (0 <= row < self.height and 0 <= column < self.width):
+                    raise AssertionError(
+                        f"draw outside {self.height}x{self.width}: row={row}, column={column}"
+                    )
+                self.rows.append(row)
+
+            def getch(self) -> int:
+                return next(self.keys)
+
+        choices = tuple(
+            f"build-{index}\n  runtime: llamacpp\n  binary: /runtime/{index}\n  sha256: {'0' * 64}"
+            for index in range(6)
+        )
+        window = BoundsWindow(height=12, width=80, keys=[10])
+
+        value, cancelled = _curses_select(window, "Backend build", choices[0], choices)
+
+        self.assertEqual(value, choices[0])
+        self.assertFalse(cancelled)
+        self.assertTrue(window.rows)
+        self.assertLess(max(window.rows), window.height)
+
+        navigation_window = BoundsWindow(
+            height=12,
+            width=80,
+            keys=[curses.KEY_DOWN] * (len(choices) - 1) + [10],
+        )
+        value, cancelled = _curses_select(
+            navigation_window, "Backend build", choices[0], choices
+        )
+
+        self.assertEqual(value, choices[-1])
+        self.assertFalse(cancelled)
+        self.assertLess(max(navigation_window.rows), navigation_window.height)
 
     def test_alt_arrow_sequences_do_not_become_escape(self) -> None:
         import curses
