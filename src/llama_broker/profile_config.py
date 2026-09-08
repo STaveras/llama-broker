@@ -75,6 +75,7 @@ ADVANCED_FIELDS: tuple[str, ...] = (
     "environment",
     "extra_args",
     "model_draft",
+    "model_draft_sha256",
 )
 
 _GGUF_TYPES = {
@@ -148,7 +149,9 @@ def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
     if not isinstance(payload, dict):
         raise ProfileError("profile manifest must be a JSON object")
     schema = payload.get("schema_version")
-    if schema != 1:
+    if schema == 2:
+        pass
+    elif schema != 1:
         if schema not in (None, 0):
             raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
         migrated = _legacy_manifest_candidate(payload)

@@ -4,10 +4,10 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_DIR="${MODELS_DIR:-${HOME}/.local/share/models}"
+MODELS_DIR="${LLAMA_BROKER_MODELS_DIR:-${MODELS_DIR:-${HOME}/.local/share/models}}"
 
 if [[ "${1:-}" != "--download" ]]; then
-    exec env MODELS_DIR="$MODELS_DIR" python3 "$ROOT/sync-models.py"
+    exec env LLAMA_BROKER_MODELS_DIR="$MODELS_DIR" MODELS_DIR="$MODELS_DIR" python3 "$ROOT/sync-models.py"
 fi
 
 echo "=== Gemma Model Downloader ==="
@@ -68,7 +68,16 @@ case "$choice" in
 esac
 
 MODEL="${MODEL_PREFIX}-${QUANT}.gguf"
-OUTPUT_FILE="$MODELS_DIR/$MODEL"
+case "$choice" in
+    1) MODEL_RELATIVE_DIR="gemma-4/12b" ;;
+    2) MODEL_RELATIVE_DIR="gemma-4/e2b" ;;
+    3) MODEL_RELATIVE_DIR="gemma-4/e4b" ;;
+esac
+CANONICAL_QUANT="${QUANT,,}"
+CANONICAL_QUANT="${CANONICAL_QUANT//_/-}"
+OUTPUT_FILE="$MODELS_DIR/$MODEL_RELATIVE_DIR/$CANONICAL_QUANT.gguf"
+DOWNLOAD_DIR="$(dirname "$OUTPUT_FILE")"
+DOWNLOAD_FILE="$DOWNLOAD_DIR/$MODEL"
 
 echo ""
 echo "Downloading: $HF_REPO/$MODEL"
@@ -79,7 +88,7 @@ echo "This will take several minutes..."
 echo "Press Ctrl+C to cancel"
 echo ""
 
-mkdir -p "$(dirname "$OUTPUT_FILE")"
+mkdir -p "$DOWNLOAD_DIR"
 
 # Check if hf CLI is available (new huggingface_hub CLI)
 if ! command -v hf &> /dev/null; then
@@ -94,7 +103,11 @@ hf download \
     --repo-type model \
     "$HF_REPO" \
     "$MODEL" \
-    --local-dir "$MODELS_DIR"
+    --local-dir "$DOWNLOAD_DIR"
+
+if [ "$DOWNLOAD_FILE" != "$OUTPUT_FILE" ] && [ -f "$DOWNLOAD_FILE" ]; then
+    mv -- "$DOWNLOAD_FILE" "$OUTPUT_FILE"
+fi
 
 echo ""
 echo "Download complete!"

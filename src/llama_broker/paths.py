@@ -29,6 +29,16 @@ def _override(env_name: str, fallback: Path) -> Path:
     return path
 
 
+def _compat_override(env_name: str, legacy_env_name: str, fallback: Path) -> Path:
+    value = os.environ.get(env_name)
+    if not value:
+        value = os.environ.get(legacy_env_name)
+    path = Path(value).expanduser() if value else fallback
+    if not path.is_absolute():
+        raise ValueError(f"{env_name} must be an absolute path: {path}")
+    return path
+
+
 XDG_CONFIG_HOME = _home_path("XDG_CONFIG_HOME", Path.home() / ".config")
 XDG_DATA_HOME = _home_path("XDG_DATA_HOME", Path.home() / ".local" / "share")
 XDG_CACHE_HOME = _home_path("XDG_CACHE_HOME", Path.home() / ".cache")
@@ -38,9 +48,21 @@ XDG_RUNTIME_DIR = _home_path(
 
 CONFIG_DIR = _override("LLAMA_BROKER_CONFIG_DIR", XDG_CONFIG_HOME / "llama-broker")
 DATA_DIR = _override("LLAMA_BROKER_DATA_DIR", XDG_DATA_HOME / "llama-broker")
-MODELS_DIR = _override("LLAMA_BROKER_MODELS_DIR", XDG_DATA_HOME / "models")
+MODELS_DIR = _compat_override(
+    "LLAMA_BROKER_MODELS_DIR", "MODELS_DIR", XDG_DATA_HOME / "models"
+)
 RUNTIMES_DIR = _override("LLAMA_BROKER_RUNTIMES_DIR", XDG_DATA_HOME / "runtimes")
 CACHE_DIR = _override("LLAMA_BROKER_CACHE_DIR", XDG_CACHE_HOME / "llama-broker")
+RUNTIME_CATALOG_PATH = _override(
+    "LLAMA_BROKER_RUNTIME_CATALOG", RUNTIMES_DIR / "catalog.json"
+)
+RUNTIME_PROVENANCE_INDEX_PATH = _override(
+    "LLAMA_BROKER_RUNTIME_PROVENANCE_INDEX",
+    CONFIG_DIR / "runtime-provenance-index.json",
+)
+MIGRATIONS_DIR = _override(
+    "LLAMA_BROKER_MIGRATIONS_DIR", CONFIG_DIR / "migrations"
+)
 RUNTIME_STATE_DIR = _override(
     "LLAMA_BROKER_RUNTIME_DIR",
     XDG_RUNTIME_DIR / "llama-broker",

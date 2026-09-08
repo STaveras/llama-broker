@@ -79,10 +79,12 @@ class LlamaCppRuntime:
 
         if profile.mmproj_path is not None:
             args.extend(["--mmproj", str(profile.mmproj_path), "--mmproj-offload"])
-        if profile.model_draft is not None:
-            args.extend(["-md", str(profile.model_draft)])
+        effective_draft = getattr(profile, "effective_model_draft", profile.model_draft)
+        if effective_draft is not None:
+            args.extend(["-md", str(effective_draft)])
 
-        args.extend(profile.extra_args)
+        effective_extra_args = getattr(profile, "effective_extra_args", profile.extra_args)
+        args.extend(effective_extra_args)
         if "tools" in profile.capabilities:
             args.extend(["--tools", "all"])
 
