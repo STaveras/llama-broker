@@ -1031,6 +1031,22 @@ class BrokerHttpTests(unittest.TestCase):
         with self.assertRaisesRegex(BackendControllerError, "mmproj SHA mismatch"):
             llama_broker._verify_profile_artifacts(profile)
 
+    def test_profile_artifact_verifier_reuses_unchanged_hashes(self) -> None:
+        llama_broker._ARTIFACT_VERIFICATION_CACHE.clear()
+        profile = self.registry.get("main")
+
+        with patch.object(llama_broker, "sha256_file", wraps=sha256_file) as digest:
+            llama_broker._verify_profile_artifacts(profile)
+            first_call_count = digest.call_count
+            llama_broker._verify_profile_artifacts(profile)
+            self.assertGreater(first_call_count, 0)
+            self.assertEqual(digest.call_count, first_call_count)
+
+            Path(profile.model_path).write_bytes(b"changed-model")
+            with self.assertRaisesRegex(BackendControllerError, "model SHA mismatch"):
+                llama_broker._verify_profile_artifacts(profile)
+            self.assertGreater(digest.call_count, first_call_count)
+
     def test_failed_recovery_cannot_republish_dead_profile_as_active(self) -> None:
         application = self.broker.application  # type: ignore[attr-defined]
         application._backend_alias_ready = lambda _alias: False
