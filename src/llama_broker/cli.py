@@ -2709,27 +2709,27 @@ def _apply_profile_configuration(
 ) -> object:
     """Apply a wizard/TUI draft under the same lifecycle lock as model switches."""
 
-    with _operation_lock(LOCK_PATH):
-        before_registry = ProfileRegistry.from_path(profiles_path)
-        active_profile: str | None = None
-        try:
-            state = create_production_controller(before_registry).state()
-            if state.get("phase") == "active":
-                raw_active = state.get("profile")
-                active_profile = str(raw_active) if raw_active else None
-        except (BackendControllerError, OSError, KeyError):
-            # A stopped broker has no active lease; edits remain safe and units
-            # can be installed for the next controlled start.
-            active_profile = None
+    before_registry = ProfileRegistry.from_path(profiles_path)
+    active_profile: str | None = None
+    try:
+        state = create_production_controller(before_registry).state()
+        if state.get("phase") == "active":
+            raw_active = state.get("profile")
+            active_profile = str(raw_active) if raw_active else None
+    except (BackendControllerError, OSError, KeyError):
+        # A stopped broker has no active lease; edits remain safe and units
+        # can be installed for the next controlled start.
+        active_profile = None
 
-        def install_units() -> object:
-            if _is_authoritative_manifest(profiles_path):
-                # The live broker reload endpoint installs its own generated
-                # units after replacing the in-memory registry.
-                return None
-            registry = ProfileRegistry.from_path(profiles_path)
-            return create_production_controller(registry).install_units()
+    def install_units() -> object:
+        if _is_authoritative_manifest(profiles_path):
+            # The live broker reload endpoint installs its own generated
+            # units after replacing the in-memory registry.
+            return None
+        registry = ProfileRegistry.from_path(profiles_path)
+        return create_production_controller(registry).install_units()
 
+    def apply_transaction() -> object:
         try:
             return apply_manifest_transaction(
                 profiles_path,
@@ -2741,6 +2741,11 @@ def _apply_profile_configuration(
             )
         except ApplyError:
             raise
+
+    if _is_authoritative_manifest(profiles_path):
+        return apply_transaction()
+    with _operation_lock(LOCK_PATH):
+        return apply_transaction()
 
 
 # ── Argument parser ─────────────────────────────────────────────────────────

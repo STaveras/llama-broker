@@ -1033,6 +1033,26 @@ class BrokerctlProfileEditorTests(unittest.TestCase):
         run_tui.assert_called_once()
         self.assertEqual(run_tui.call_args.args[1], "fixture-vision-12b")
 
+    def test_authoritative_edit_does_not_hold_operation_lock_during_reload(self) -> None:
+        from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            profiles = materialize_fixture(Path(tempdir))
+            updated = json.loads(profiles.read_text(encoding="utf-8"))
+            updated["profiles"][0]["display_name"] = "updated"
+            controller = Mock()
+            controller.state.return_value = {"phase": "inactive", "profile": None}
+            with (
+                patch.object(brokerctl, "_is_authoritative_manifest", return_value=True),
+                patch.object(brokerctl, "_operation_lock", side_effect=AssertionError("lock held during reload")) as operation_lock,
+                patch.object(brokerctl, "create_production_controller", return_value=controller),
+                patch.object(brokerctl, "_refresh_live_profile_registry"),
+            ):
+                result = brokerctl._apply_profile_configuration(profiles, updated, {"fixture-text-7b"})
+
+        self.assertTrue(result.changed)
+        operation_lock.assert_not_called()
+
     def test_profiles_state_command_is_removed(self) -> None:
         with self.assertRaises(SystemExit):
             brokerctl.build_parser().parse_args(["profile", "state"])
