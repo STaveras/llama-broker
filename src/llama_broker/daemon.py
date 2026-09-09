@@ -77,6 +77,43 @@ LEGACY_SERVICE_UNIT = "llama-server.service"
 
 _DEFAULT_BACKEND_URL = "http://127.0.0.1:10000"
 
+_ARTIFACT_VERIFICATION_CACHE: dict[tuple[object, ...], None] = {}
+_ARTIFACT_VERIFICATION_CACHE_LOCK = threading.Lock()
+_ARTIFACT_VERIFICATION_CACHE_MAX = 1024
+
+
+def _artifact_verification_key(path: Path, expected: str) -> tuple[object, ...] | None:
+    """Return a process-local identity for a file and its expected digest."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (
+        str(path),
+        expected,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _artifact_verification_cached(key: tuple[object, ...] | None) -> bool:
+    if key is None:
+        return False
+    with _ARTIFACT_VERIFICATION_CACHE_LOCK:
+        return key in _ARTIFACT_VERIFICATION_CACHE
+
+
+def _remember_artifact_verification(key: tuple[object, ...] | None) -> None:
+    if key is None:
+        return
+    with _ARTIFACT_VERIFICATION_CACHE_LOCK:
+        _ARTIFACT_VERIFICATION_CACHE[key] = None
+        while len(_ARTIFACT_VERIFICATION_CACHE) > _ARTIFACT_VERIFICATION_CACHE_MAX:
+            _ARTIFACT_VERIFICATION_CACHE.pop(next(iter(_ARTIFACT_VERIFICATION_CACHE)))
+
 
 def _env_value(canonical: str, legacy: str, default: str) -> str:
     return os.environ.get(canonical, os.environ.get(legacy, default))
@@ -360,17 +397,26 @@ def _verify_profile_artifacts(profile: Any) -> None:
             raise BackendControllerError(
                 f"{profile.id} {kind} has no configured SHA-256 digest"
             )
+        key = _artifact_verification_key(path, str(expected))
+        if _artifact_verification_cached(key):
+            continue
         try:
             actual = sha256_file(path)
         except OSError as error:
             raise BackendControllerError(
                 f"{profile.id} {kind} is unavailable: {error}"
             ) from error
+        after_key = _artifact_verification_key(path, str(expected))
+        if key is not None and after_key != key:
+            raise BackendControllerError(
+                f"{profile.id} {kind} changed during verification: {path}"
+            )
         if actual != expected:
             raise BackendControllerError(
                 f"{profile.id} {kind} SHA mismatch: expected {expected}, "
                 f"got {actual} ({path})"
             )
+        _remember_artifact_verification(key)
 
 
 def apply_reasoning_policy(
