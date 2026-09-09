@@ -1768,6 +1768,22 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertEqual(rewritten["reasoning_effort"], effort)
                 self.assertEqual(rewritten["thinking_budget_tokens"], budget)
 
+    def test_experimental_effort_scaling_accepts_opencode_xhigh_alias(self) -> None:
+        rewritten = apply_reasoning_policy(
+            {
+                "max_tokens": 8192,
+                "reasoning_effort": "xhigh",
+            },
+            runtime="llamacpp",
+            max_output_tokens=131072,
+            request_max_output_tokens=8192,
+            batch_size=256,
+            ubatch_size=64,
+        )
+        self.assertEqual(rewritten["reasoning_effort"], "extra high")
+        self.assertEqual(rewritten["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(rewritten["thinking_budget_tokens"], 4096)
+
     def test_experimental_effort_scaling_preserves_explicit_budget(self) -> None:
         rewritten = apply_reasoning_policy(
             {
