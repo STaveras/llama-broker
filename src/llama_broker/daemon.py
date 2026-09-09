@@ -415,7 +415,10 @@ def apply_reasoning_policy(
     if effort is None and isinstance(raw_effort, str):
         effort = raw_effort
     if effort is not None:
-        effort = {"min": "minimal"}.get(effort.strip().casefold(), effort.strip().casefold())
+        effort = {
+            "min": "minimal",
+            "xhigh": "extra high",
+        }.get(effort.strip().casefold(), effort.strip().casefold())
 
     explicit_budget = (
         "reasoning_budget_tokens" in rewritten
