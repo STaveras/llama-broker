@@ -620,6 +620,293 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def _configure_runtime_builds(self) -> tuple[Path, Path]:
+        profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        default_server = Path(profile["server_binary"])
+        default_server.chmod(0o755)
+        upstream_server = self.root / "bin" / "upstream" / "llama-server"
+        upstream_server.parent.mkdir(parents=True, exist_ok=True)
+        upstream_server.write_bytes(b"upstream runtime build")
+        upstream_server.chmod(0o755)
+        self.data["runtime_builds"] = [
+            {
+                "id": "default-build",
+                "runtime": "llamacpp",
+                "display_name": "Default build",
+                "server_binary": str(default_server),
+                "server_sha256": brokerctl.sha256_file(default_server),
+                "environment": {"LD_LIBRARY_PATH": str(default_server.parent)},
+            },
+            {
+                "id": "upstream-build",
+                "runtime": "llamacpp",
+                "display_name": "Upstream build",
+                "server_binary": str(upstream_server),
+                "server_sha256": brokerctl.sha256_file(upstream_server),
+                "environment": {"LD_LIBRARY_PATH": str(upstream_server.parent)},
+            },
+        ]
+        profile["runtime_build"] = "default-build"
+        self.profiles.write_text(
+            json.dumps(self.data, indent=2) + "\n", encoding="utf-8"
+        )
+        return default_server, upstream_server
+
+    def test_profiles_add_parser_accepts_runtime_build(self) -> None:
+        args = brokerctl.build_parser().parse_args(
+            [
+                "profile",
+                "add",
+                "new-profile",
+                "--model",
+                "/tmp/model.gguf",
+                "--runtime-build",
+                "upstream-build",
+            ]
+        )
+
+        self.assertEqual(args.runtime_build, "upstream-build")
+
+    def test_profiles_add_selects_cataloged_runtime_build(self) -> None:
+        _default_server, upstream_server = self._configure_runtime_builds()
+        source_profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profile",
+                    "add",
+                    "upstream-test",
+                    "--model",
+                    source_profile["model_path"],
+                    "--runtime-build",
+                    "upstream-build",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        added = next(
+            item
+            for item in json.loads(self.profiles.read_text(encoding="utf-8"))["profiles"]
+            if item["id"] == "upstream-test"
+        )
+        self.assertEqual(added["runtime"], "llamacpp")
+        self.assertEqual(added["runtime_build"], "upstream-build")
+        self.assertEqual(added["server_binary"], str(upstream_server.resolve()))
+        self.assertEqual(added["server_sha256"], brokerctl.sha256_file(upstream_server))
+        self.assertEqual(
+            added["environment"]["LD_LIBRARY_PATH"], str(upstream_server.parent)
+        )
+
+    def test_profiles_add_selects_cross_runtime_build_without_template_fields(self) -> None:
+        default_server = Path(
+            next(
+                item
+                for item in self.data["profiles"]
+                if item["id"] == "fixture-text-7b"
+            )["server_binary"]
+        )
+        default_server.chmod(0o755)
+        vllm_binary = self.root / "bin" / "vllm"
+        vllm_binary.parent.mkdir(parents=True, exist_ok=True)
+        vllm_binary.write_bytes(b"vllm runtime build")
+        vllm_binary.chmod(0o755)
+        self.data["runtime_builds"] = [
+            {
+                "id": "default-build",
+                "runtime": "llamacpp",
+                "display_name": "Default build",
+                "server_binary": str(default_server),
+                "server_sha256": brokerctl.sha256_file(default_server),
+            },
+            {
+                "id": "vllm-build",
+                "runtime": "vllm",
+                "display_name": "vLLM build",
+                "server_binary": str(vllm_binary),
+                "server_sha256": brokerctl.sha256_file(vllm_binary),
+                "environment": {"VLLM_USE_V1": "1"},
+            },
+        ]
+        source_profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        source_profile["runtime_build"] = "default-build"
+        source_profile["environment"]["VLLM_USE_V1"] = "stale-source-setting"
+        self.profiles.write_text(
+            json.dumps(self.data, indent=2) + "\n", encoding="utf-8"
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profile",
+                    "add",
+                    "vllm-test",
+                    "--model",
+                    source_profile["model_path"],
+                    "--runtime-build",
+                    "vllm-build",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        added = next(
+            item
+            for item in json.loads(self.profiles.read_text(encoding="utf-8"))["profiles"]
+            if item["id"] == "vllm-test"
+        )
+        self.assertEqual(added["runtime"], "vllm")
+        self.assertEqual(added["runtime_build"], "vllm-build")
+        self.assertEqual(added["server_binary"], str(vllm_binary.resolve()))
+        self.assertEqual(added["environment"], {"VLLM_USE_V1": "1"})
+        for field in (
+            "batch_size",
+            "ubatch_size",
+            "cache_type_k",
+            "cache_type_v",
+            "flash_attention",
+            "gpu_layers",
+            "fit",
+            "mmproj_path",
+            "mmproj_sha256",
+        ):
+            self.assertNotIn(field, added)
+
+    def test_profiles_add_infers_vllm_build_when_template_runtime_is_omitted(self) -> None:
+        default_server = Path(
+            next(
+                item
+                for item in self.data["profiles"]
+                if item["id"] == "fixture-text-7b"
+            )["server_binary"]
+        )
+        default_server.chmod(0o755)
+        vllm_binary = self.root / "bin" / "vllm"
+        vllm_binary.parent.mkdir(parents=True, exist_ok=True)
+        vllm_binary.write_bytes(b"vllm inferred runtime build")
+        vllm_binary.chmod(0o755)
+        self.data["runtime_builds"] = [
+            {
+                "id": "default-build",
+                "runtime": "llamacpp",
+                "display_name": "Default build",
+                "server_binary": str(default_server),
+                "server_sha256": brokerctl.sha256_file(default_server),
+            },
+            {
+                "id": "vllm-build",
+                "runtime": "vllm",
+                "display_name": "vLLM build",
+                "server_binary": str(vllm_binary),
+                "server_sha256": brokerctl.sha256_file(vllm_binary),
+            },
+        ]
+        source_profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        source_profile["runtime_build"] = "default-build"
+        self.profiles.write_text(
+            json.dumps(self.data, indent=2) + "\n", encoding="utf-8"
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profile",
+                    "add",
+                    "vllm-inferred-test",
+                    "--model",
+                    source_profile["model_path"],
+                    "--server-binary",
+                    str(vllm_binary),
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        added = next(
+            item
+            for item in json.loads(self.profiles.read_text(encoding="utf-8"))["profiles"]
+            if item["id"] == "vllm-inferred-test"
+        )
+        self.assertEqual(added["runtime"], "vllm")
+        self.assertEqual(added["runtime_build"], "vllm-build")
+        self.assertEqual(added["server_binary"], str(vllm_binary.resolve()))
+
+    def test_profiles_add_infers_runtime_build_from_matching_binary(self) -> None:
+        _default_server, upstream_server = self._configure_runtime_builds()
+        source_profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profile",
+                    "add",
+                    "inferred-test",
+                    "--model",
+                    source_profile["model_path"],
+                    "--server-binary",
+                    str(upstream_server),
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        added = next(
+            item
+            for item in json.loads(self.profiles.read_text(encoding="utf-8"))["profiles"]
+            if item["id"] == "inferred-test"
+        )
+        self.assertEqual(added["runtime_build"], "upstream-build")
+        self.assertEqual(added["server_binary"], str(upstream_server.resolve()))
+
+    def test_profiles_add_rejects_conflicting_runtime_build_and_binary_atomically(self) -> None:
+        default_server, upstream_server = self._configure_runtime_builds()
+        source_profile = next(
+            item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"
+        )
+        before = self.profiles.read_bytes()
+        error = io.StringIO()
+
+        with redirect_stderr(error):
+            result = brokerctl.main(
+                [
+                    "--profiles",
+                    str(self.profiles),
+                    "profile",
+                    "add",
+                    "conflict-test",
+                    "--model",
+                    source_profile["model_path"],
+                    "--runtime-build",
+                    "upstream-build",
+                    "--server-binary",
+                    str(default_server),
+                ]
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(self.profiles.read_bytes(), before)
+        self.assertIn("does not match runtime build", error.getvalue())
+        self.assertNotIn("conflict-test", self.profiles.read_text(encoding="utf-8"))
+
     def test_live_profile_mutation_refreshes_broker_registry(self) -> None:
         output = io.StringIO()
         admin = Mock(return_value={"status": "ok"})

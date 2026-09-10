@@ -558,10 +558,104 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
     if not PROFILE_ID_RE.fullmatch(profile_id):
         raise ProfileError(f"invalid profile id: {profile_id!r}")
     record = _template_profile_record(data)
+
+    template_build = None
+    raw_template_build = record.get("runtime_build")
+    if isinstance(raw_template_build, str) and raw_template_build.strip():
+        try:
+            template_build = resolve_runtime_build(data, raw_template_build)
+        except ValueError as error:
+            raise ProfileError(str(error)) from error
+
+    requested_server_path = None
+    requested_server_sha256 = None
+    if args.server_binary:
+        requested_server_path = _normalise_existing_path(
+            args.server_binary, "server-binary"
+        )
+        requested_server_sha256 = sha256_file(requested_server_path)
+
+    selected_build = None
+    requested_runtime_build = getattr(args, "runtime_build", None)
+    if requested_runtime_build is not None:
+        try:
+            selected_build = resolve_runtime_build(data, requested_runtime_build)
+        except ValueError as error:
+            raise ProfileError(str(error)) from error
+    elif requested_server_path is not None:
+        selected_build = infer_runtime_build(
+            data,
+            {
+                "runtime": record.get("runtime"),
+                "server_binary": str(requested_server_path),
+                "server_sha256": requested_server_sha256,
+            },
+        )
+    if selected_build is None:
+        selected_build = template_build
+
+    if selected_build is not None:
+        if requested_server_path is not None and (
+            requested_server_path != selected_build.server_binary
+            or requested_server_sha256 != selected_build.server_sha256
+        ):
+            raise ProfileError(
+                f"server_binary {requested_server_path} does not match runtime build "
+                f"{selected_build.id!r}"
+            )
+        template_runtime = (
+            template_build.runtime
+            if template_build is not None
+            else str(record.get("runtime") or "llamacpp").strip().lower()
+        )
+        runtime_changed = template_runtime != selected_build.runtime
+        if runtime_changed:
+            editable_fields = get_runtime_info(selected_build.runtime).editable_fields
+            for field in tuple(record):
+                if field not in editable_fields:
+                    record.pop(field, None)
+            # Extra arguments are runtime-specific; callers can add new ones
+            # through --arg after the target runtime has been selected.
+            record["extra_args"] = []
+        record.update(
+            {
+                "runtime": selected_build.runtime,
+                "runtime_build": selected_build.id,
+                "server_binary": str(selected_build.server_binary),
+                "server_sha256": selected_build.server_sha256,
+            }
+        )
+        raw_environment = record.get("environment", {})
+        if not isinstance(raw_environment, dict):
+            raise ProfileError("environment must be a mapping for the new profile")
+        inherited_environment = {} if runtime_changed else dict(raw_environment)
+        if template_build is not None and not runtime_changed:
+            for key, value in template_build.environment.items():
+                if inherited_environment.get(key) == value:
+                    inherited_environment.pop(key)
+        if selected_build.runtime == "vllm":
+            inherited_environment = {
+                key: value
+                for key, value in inherited_environment.items()
+                if not key.startswith(("GGML_", "LLAMA_"))
+            }
+        environment = dict(selected_build.environment)
+        environment.update(inherited_environment)
+        if selected_build.runtime == "llamacpp":
+            environment.setdefault("GGML_CUDA_PDL", "0")
+        record["environment"] = environment
+    else:
+        server_path = requested_server_path or _normalise_existing_path(
+            str(record.get("server_binary", "")), "server-binary"
+        )
+        record["server_binary"] = str(server_path)
+        record["server_sha256"] = (
+            requested_server_sha256
+            if requested_server_sha256 is not None
+            else sha256_file(server_path)
+        )
+
     model_path = _normalise_existing_path(args.model, "model")
-    server_path = _normalise_existing_path(
-        args.server_binary or str(record.get("server_binary", "")), "server-binary"
-    )
     aliases = [item.strip() for item in (args.alias or [profile_id]) if item.strip()]
     if not aliases:
         raise ProfileError("at least one non-empty alias is required")
@@ -578,8 +672,6 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
     record.pop("fit", None)
     for key in ("fit_target_mib", "fit_ctx", "ctx_checkpoints", "cache_ram_mib"):
         record.pop(key, None)
-    record["server_binary"] = str(server_path)
-    record["server_sha256"] = sha256_file(server_path)
     record["model_path"] = str(model_path)
     record["model_sha256"] = sha256_file(model_path)
 
@@ -1727,7 +1819,7 @@ def _cmd_model_list(args: argparse.Namespace) -> int:
     rows = [
         (
             profile.alias,
-            profile.id,
+            profile.display_name,
             profile.runtime,
             ", ".join(sorted(profile.capabilities)),
             f"{profile.context_size:,}",
@@ -1737,7 +1829,14 @@ def _cmd_model_list(args: argparse.Namespace) -> int:
     ]
     print(
         _render_table(
-            ("MODEL", "PROFILE", "RUNTIME", "CAPABILITIES", "CONTEXT", "SLOTS"),
+            (
+                "PROFILE",
+                "MODEL",
+                "RUNTIME",
+                "CAPABILITIES",
+                "CONTEXT",
+                "SLOTS",
+            ),
             rows,
             width=_terminal_width(getattr(args, "width", None)),
         )
@@ -2567,20 +2666,59 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
         print("No runtimes registered.")
         return 0
 
-    rows = [
-        (
-            str(row["name"]),
-            ", ".join(
-                str(profile["model"]) for profile in row["profiles"]
-            ) or "(none)",
-            ", ".join(str(capability) for capability in row["capabilities"]),
+    # One row per (family, bundle) pair so the table reads:
+    # family -> bundle -> the profiles using that bundle. The family cell
+    # spans its bundle rows (blanked on continuation rows).
+    rows: list[tuple[str, str, str]] = []
+    for row in runtime_rows:
+        family = str(row["name"])
+        family_profiles = [
+            profile
+            for profile in registry.profiles
+            if profile.runtime == family
+        ]
+        # Catalog build ids for this family, in catalog order.
+        catalog_builds = [
+            str(build["id"]) for build in row["builds"]  # type: ignore[index]
+        ]
+        # Ordered, deduplicated bundle list: catalog order first, then any
+        # profile references not in the catalog.
+        ordered: list[str] = []
+        for build_id in catalog_builds:
+            if build_id not in ordered:
+                ordered.append(build_id)
+        for profile in family_profiles:
+            bundle_id = profile.runtime_build
+            if bundle_id is not None and bundle_id not in ordered:
+                ordered.append(bundle_id)
+        bundles = ordered if ordered else ["(none)"]
+        # Profiles grouped under each bundle, in registry order.
+        profiles_by_bundle: dict[str, list[str]] = {}
+        for profile in family_profiles:
+            profiles_by_bundle.setdefault(
+                profile.runtime_build or "(none)", []
+            ).append(profile.alias)
+        for bundle in bundles:
+            aliases = profiles_by_bundle.get(bundle)
+            rows.append(
+                (
+                    family,
+                    bundle,
+                    ", ".join(aliases) if aliases else "(none)",
+                )
+            )
+    # Blank the family cell on continuation rows (one family per visual block).
+    rendered: list[tuple[str, str, str]] = []
+    last_family: str | None = None
+    for family, bundle, profiles in rows:
+        rendered.append(
+            ("" if family == last_family else family, bundle, profiles)
         )
-        for row in runtime_rows
-    ]
+        last_family = family
     print(
         _render_table(
-            ("RUNTIME", "PROFILES", "CAPABILITIES"),
-            rows,
+            ("RUNTIME", "BUNDLE", "PROFILES"),
+            rendered,
             width=_terminal_width(getattr(args, "width", None)),
         )
     )
@@ -3165,6 +3303,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--alias", action="append", help="profile alias; repeat for more aliases")
     add.add_argument("--display-name", help="human-readable display name")
     add.add_argument("--role", choices=sorted(ALLOWED_ROLES), default=None)
+    add.add_argument("--runtime-build", help="select a concrete cataloged runtime build")
     add.add_argument("--server-binary", help="absolute llama-server binary path")
     add.add_argument("--context", type=int, help="context size")
     add.add_argument("--parallel", type=int, help="parallel slots")
