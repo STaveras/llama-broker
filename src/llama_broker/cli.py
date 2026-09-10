@@ -1525,22 +1525,171 @@ def _cmd_security_init(args: argparse.Namespace) -> int:
 
 # ── Subcommands: model list and profiles list ───────────────────────────────
 
-def _render_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
-    """Render a small dependency-free table for human-facing CLI output."""
+_DEFAULT_TABLE_WIDTH = 80
+_MIN_TABLE_WIDTH = 40
+_MIN_COLUMN_WIDTH = 8
+_COLUMN_GUTTER = 2
+
+
+def _terminal_width(explicit: int | None = None) -> int:
+    """Best available terminal width in columns, with a sane floor.
+
+    *explicit* wins when given; otherwise the controlling terminal is probed
+    and a conservative default is used for pipes and non-terminals.
+    """
+
+    columns = explicit if explicit is not None else shutil.get_terminal_size().columns
+    return max(int(columns), _MIN_TABLE_WIDTH)
+
+
+def _wrap_cell(text: str, width: int) -> list[str]:
+    """Word-wrap one cell so every line fits in *width* columns."""
+
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        line = ""
+        for word in words:
+            if len(word) > width:
+                # One token longer than the whole column: hard-break it so the
+                # table keeps its shape instead of silently overflowing.
+                for chunk in range(0, len(word), width):
+                    piece = word[chunk : chunk + width]
+                    if not line:
+                        line = piece
+                    else:
+                        lines.append(line)
+                        line = piece
+                continue
+            if not line:
+                line = word
+                continue
+            if len(line) + 1 + len(word) > width:
+                lines.append(line)
+                line = word
+            else:
+                line += " " + word
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _cell_width(text: str) -> int:
+    """Natural width of one cell: its longest raw line, ignoring wrapping.
+
+    Word-wrapping turns long text into *rows*, not *columns*, so a cell only
+    contributes as much width as its widest single line needs.
+    """
+
+    return max((len(line) for line in text.split("\n")), default=0)
+
+
+def _word_width(text: str) -> int:
+    """Widest single word in a cell; the floor below which wrapping hard-breaks."""
+
+    return max((len(word) for word in text.split()), default=0)
+
+
+def _allocate_widths(
+    natural: list[int], word_widths: list[int], budget: int
+) -> list[int]:
+    """Fit *natural* column widths into *budget* columns.
+
+    Phase 1 shrinks the widest columns' slack toward their word floor (no
+    hard-breaking, just more rows); phase 2, only when a word is wider than
+    the terminal, shrinks below the floor so wrapping hard-breaks it. Either
+    way the table fits the budget instead of overflowing.
+    """
+
+    widths = list(natural)
+    gutters = _COLUMN_GUTTER * (len(widths) - 1)
+    floors = [max(w, _MIN_COLUMN_WIDTH) for w in word_widths]
+
+    while sum(widths) + gutters > budget:
+        # Phase 1: give up slack above the word floor, widest first.
+        candidates = [i for i, w in enumerate(widths) if w > floors[i]]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda i: widths[i] - floors[i])
+        widths[widest] -= 1
+    # Phase 2: a word is wider than the terminal; hard-break below the floor.
+    while sum(widths) + gutters > budget:
+        candidates = [i for i, w in enumerate(widths) if w > _MIN_COLUMN_WIDTH]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda i: widths[i])
+        widths[widest] -= 1
+    return widths
+
+
+def _render_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[object]],
+    *,
+    width: int = _DEFAULT_TABLE_WIDTH,
+) -> str:
+    """Render a small dependency-free table for human-facing CLI output.
+
+    Columns size to their content when the table fits within *width* columns;
+    otherwise long cells wrap vertically so the output always fits the terminal
+    instead of scrolling sideways.
+    """
 
     rendered_rows = [[str(value) for value in row] for row in rows]
     rendered_headers = [str(header) for header in headers]
-    widths = [len(header) for header in rendered_headers]
-    for row in rendered_rows:
-        for index, value in enumerate(row):
-            widths[index] = max(widths[index], len(value))
+    columns = len(rendered_headers)
 
-    def render_row(row: Sequence[str]) -> str:
-        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+    def column_natural(index: int) -> int:
+        # As wide as the widest single line in the column.
+        return max(
+            _cell_width(rendered_headers[index]),
+            max((_cell_width(row[index]) for row in rendered_rows), default=0),
+        )
 
-    lines = [render_row(rendered_headers), render_row(["-" * width for width in widths])]
-    lines.extend(render_row(row) for row in rendered_rows)
-    return "\n".join(lines)
+    def column_word(index: int) -> int:
+        # As wide as the widest single word in the column.
+        return max(
+            _word_width(rendered_headers[index]),
+            max((_word_width(row[index]) for row in rendered_rows), default=0),
+        )
+
+    # Natural width of each column: as wide as its widest single line.
+    natural = [column_natural(index) for index in range(columns)]
+    word_widths = [column_word(index) for index in range(columns)]
+    if sum(natural) + _COLUMN_GUTTER * (columns - 1) > width:
+        natural = _allocate_widths(natural, word_widths, width)
+    widths = natural
+    header_cells = [_wrap_cell(header, widths[index]) for index, header in enumerate(rendered_headers)]
+    row_cells = [
+        [_wrap_cell(cell, widths[index]) for index, cell in enumerate(row)] for row in rendered_rows
+    ]
+
+    def render_block(cells: list[list[str]]) -> list[str]:
+        height = max(len(cell) for cell in cells)
+        lines: list[str] = []
+        for line_index in range(height):
+            parts = [
+                cell[line_index] if line_index < len(cell) else ""
+                for cell in cells
+            ]
+            line = (
+                _COLUMN_GUTTER * " "
+            ).join(
+                part.ljust(widths[index]) if index < columns - 1 else part
+                for index, part in enumerate(parts)
+            )
+            lines.append(line.rstrip())
+        return lines
+
+    parts: list[str] = []
+    parts.extend(render_block(header_cells))
+    parts.extend(render_block([["-" * widths[index]] for index in range(columns)]))
+    for row in row_cells:
+        parts.extend(render_block(row))
+    return "\n".join(parts)
 
 
 def _model_payload(profile: Profile) -> dict[str, object]:
@@ -1590,6 +1739,7 @@ def _cmd_model_list(args: argparse.Namespace) -> int:
         _render_table(
             ("MODEL", "PROFILE", "RUNTIME", "CAPABILITIES", "CONTEXT", "SLOTS"),
             rows,
+            width=_terminal_width(getattr(args, "width", None)),
         )
     )
     return 0
@@ -2427,7 +2577,13 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
         )
         for row in runtime_rows
     ]
-    print(_render_table(("RUNTIME", "PROFILES", "CAPABILITIES"), rows))
+    print(
+        _render_table(
+            ("RUNTIME", "PROFILES", "CAPABILITIES"),
+            rows,
+            width=_terminal_width(getattr(args, "width", None)),
+        )
+    )
     return 0
 
 
@@ -2797,6 +2953,11 @@ def build_parser() -> argparse.ArgumentParser:
         "list", help="list canonical model references from the profile manifest"
     )
     model_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    model_list.add_argument(
+        "--width",
+        type=int,
+        help="target output width in columns; the table wraps to fit instead of overflowing the terminal (default: detected terminal width)",
+    )
 
     status = subparsers.add_parser("status", help="show durable backend state")
     status.add_argument("-v", "--verbose", action="store_true", help="show full JSON state")
@@ -2880,6 +3041,11 @@ def build_parser() -> argparse.ArgumentParser:
         "list", help="list runtimes and the profile-backed models selecting each"
     )
     runtime_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    runtime_list.add_argument(
+        "--width",
+        type=int,
+        help="target output width in columns; the table wraps to fit instead of overflowing the terminal (default: detected terminal width)",
+    )
 
     security = subparsers.add_parser(
         "security", help="provision and rotate deployment-owned API-key and TLS material"
