@@ -1214,3 +1214,94 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RuntimeListTableWidthTests(unittest.TestCase):
+    """`runtime list` / table rendering must fit the terminal, never overflow."""
+
+    def _render(self, headers, rows, width=80) -> str:
+        return brokerctl._render_table(headers, rows, width=width)
+
+    def test_table_fits_terminal_width_and_keeps_content(self) -> None:
+        rows = [
+            (
+                "llamacpp",
+                "qwen3.5-9b, qwen3.5-9b-vision, qwen3.5-9b-antidoom, gemma4-12b, qwen3.8-27b, qwen3.8-27b-kvarn-bounded-accum-test",
+                "text, vision, tools, fit, speculative",
+            ),
+        ]
+        rendered = self._render(("RUNTIME", "PROFILES", "CAPABILITIES"), rows, width=80)
+        lines = rendered.splitlines()
+        for line in lines:
+            self.assertLessEqual(len(line), 80, f"line exceeds 80 cols: {line!r}")
+        # Content is preserved, just wrapped: join on newlines so multi-line
+        # cells are reassembled intact.
+        joined = "\n".join(lines)
+        # Header and separator are present.
+        self.assertIn("RUNTIME", joined)
+        self.assertIn("CAPABILITIES", joined)
+
+    def test_table_exact_width_when_content_is_small(self) -> None:
+        rendered = self._render(("RUNTIME", "PROFILES", "CAPABILITIES"), [
+            ("llamacpp", "one, two, three", "text"),
+        ])
+        lines = rendered.splitlines()
+        # Column widths are 8 (llamacpp), 15 (one, two, three), 12 (CAPABILITIES).
+        self.assertEqual(
+            lines[1].rstrip(),
+            "-" * 8 + "  " + "-" * 15 + "  " + "-" * 12,
+        )
+        self.assertEqual(lines[2].rstrip(), "llamacpp" + "  " + "one, two, three" + "  " + "text")
+        # When content is small the table hugs its content: no trailing stretch.
+        for line in lines:
+            self.assertLessEqual(len(line.rstrip()), 8 + 2 + 15 + 2 + 12)
+
+    def test_table_wraps_very_long_single_token(self) -> None:
+        token = "x" * 40
+        rendered = self._render(("A", "B"), [(token, "z")], width=40)
+        for line in rendered.splitlines():
+            self.assertLessEqual(len(line), 40)
+
+    def test_runtime_list_auto_width_needs_no_flag(self) -> None:
+        # Auto-detection: no --width given, output still fits the detected width.
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = brokerctl.main(["--profiles", str(profiles), "runtime", "list"])
+        self.assertEqual(result, 0)
+        rendered = output.getvalue()
+        detected = brokerctl.shutil.get_terminal_size().columns
+        for line in rendered.splitlines():
+            self.assertLessEqual(len(line), max(detected, brokerctl._MIN_TABLE_WIDTH))
+        self.assertIn("llamacpp", rendered)
+
+    def test_runtime_list_width_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = brokerctl.main(
+                    ["--profiles", str(profiles), "runtime", "list", "--width", "200"]
+                )
+        self.assertEqual(result, 0)
+        rendered = output.getvalue()
+        # At 200 cols nothing wraps: each comma-joined value stays on one line.
+        self.assertIn("fixture-text-7b, fixture-vision-12b", rendered)
+        for line in rendered.splitlines():
+            self.assertLessEqual(len(line), 200)
+
+    def test_model_list_accepts_width_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+            profiles = materialize_fixture(Path(tempdir))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = brokerctl.main(
+                    ["--profiles", str(profiles), "model", "list", "--width", "120"]
+                )
+        self.assertEqual(result, 0)
