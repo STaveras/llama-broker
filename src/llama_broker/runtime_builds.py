@@ -552,7 +552,8 @@ def infer_runtime_build(
     *,
     allow_missing_artifacts: bool = False,
 ) -> RuntimeBuild | None:
-    runtime = str(_profile_value(profile, "runtime", "llamacpp")).strip().lower()
+    raw_runtime = _profile_value(profile, "runtime")
+    runtime = str(raw_runtime).strip().lower() if raw_runtime else None
     server_binary = _profile_value(profile, "server_binary")
     server_sha256 = _profile_value(profile, "server_sha256")
     if not server_binary or not server_sha256:
@@ -565,7 +566,7 @@ def infer_runtime_build(
         for build in catalog_from_manifest(
             manifest, allow_missing_artifacts=allow_missing_artifacts
         )
-        if build.runtime == runtime
+        if (runtime is None or build.runtime == runtime)
         and build.server_binary == binary_path.resolve()
         and build.server_sha256 == str(server_sha256).strip().lower()
     ]

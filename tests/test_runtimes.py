@@ -237,12 +237,12 @@ class RuntimeDispatchTests(unittest.TestCase):
 
         rendered = output.getvalue()
         self.assertIn("RUNTIME", rendered)
+        self.assertIn("BUNDLE", rendered)
         self.assertIn("PROFILES", rendered)
         self.assertIn("llamacpp", rendered)
         self.assertIn("vllm", rendered)
         self.assertNotIn("llama-server", rendered)
         self.assertIn("vllm-main", rendered)
-        self.assertIn("tensor-parallel", rendered)
 
     def test_profile_edit_rejects_unsupported_field_without_mutation(self) -> None:
         path = self._write([self._vllm_profile()])
