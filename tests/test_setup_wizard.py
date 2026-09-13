@@ -314,6 +314,90 @@ class SetupWizardTests(unittest.TestCase):
             self.assertEqual(catalog.read_bytes(), catalog_before)
             self.assertFalse(models_dir.exists())
 
+    def test_schema2_inline_runtime_catalog_refuses_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles, catalog, runtime, model, _runtime_id, _revision, _digest = (
+                self._schema2_setup_fixture(root)
+            )
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+                create_model_link=True,
+            )
+            assert plan.runtime_build_record is not None
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data["runtime_builds"] = [plan.runtime_build_record]
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+            manifest_before = profiles.read_bytes()
+            catalog_before = catalog.read_bytes()
+            models_dir = root / "linked-models"
+
+            original_mkstemp = tempfile.mkstemp
+            with patch.dict(
+                os.environ,
+                {"LLAMA_BROKER_RUNTIME_CATALOG": str(catalog)},
+                clear=False,
+            ), patch("llama_broker.setup_wizard.os.replace") as replace, patch(
+                "llama_broker.setup_wizard.tempfile.mkstemp",
+                side_effect=original_mkstemp,
+            ) as mkstemp:
+                with self.assertRaisesRegex(
+                    ProfileError,
+                    r"schema 2.*external catalog.*runtime_builds",
+                ):
+                    apply_profile_plan(
+                        plan,
+                        profiles,
+                        models_dir=models_dir,
+                        create_model_link=True,
+                    )
+
+            replace.assert_not_called()
+            mkstemp.assert_not_called()
+            self.assertEqual(profiles.read_bytes(), manifest_before)
+            self.assertEqual(catalog.read_bytes(), catalog_before)
+            self.assertFalse(models_dir.exists())
+
+    def test_legacy_migration_rolls_back_when_profile_composition_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data.pop("schema_version")
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+            manifest_before = profiles.read_bytes()
+
+            existing_backup = profiles.with_name(f"{profiles.name}.bak-existing")
+            existing_backup.write_bytes(b"operator backup\n")
+            backups_before = {
+                path.name: path.read_bytes()
+                for path in profiles.parent.glob(f"{profiles.name}.bak-*")
+            }
+
+            runtime = root / "llama-server"
+            runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            runtime.chmod(0o755)
+            model = root / "fixture-text-7b.gguf"
+            model.write_bytes(b"new-model")
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+            )
+            self.assertIsNotNone(plan.profile_record)
+
+            with self.assertRaisesRegex(ValueError, r"profile already exists"):
+                apply_profile_plan(plan, profiles)
+
+            self.assertEqual(profiles.read_bytes(), manifest_before)
+            backups_after = {
+                path.name: path.read_bytes()
+                for path in profiles.parent.glob(f"{profiles.name}.bak-*")
+            }
+            self.assertEqual(backups_after, backups_before)
+
     def test_setup_plan_can_include_startup_and_integrate_operations(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
