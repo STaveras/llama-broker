@@ -179,6 +179,50 @@ class SetupWizardTests(unittest.TestCase):
 
             self.assertFalse(profiles.exists())
 
+    def test_schema1_setup_rejects_invalid_existing_profile_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data["schema_version"] = 1
+            data["profiles"][0]["context_size"] = 0
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+            manifest_before = profiles.read_bytes()
+
+            runtime = root / "llama-server"
+            runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            runtime.chmod(0o755)
+            model = root / "new-model.gguf"
+            model.write_bytes(b"new-model")
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+            )
+            self.assertIsNotNone(plan.profile_record)
+
+            with self.assertRaisesRegex(ProfileError, r"context_size.*positive integer"):
+                apply_profile_plan(plan, profiles)
+
+            self.assertEqual(profiles.read_bytes(), manifest_before)
+
+    def test_no_selection_does_not_migrate_legacy_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data.pop("schema_version")
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+            manifest_before = profiles.read_bytes()
+            plan = build_setup_plan(discover_candidates([root]))
+
+            self.assertIsNone(plan.profile_record)
+            result = apply_profile_plan(plan, profiles)
+
+            self.assertEqual(result["skipped"], ["no explicit selection"])
+            self.assertEqual(profiles.read_bytes(), manifest_before)
+            self.assertEqual(list(profiles.parent.glob(f"{profiles.name}.bak-*")), [])
+
     def test_apply_schema2_setup_reuses_catalog_build_id_without_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -353,6 +397,7 @@ class SetupWizardTests(unittest.TestCase):
 
             seed.profile_record["id"] = "added"
             seed.profile_record["alias"] = "added"
+            seed.profile_record["aliases"] = ["added"]
             apply_profile_plan(seed, profiles_path)
 
             saved = json.loads(profiles_path.read_text(encoding="utf-8"))
