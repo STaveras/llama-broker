@@ -462,73 +462,138 @@ def apply_profile_plan(
 
     original_manifest = profiles_path.read_bytes() if profiles_path.exists() else None
     original_mode = profiles_path.stat().st_mode & 0o777 if profiles_path.exists() else 0o600
+    existing_migration_backups = {
+        backup.name
+        for backup in profiles_path.parent.glob(f"{profiles_path.name}.bak-*")
+    }
     migration_published = False
-    if profiles_path.exists():
-        payload = load_manifest_source(profiles_path, validate=False)
-        migration_published = profiles_path.read_bytes() != original_manifest
-    else:
-        payload = {
-            "schema_version": 1,
-            "profiles": [],
-        }
-    source_schema = payload.get("schema_version", 1)
-
-    records = payload.get("profiles")
-    if not isinstance(records, list):
-        raise ValueError("profile manifest must contain a profiles list")
-
-    profile_record = dict(plan.profile_record)
-    if source_schema == 2:
-        try:
-            catalog_build = infer_runtime_build(payload, profile_record)
-        except RuntimeBuildError as error:
-            raise ProfileError(str(error)) from error
-        if catalog_build is None:
-            raise ProfileError(
-                "unknown runtime build: selected runtime is not registered in "
-                "the external runtime catalog"
-            )
-        profile_record["runtime_build"] = catalog_build.id
-        for field_name in ("runtime", "server_binary", "server_sha256"):
-            profile_record.pop(field_name, None)
-    else:
-        runtime_builds = payload.setdefault("runtime_builds", [])
-        if not isinstance(runtime_builds, list):
-            raise ValueError("profile manifest runtime_builds must be a list")
-        if plan.runtime_build_record is not None:
-            build_id = plan.runtime_build_record["id"]
-            existing_build = next(
-                (
-                    item
-                    for item in runtime_builds
-                    if isinstance(item, dict) and item.get("id") == build_id
-                ),
-                None,
-            )
-            if existing_build is None:
-                runtime_builds.append(plan.runtime_build_record)
-            elif existing_build != plan.runtime_build_record:
-                raise ValueError(
-                    f"runtime build already exists with different data: {build_id}"
-                )
-        if plan.runtime_build_record is not None:
-            profile_record["runtime_build"] = plan.runtime_build_record["id"]
-
-    profile_id = profile_record["id"]
-    if any(isinstance(item, dict) and item.get("id") == profile_id for item in records):
-        raise ValueError(f"profile already exists: {profile_id}")
-    records.append(profile_record)
-    validate_manifest(payload, directory=profiles_path.parent)
-
-    profiles_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=f".{profiles_path.name}.", dir=profiles_path.parent
-    )
-    temporary_path = Path(temp_name)
+    temporary_path: Path | None = None
     destination: Path | None = None
     created_link = False
     manifest_replaced = False
+
+    def _manifest_changed_since_snapshot() -> bool:
+        if original_manifest is None:
+            return profiles_path.exists()
+        try:
+            return profiles_path.read_bytes() != original_manifest
+        except OSError:
+            return True
+
+    def _restore_original_manifest() -> None:
+        if original_manifest is None:
+            profiles_path.unlink(missing_ok=True)
+            return
+        profiles_path.parent.mkdir(parents=True, exist_ok=True)
+        restore_fd, restore_name = tempfile.mkstemp(
+            prefix=f".{profiles_path.name}.rollback.",
+            dir=profiles_path.parent,
+        )
+        restore_path = Path(restore_name)
+        try:
+            with os.fdopen(restore_fd, "wb") as handle:
+                handle.write(original_manifest)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(restore_path, original_mode)
+            os.replace(restore_path, profiles_path)
+            directory_fd = os.open(profiles_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            restore_path.unlink(missing_ok=True)
+
+    def _rollback_state() -> None:
+        rollback_errors: list[str] = []
+        if created_link and destination is not None:
+            try:
+                destination.unlink(missing_ok=True)
+            except BaseException as error:
+                rollback_errors.append(str(error))
+        if manifest_replaced or migration_published or _manifest_changed_since_snapshot():
+            try:
+                _restore_original_manifest()
+            except BaseException as error:
+                rollback_errors.append(str(error))
+        try:
+            for backup in profiles_path.parent.glob(f"{profiles_path.name}.bak-*"):
+                if backup.name not in existing_migration_backups:
+                    backup.unlink()
+        except BaseException as error:
+            rollback_errors.append(str(error))
+        if rollback_errors:
+            raise RuntimeError("; ".join(rollback_errors))
+
     try:
+        if profiles_path.exists():
+            payload = load_manifest_source(profiles_path, validate=False)
+            migration_published = _manifest_changed_since_snapshot()
+        else:
+            payload = {
+                "schema_version": 1,
+                "profiles": [],
+            }
+        source_schema = payload.get("schema_version", 1)
+        if source_schema == 2 and "runtime_builds" in payload:
+            raise ProfileError(
+                "schema 2 uses the external catalog; remove the inline "
+                "runtime_builds key and repair the manifest separately"
+            )
+
+        records = payload.get("profiles")
+        if not isinstance(records, list):
+            raise ValueError("profile manifest must contain a profiles list")
+
+        profile_record = dict(plan.profile_record)
+        if source_schema == 2:
+            try:
+                catalog_build = infer_runtime_build(payload, profile_record)
+            except RuntimeBuildError as error:
+                raise ProfileError(str(error)) from error
+            if catalog_build is None:
+                raise ProfileError(
+                    "unknown runtime build: selected runtime is not registered in "
+                    "the external runtime catalog"
+                )
+            profile_record["runtime_build"] = catalog_build.id
+            for field_name in ("runtime", "server_binary", "server_sha256"):
+                profile_record.pop(field_name, None)
+        else:
+            runtime_builds = payload.setdefault("runtime_builds", [])
+            if not isinstance(runtime_builds, list):
+                raise ValueError("profile manifest runtime_builds must be a list")
+            if plan.runtime_build_record is not None:
+                build_id = plan.runtime_build_record["id"]
+                existing_build = next(
+                    (
+                        item
+                        for item in runtime_builds
+                        if isinstance(item, dict) and item.get("id") == build_id
+                    ),
+                    None,
+                )
+                if existing_build is None:
+                    runtime_builds.append(plan.runtime_build_record)
+                elif existing_build != plan.runtime_build_record:
+                    raise ValueError(
+                        f"runtime build already exists with different data: {build_id}"
+                    )
+            if plan.runtime_build_record is not None:
+                profile_record["runtime_build"] = plan.runtime_build_record["id"]
+
+        profile_id = profile_record["id"]
+        if any(isinstance(item, dict) and item.get("id") == profile_id for item in records):
+            raise ValueError(f"profile already exists: {profile_id}")
+        records.append(profile_record)
+        validate_manifest(payload, directory=profiles_path.parent)
+
+        profiles_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{profiles_path.name}.", dir=profiles_path.parent
+        )
+        temporary_path = Path(temp_name)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
@@ -551,35 +616,14 @@ def apply_profile_plan(
         os.replace(temporary_path, profiles_path)
         manifest_replaced = True
     except BaseException as error:
-        rollback_error: BaseException | None = None
         try:
-            if created_link and destination is not None:
-                destination.unlink(missing_ok=True)
-            if manifest_replaced or migration_published:
-                if original_manifest is None:
-                    profiles_path.unlink(missing_ok=True)
-                else:
-                    restore_fd, restore_name = tempfile.mkstemp(
-                        prefix=f".{profiles_path.name}.rollback.",
-                        dir=profiles_path.parent,
-                    )
-                    restore_path = Path(restore_name)
-                    try:
-                        with os.fdopen(restore_fd, "wb") as handle:
-                            handle.write(original_manifest)
-                            handle.flush()
-                            os.fsync(handle.fileno())
-                        os.chmod(restore_path, original_mode)
-                        os.replace(restore_path, profiles_path)
-                    finally:
-                        restore_path.unlink(missing_ok=True)
-        except BaseException as caught:
-            rollback_error = caught
-        if rollback_error is not None:
+            _rollback_state()
+        except BaseException as rollback_error:
             raise RuntimeError(f"setup rollback failed: {rollback_error}") from error
         raise
     finally:
-        temporary_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
     applied = ["profile"]
     if create_model_link:
