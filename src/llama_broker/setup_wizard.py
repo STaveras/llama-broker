@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .profile_config import load_manifest_source, sha256_file
+from .broker_profiles import ProfileError
+from .profile_config import load_manifest_source, sha256_file, validate_manifest
+from .runtime_builds import RuntimeBuildError, infer_runtime_build
 
 
 MODEL_SUFFIXES = frozenset({".gguf", ".safetensors", ".bin", ".pt", ".pth"})
@@ -451,44 +453,74 @@ def apply_profile_plan(
 
     if plan.errors:
         raise ValueError("; ".join(plan.errors))
-    if plan.profile_record is None:
-        return {"schema_version": 1, "applied": [], "skipped": ["no explicit selection"]}
 
     original_manifest = profiles_path.read_bytes() if profiles_path.exists() else None
     original_mode = profiles_path.stat().st_mode & 0o777 if profiles_path.exists() else 0o600
     migration_published = False
     if profiles_path.exists():
-        payload = load_manifest_source(profiles_path)
+        payload = load_manifest_source(profiles_path, validate=False)
         migration_published = profiles_path.read_bytes() != original_manifest
     else:
         payload = {
             "schema_version": 1,
             "profiles": [],
         }
+    source_schema = payload.get("schema_version", 1)
+
+    if plan.profile_record is None:
+        return {
+            "schema_version": source_schema,
+            "applied": [],
+            "skipped": ["no explicit selection"],
+        }
+
     records = payload.get("profiles")
     if not isinstance(records, list):
         raise ValueError("profile manifest must contain a profiles list")
-    runtime_builds = payload.setdefault("runtime_builds", [])
-    if not isinstance(runtime_builds, list):
-        raise ValueError("profile manifest runtime_builds must be a list")
-    if plan.runtime_build_record is not None:
-        build_id = plan.runtime_build_record["id"]
-        existing_build = next(
-            (item for item in runtime_builds if isinstance(item, dict) and item.get("id") == build_id),
-            None,
-        )
-        if existing_build is None:
-            runtime_builds.append(plan.runtime_build_record)
-        elif existing_build != plan.runtime_build_record:
-            raise ValueError(f"runtime build already exists with different data: {build_id}")
+
     profile_record = dict(plan.profile_record)
-    if plan.runtime_build_record is not None:
-        profile_record["runtime_build"] = plan.runtime_build_record["id"]
+    if source_schema == 2:
+        try:
+            catalog_build = infer_runtime_build(payload, profile_record)
+        except RuntimeBuildError as error:
+            raise ProfileError(str(error)) from error
+        if catalog_build is None:
+            raise ProfileError(
+                "unknown runtime build: selected runtime is not registered in "
+                "the external runtime catalog"
+            )
+        profile_record["runtime_build"] = catalog_build.id
+        for field_name in ("runtime", "server_binary", "server_sha256"):
+            profile_record.pop(field_name, None)
+    else:
+        runtime_builds = payload.setdefault("runtime_builds", [])
+        if not isinstance(runtime_builds, list):
+            raise ValueError("profile manifest runtime_builds must be a list")
+        if plan.runtime_build_record is not None:
+            build_id = plan.runtime_build_record["id"]
+            existing_build = next(
+                (
+                    item
+                    for item in runtime_builds
+                    if isinstance(item, dict) and item.get("id") == build_id
+                ),
+                None,
+            )
+            if existing_build is None:
+                runtime_builds.append(plan.runtime_build_record)
+            elif existing_build != plan.runtime_build_record:
+                raise ValueError(
+                    f"runtime build already exists with different data: {build_id}"
+                )
+        if plan.runtime_build_record is not None:
+            profile_record["runtime_build"] = plan.runtime_build_record["id"]
+
     profile_id = profile_record["id"]
     if any(isinstance(item, dict) and item.get("id") == profile_id for item in records):
         raise ValueError(f"profile already exists: {profile_id}")
     records.append(profile_record)
-    payload["schema_version"] = 1
+    if source_schema == 2:
+        validate_manifest(payload, directory=profiles_path.parent)
 
     profiles_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
@@ -554,4 +586,4 @@ def apply_profile_plan(
     applied = ["profile"]
     if create_model_link:
         applied.append("model_symlink")
-    return {"schema_version": 1, "applied": applied, "profile_id": profile_id}
+    return {"schema_version": source_schema, "applied": applied, "profile_id": profile_id}

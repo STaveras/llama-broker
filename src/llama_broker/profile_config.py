@@ -169,18 +169,22 @@ def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
 
 
 def load_manifest_source(
-    path: Path | str, *, allow_missing_artifacts: bool = False
+    path: Path | str,
+    *,
+    allow_missing_artifacts: bool = False,
+    validate: bool = True,
 ) -> dict[str, Any]:
     """Load the persisted manifest while preserving explicit inheritance links."""
 
     manifest_path, payload = _load_manifest_payload(path)
     try:
         resolve_manifest_inheritance(payload)
-        validate_manifest(
-            payload,
-            directory=manifest_path.parent,
-            allow_missing_artifacts=allow_missing_artifacts,
-        )
+        if validate:
+            validate_manifest(
+                payload,
+                directory=manifest_path.parent,
+                allow_missing_artifacts=allow_missing_artifacts,
+            )
     except ValueError as error:
         raise ProfileError(str(error)) from error
     return payload
