@@ -453,6 +453,12 @@ def apply_profile_plan(
 
     if plan.errors:
         raise ValueError("; ".join(plan.errors))
+    if plan.profile_record is None:
+        return {
+            "schema_version": 1,
+            "applied": [],
+            "skipped": ["no explicit selection"],
+        }
 
     original_manifest = profiles_path.read_bytes() if profiles_path.exists() else None
     original_mode = profiles_path.stat().st_mode & 0o777 if profiles_path.exists() else 0o600
@@ -466,13 +472,6 @@ def apply_profile_plan(
             "profiles": [],
         }
     source_schema = payload.get("schema_version", 1)
-
-    if plan.profile_record is None:
-        return {
-            "schema_version": source_schema,
-            "applied": [],
-            "skipped": ["no explicit selection"],
-        }
 
     records = payload.get("profiles")
     if not isinstance(records, list):
@@ -519,8 +518,7 @@ def apply_profile_plan(
     if any(isinstance(item, dict) and item.get("id") == profile_id for item in records):
         raise ValueError(f"profile already exists: {profile_id}")
     records.append(profile_record)
-    if source_schema == 2:
-        validate_manifest(payload, directory=profiles_path.parent)
+    validate_manifest(payload, directory=profiles_path.parent)
 
     profiles_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
