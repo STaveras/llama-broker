@@ -949,6 +949,14 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         print(f"ERROR: integration cannot read profiles: {error}", file=sys.stderr)
         return 1
 
+    manifest_profile_ids: frozenset[str] | None = None
+    if clean_requested:
+        try:
+            manifest_profile_ids = _safe_manifest_profile_ids(payload)
+        except (ProfileError, ValueError) as error:
+            print(f"ERROR: integration cannot establish safe manifest ownership: {error}", file=sys.stderr)
+            return 1
+
     ready = [item for item in inspections if item.status == "ready" and item.profile is not None]
     if not ready:
         result = report_for(inspections)
@@ -1154,7 +1162,12 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             applied_errors.append("stale unit cleanup skipped: no profile controller available")
         else:
             try:
-                removed_paths = tuple(controller.cleanup_stale_units())
+                assert manifest_profile_ids is not None
+                removed_paths = tuple(
+                    controller.cleanup_stale_units(
+                        manifest_profile_ids=manifest_profile_ids,
+                    )
+                )
                 cleanup_report["status"] = "removed" if removed_paths else "unchanged"
                 cleanup_report["removed"] = [Path(path).name for path in removed_paths]
                 cleanup_report["paths"] = [str(path) for path in removed_paths]
@@ -1276,6 +1289,24 @@ def _confirm_setup_plan(plan: object) -> bool:
     except EOFError:
         return False
     return answer in {"y", "yes"}
+
+
+def _safe_manifest_profile_ids(payload: Mapping[str, Any]) -> frozenset[str]:
+    """Return the complete manifest ID set or fail closed for cleanup."""
+    raw_profiles = payload.get("profiles")
+    if not isinstance(raw_profiles, list):
+        raise ProfileError("unsafe manifest profile id set: profiles must be a list")
+    profile_ids: list[str] = []
+    for index, raw_profile in enumerate(raw_profiles):
+        if not isinstance(raw_profile, dict):
+            raise ProfileError(f"unsafe manifest profile id at index {index}: profile is not an object")
+        profile_id = raw_profile.get("id")
+        if not isinstance(profile_id, str) or not PROFILE_ID_RE.fullmatch(profile_id):
+            raise ProfileError(f"unsafe manifest profile id at index {index}: {profile_id!r}")
+        if profile_id in profile_ids:
+            raise ProfileError(f"ambiguous manifest profile id: {profile_id!r} is duplicated")
+        profile_ids.append(profile_id)
+    return frozenset(profile_ids)
 
 
 def _setup_referenced_paths(profiles_path: Path) -> list[Path]:

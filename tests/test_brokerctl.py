@@ -1685,6 +1685,8 @@ class BrokerctlIntegrateCleanTests(unittest.TestCase):
         *,
         clean: bool,
         cleanup_error: Exception | None = None,
+        extra_manifest_ids: tuple[str, ...] = (),
+        systemd_available: bool = True,
     ) -> tuple[int, dict[str, object], Mock, list[str]]:
         profiles = materialize_fixture(root / "fixture")
         registry = ProfileRegistry.from_path(profiles)
@@ -1696,6 +1698,7 @@ class BrokerctlIntegrateCleanTests(unittest.TestCase):
         )
         inspection = ProfileInspection(profile.id, "ready", profile, record)
         payload = json.loads(profiles.read_text(encoding="utf-8"))
+        payload["profiles"].extend({"id": profile_id} for profile_id in extra_manifest_ids)
         controller = Mock()
         events: list[str] = []
         controller.unit_path.side_effect = lambda profile_id: root / f"{profile_id}.service"
@@ -1703,11 +1706,11 @@ class BrokerctlIntegrateCleanTests(unittest.TestCase):
         controller.install_units.side_effect = lambda: events.append("install")
         stale = (root / "old-profile.service", root / "old-profile-verify.service")
         if cleanup_error is None:
-            controller.cleanup_stale_units.side_effect = lambda: (
+            controller.cleanup_stale_units.side_effect = lambda **_kwargs: (
                 events.append("clean") or stale
             )
         else:
-            controller.cleanup_stale_units.side_effect = lambda: (
+            controller.cleanup_stale_units.side_effect = lambda **_kwargs: (
                 events.append("clean") or (_ for _ in ()).throw(cleanup_error)
             )
         template = root / "llama-broker.service.in"
@@ -1735,7 +1738,11 @@ class BrokerctlIntegrateCleanTests(unittest.TestCase):
             patch.object(brokerctl, "_service_exec_start", return_value="/bin/true"),
             patch.object(brokerctl, "_atomic_write"),
             patch.object(brokerctl.broker_runtime, "SYSTEMD_USER_DIR", root / "systemd"),
-            patch.dict(brokerctl.os.environ, {"DBUS_SESSION_BUS_ADDRESS": "test"}, clear=False),
+            patch.dict(
+                brokerctl.os.environ,
+                {"DBUS_SESSION_BUS_ADDRESS": "test" if systemd_available else ""},
+                clear=False,
+            ),
             redirect_stdout(output),
         ):
             result = brokerctl._cmd_integrate(args)
@@ -1750,7 +1757,9 @@ class BrokerctlIntegrateCleanTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(events, ["install", "clean"])
         controller.install_units.assert_called_once_with()
-        controller.cleanup_stale_units.assert_called_once_with()
+        controller.cleanup_stale_units.assert_called_once_with(
+            manifest_profile_ids={"fixture-text-7b", "fixture-vision-12b"}
+        )
         cleanup = next(
             operation
             for operation in report["operations"]
@@ -1776,6 +1785,80 @@ class BrokerctlIntegrateCleanTests(unittest.TestCase):
             [operation["action"] for operation in report["operations"]],
         )
 
+    def test_clean_uses_all_safe_manifest_ids_not_only_ready_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result, _report, controller, _events = self._run_install(
+                Path(temp),
+                clean=True,
+                extra_manifest_ids=("declared-but-unready",),
+            )
+
+        self.assertEqual(result, 0)
+        controller.cleanup_stale_units.assert_called_once_with(
+            manifest_profile_ids={
+                "fixture-text-7b",
+                "fixture-vision-12b",
+                "declared-but-unready",
+            }
+        )
+
+    def test_clean_refuses_ambiguous_manifest_ids_before_controller_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            registry = ProfileRegistry.from_path(profiles)
+            profile = registry.get("fixture-text-7b")
+            payload = json.loads(profiles.read_text(encoding="utf-8"))
+            payload["profiles"].append({"id": "unsafe/profile"})
+            inspection = ProfileInspection(
+                profile.id,
+                "ready",
+                profile,
+                next(item for item in payload["profiles"] if item["id"] == profile.id),
+            )
+            args = SimpleNamespace(
+                profiles=profiles,
+                full_verify=False,
+                json=True,
+                dry_run=False,
+                integrate_command="install",
+                install_units=True,
+                clean=True,
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    brokerctl,
+                    "inspect_manifest",
+                    return_value=(payload, (inspection,)),
+                ),
+                patch.object(brokerctl, "create_production_controller") as create_controller,
+                redirect_stderr(stderr),
+            ):
+                result = brokerctl._cmd_integrate(args)
+
+        self.assertEqual(result, 1)
+        create_controller.assert_not_called()
+        self.assertIn("unsafe manifest profile id", stderr.getvalue())
+
+    def test_clean_skips_without_systemd_and_reports_partial_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result, report, controller, events = self._run_install(
+                Path(temp), clean=True, systemd_available=False
+            )
+
+        self.assertEqual(result, 3)
+        self.assertEqual(events, [])
+        controller.cleanup_stale_units.assert_not_called()
+        cleanup = next(
+            operation
+            for operation in report["operations"]
+            if operation["action"] == "stale_unit_cleanup"
+        )
+        self.assertEqual(cleanup["status"], "skipped")
+        self.assertIn("systemd", cleanup["reason"])
+        self.assertTrue(any("cleanup skipped" in error for error in report["errors"]))
+
     def test_clean_failure_is_reported_as_partial_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             result, report, controller, events = self._run_install(
@@ -1786,7 +1869,9 @@ class BrokerctlIntegrateCleanTests(unittest.TestCase):
 
         self.assertEqual(result, 3)
         self.assertEqual(events, ["install", "clean"])
-        controller.cleanup_stale_units.assert_called_once_with()
+        controller.cleanup_stale_units.assert_called_once_with(
+            manifest_profile_ids={"fixture-text-7b", "fixture-vision-12b"}
+        )
         cleanup = next(
             operation
             for operation in report["operations"]
