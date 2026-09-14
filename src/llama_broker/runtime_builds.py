@@ -392,6 +392,14 @@ def external_catalog_for_manifest(
 ) -> RuntimeCatalog | None:
     """Return the external catalog for v2, or ``None`` for a v1 manifest."""
     schema = manifest.get("schema_version")
+    if schema is None:
+        return None
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        raise RuntimeBuildError(f"unsupported profile manifest schema_version: {schema!r}")
+    if schema == 0:
+        return None
+    if schema not in {1, 2}:
+        raise RuntimeBuildError(f"unsupported profile manifest schema_version: {schema!r}")
     if schema != 2:
         return None
     revision = manifest.get("deployment_revision")

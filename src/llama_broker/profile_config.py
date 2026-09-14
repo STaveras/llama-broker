@@ -140,7 +140,19 @@ def _create_migration_backup(path: Path) -> Path:
     return backup
 
 
-def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
+def legacy_manifest_candidate(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return a validated in-memory schema-1 candidate without writing it."""
+    return _legacy_manifest_candidate(payload)
+
+
+def create_migration_backup(path: Path | str) -> Path:
+    """Create the standard backup used when a legacy manifest is published."""
+    return _create_migration_backup(Path(path))
+
+
+def _load_manifest_payload(
+    path: Path | str, *, migrate: bool = True
+) -> tuple[Path, dict[str, Any]]:
     manifest_path = Path(path)
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -149,38 +161,50 @@ def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
     if not isinstance(payload, dict):
         raise ProfileError("profile manifest must be a JSON object")
     schema = payload.get("schema_version")
-    if schema == 2:
+    if isinstance(schema, bool) or (
+        schema is not None and not isinstance(schema, int)
+    ):
+        raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
+    if schema in (1, 2):
         pass
-    elif schema != 1:
-        if schema not in (None, 0):
-            raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
-        migrated = _legacy_manifest_candidate(payload)
-        if migrated is None:
-            raise ProfileError("profile manifest is ambiguous or unsupported for automatic migration")
-        _create_migration_backup(manifest_path)
-        try:
-            write_manifest_atomically(manifest_path, migrated)
-        except Exception as error:
-            raise ProfileError(f"profile manifest migration failed: {error}") from error
-        payload = migrated
+    elif schema in (None, 0):
+        if migrate:
+            migrated = _legacy_manifest_candidate(payload)
+            if migrated is None:
+                raise ProfileError(
+                    "profile manifest is ambiguous or unsupported for automatic migration"
+                )
+            _create_migration_backup(manifest_path)
+            try:
+                write_manifest_atomically(manifest_path, migrated)
+            except Exception as error:
+                raise ProfileError(f"profile manifest migration failed: {error}") from error
+            payload = migrated
+    else:
+        raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
     payload = copy.deepcopy(payload)
     payload.pop("default_profile", None)
     return manifest_path, payload
 
 
 def load_manifest_source(
-    path: Path | str, *, allow_missing_artifacts: bool = False
+    path: Path | str,
+    *,
+    allow_missing_artifacts: bool = False,
+    validate: bool = True,
+    migrate: bool = True,
 ) -> dict[str, Any]:
     """Load the persisted manifest while preserving explicit inheritance links."""
 
-    manifest_path, payload = _load_manifest_payload(path)
+    manifest_path, payload = _load_manifest_payload(path, migrate=migrate)
     try:
         resolve_manifest_inheritance(payload)
-        validate_manifest(
-            payload,
-            directory=manifest_path.parent,
-            allow_missing_artifacts=allow_missing_artifacts,
-        )
+        if validate:
+            validate_manifest(
+                payload,
+                directory=manifest_path.parent,
+                allow_missing_artifacts=allow_missing_artifacts,
+            )
     except ValueError as error:
         raise ProfileError(str(error)) from error
     return payload

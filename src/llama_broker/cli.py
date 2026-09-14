@@ -1227,6 +1227,7 @@ def _confirm_setup_plan(plan: object) -> bool:
 def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
     references: list[Path] = []
     if profiles_path.is_file():
+        payload: object = {}
         try:
             payload = json.loads(profiles_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1244,8 +1245,14 @@ def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
                     for index, value in enumerate(extra_args):
                         if value == "--moe-cache-profile" and index + 1 < len(extra_args):
                             references.append(Path(str(extra_args[index + 1])).expanduser())
+    raw_schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    strict_schema = (
+        isinstance(raw_schema, int)
+        and not isinstance(raw_schema, bool)
+        and raw_schema in {1, 2}
+    )
     try:
-        if RUNTIME_CATALOG_PATH.is_file() and profiles_path.is_file():
+        if RUNTIME_CATALOG_PATH.is_file() and profiles_path.is_file() and strict_schema:
             registry = ProfileRegistry.from_path(profiles_path, allow_missing_artifacts=True)
             for profile in registry.profiles:
                 references.extend(
@@ -1389,7 +1396,7 @@ def _cmd_setup_wizard(args: argparse.Namespace) -> int:
             models_dir=MODELS_DIR,
             create_model_link=bool(getattr(args, "link_model", False)),
         )
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (ApplyError, OSError, ValueError, json.JSONDecodeError) as error:
         print(f"ERROR: setup apply failed: {error}", file=sys.stderr)
         return 1
 
