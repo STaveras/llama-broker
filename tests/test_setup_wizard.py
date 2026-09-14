@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from llama_broker.broker_profiles import ProfileError, ProfileRegistry
+from llama_broker.profile_config import ApplyError
 from llama_broker.setup_wizard import (
     apply_profile_plan,
     build_setup_plan,
@@ -179,6 +181,108 @@ class SetupWizardTests(unittest.TestCase):
 
             self.assertFalse(profiles.exists())
 
+    def test_apply_revalidates_selected_artifacts_before_publication(self) -> None:
+        for changed_kind in ("runtime", "model"):
+            with self.subTest(changed_kind=changed_kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                runtime = root / "llama-server"
+                runtime.write_bytes(b"runtime-before")
+                runtime.chmod(0o755)
+                model = root / "new-model.gguf"
+                model.write_bytes(b"model-before")
+                plan = build_setup_plan(
+                    discover_candidates([runtime, model]),
+                    runtime_path=runtime,
+                    model_path=model,
+                    create_model_link=True,
+                )
+                profiles = root / "profiles.json"
+                models_dir = root / "models"
+
+                if changed_kind == "runtime":
+                    runtime.write_bytes(b"runtime-after")
+                else:
+                    model.write_bytes(b"model-after")
+
+                with self.assertRaisesRegex(ProfileError, r"artifact|SHA-256|hash|identity"):
+                    apply_profile_plan(
+                        plan,
+                        profiles,
+                        models_dir=models_dir,
+                        create_model_link=True,
+                    )
+
+                self.assertFalse(profiles.exists())
+                self.assertFalse(models_dir.exists())
+
+    def test_apply_fsyncs_manifest_directory_after_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = root / "llama-server"
+            runtime.write_bytes(b"runtime")
+            runtime.chmod(0o755)
+            model = root / "new-model.gguf"
+            model.write_bytes(b"model")
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+            )
+            profiles = root / "profiles.json"
+            events: list[str] = []
+            real_replace = os.replace
+            real_fsync = os.fsync
+
+            def record_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+                result = real_replace(source, destination)
+                if Path(destination) == profiles:
+                    events.append("replace")
+                return result
+
+            def record_fsync(fd: int) -> None:
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    events.append("directory_fsync")
+                return real_fsync(fd)
+
+            with patch("llama_broker.setup_wizard.os.replace", side_effect=record_replace), patch(
+                "llama_broker.setup_wizard.os.fsync", side_effect=record_fsync
+            ):
+                apply_profile_plan(plan, profiles)
+
+            self.assertEqual(events, ["replace", "directory_fsync"])
+
+    def test_apply_reports_original_and_rollback_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            runtime = root / "llama-server"
+            runtime.write_bytes(b"runtime")
+            runtime.chmod(0o755)
+            model = root / "new-model.gguf"
+            model.write_bytes(b"model")
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+            )
+            original_manifest = profiles.read_bytes()
+            real_fsync = os.fsync
+
+            def fail_directory_fsync(fd: int) -> None:
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise OSError("publish directory fsync failed")
+                return real_fsync(fd)
+
+            with patch(
+                "llama_broker.setup_wizard.os.fsync", side_effect=fail_directory_fsync
+            ), self.assertRaises(ApplyError) as raised:
+                apply_profile_plan(plan, profiles)
+
+            self.assertIn("setup apply failed", str(raised.exception))
+            self.assertIn("rollback also failed", str(raised.exception))
+            self.assertIn("publish directory fsync failed", str(raised.exception))
+            self.assertEqual(profiles.read_bytes(), original_manifest)
+
     def test_schema1_setup_rejects_invalid_existing_profile_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -271,6 +375,42 @@ class SetupWizardTests(unittest.TestCase):
                 )
 
             self.assertEqual(catalog.read_bytes(), catalog_before)
+
+    def test_schema2_apply_revalidates_catalog_artifacts_before_publication(self) -> None:
+        for changed_kind in ("runtime", "model"):
+            with self.subTest(changed_kind=changed_kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                profiles, catalog, runtime, model, _runtime_id, _revision, _digest = (
+                    self._schema2_setup_fixture(root)
+                )
+                plan = build_setup_plan(
+                    discover_candidates([runtime, model]),
+                    runtime_path=runtime,
+                    model_path=model,
+                    create_model_link=True,
+                )
+                manifest_before = profiles.read_bytes()
+                models_dir = root / "linked-models"
+                if changed_kind == "runtime":
+                    runtime.write_bytes(b"catalog-runtime-replaced")
+                else:
+                    model.write_bytes(b"new-model-replaced")
+
+                with patch.dict(
+                    os.environ,
+                    {"LLAMA_BROKER_RUNTIME_CATALOG": str(catalog)},
+                    clear=False,
+                ):
+                    with self.assertRaisesRegex(ProfileError, r"artifact|SHA-256|hash|identity"):
+                        apply_profile_plan(
+                            plan,
+                            profiles,
+                            models_dir=models_dir,
+                            create_model_link=True,
+                        )
+
+                self.assertEqual(profiles.read_bytes(), manifest_before)
+                self.assertFalse(models_dir.exists())
 
     def test_unregistered_schema2_setup_refuses_before_mutation_or_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -397,6 +537,53 @@ class SetupWizardTests(unittest.TestCase):
                 for path in profiles.parent.glob(f"{profiles.name}.bak-*")
             }
             self.assertEqual(backups_after, backups_before)
+
+    def test_legacy_rollback_preserves_concurrent_manifest_and_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data.pop("schema_version")
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+
+            existing_backup = profiles.with_name(f"{profiles.name}.bak-existing")
+            existing_backup.write_bytes(b"operator backup")
+            concurrent_backup = profiles.with_name(f"{profiles.name}.bak-concurrent")
+            concurrent_manifest = b"concurrent editor manifest\n"
+            concurrent_backup_bytes = b"concurrent editor backup\n"
+
+            runtime = root / "llama-server"
+            runtime.write_bytes(b"runtime")
+            runtime.chmod(0o755)
+            model = root / "new-model.gguf"
+            model.write_bytes(b"model")
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+            )
+
+            def concurrent_failure(
+                _manifest: dict[str, object], *, directory: Path | None = None
+            ) -> None:
+                profiles.write_bytes(concurrent_manifest)
+                concurrent_backup.write_bytes(concurrent_backup_bytes)
+                raise ValueError("later apply failure")
+
+            with patch(
+                "llama_broker.setup_wizard.validate_manifest",
+                side_effect=concurrent_failure,
+            ):
+                with self.assertRaisesRegex(ValueError, r"later apply failure"):
+                    apply_profile_plan(plan, profiles)
+
+            self.assertEqual(profiles.read_bytes(), concurrent_manifest)
+            self.assertEqual(existing_backup.read_bytes(), b"operator backup")
+            self.assertEqual(concurrent_backup.read_bytes(), concurrent_backup_bytes)
+            backup_names = {
+                path.name for path in profiles.parent.glob(f"{profiles.name}.bak-*")
+            }
+            self.assertEqual(backup_names, {existing_backup.name, concurrent_backup.name})
 
     def test_setup_plan_can_include_startup_and_integrate_operations(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -1389,7 +1389,7 @@ def _cmd_setup_wizard(args: argparse.Namespace) -> int:
             models_dir=MODELS_DIR,
             create_model_link=bool(getattr(args, "link_model", False)),
         )
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (ApplyError, OSError, ValueError, json.JSONDecodeError) as error:
         print(f"ERROR: setup apply failed: {error}", file=sys.stderr)
         return 1
 
