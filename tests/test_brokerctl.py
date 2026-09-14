@@ -13,6 +13,7 @@ from unittest.mock import Mock, call, patch
 import llama_broker.cli as brokerctl
 from llama_broker.broker_profiles import ProfileRegistry
 from llama_broker.discovery import DiscoveryResult
+from tests.fixtures import materialize_fixture
 
 
 class BrokerctlStatusTests(unittest.TestCase):
@@ -1645,3 +1646,32 @@ class BrokerctlSetupWizardApplyErrorTests(unittest.TestCase):
             self.assertIn("ERROR: setup apply failed", stderr.getvalue())
             self.assertIn("rollback also failed", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+
+
+class BrokerctlSetupReferenceScanTests(unittest.TestCase):
+    def test_reference_scan_does_not_migrate_unversioned_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data.pop("schema_version")
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+            catalog = root / "catalog.json"
+            catalog.write_text("{}\n", encoding="utf-8")
+            manifest_before = profiles.read_bytes()
+            backups_before = {
+                path.name: path.read_bytes()
+                for path in profiles.parent.glob(f"{profiles.name}.bak-*")
+            }
+
+            with patch.object(brokerctl, "RUNTIME_CATALOG_PATH", catalog):
+                brokerctl._setup_referenced_paths(profiles)
+
+            self.assertEqual(profiles.read_bytes(), manifest_before)
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in profiles.parent.glob(f"{profiles.name}.bak-*")
+                },
+                backups_before,
+            )
