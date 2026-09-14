@@ -13,6 +13,7 @@ from unittest.mock import Mock, call, patch
 import llama_broker.cli as brokerctl
 from llama_broker.broker_profiles import ProfileRegistry
 from llama_broker.discovery import DiscoveryResult
+from tests.fixtures import materialize_fixture
 
 
 class BrokerctlStatusTests(unittest.TestCase):
@@ -1592,3 +1593,85 @@ class RuntimeListTableWidthTests(unittest.TestCase):
                     ["--profiles", str(profiles), "model", "list", "--width", "120"]
                 )
         self.assertEqual(result, 0)
+
+
+class BrokerctlSetupWizardApplyErrorTests(unittest.TestCase):
+    def test_setup_wizard_reports_apply_error_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = SimpleNamespace(
+                profiles=root / "profiles.json",
+                runtime_path=root / "llama-server",
+                model_path=root / "model.gguf",
+                scan_path=[],
+                check=False,
+                json=False,
+                dry_run=False,
+                enable_startup=False,
+                allow_experimental=False,
+                link_model=False,
+                integrate=False,
+            )
+            plan = SimpleNamespace(
+                errors=(),
+                profile_record={"id": "new-profile"},
+                enable_startup=False,
+            )
+            stderr = io.StringIO()
+
+            with (
+                patch.object(brokerctl, "RUNTIME_CATALOG_PATH", root / "catalog.json"),
+                patch.object(brokerctl, "_setup_referenced_paths", return_value=[]),
+                patch.object(
+                    brokerctl,
+                    "ensure_runtime_catalog",
+                    return_value={"mode": "catalog-first", "broad_scan": False},
+                ),
+                patch.object(brokerctl, "discover_candidates", return_value=SimpleNamespace()),
+                patch.object(brokerctl, "build_setup_plan", return_value=plan),
+                patch.object(brokerctl, "_confirm_setup_plan", return_value=True),
+                patch.object(
+                    brokerctl,
+                    "apply_profile_plan",
+                    side_effect=brokerctl.ApplyError(
+                        "profile apply failed: original; rollback also failed: rollback"
+                    ),
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(stderr),
+            ):
+                result = brokerctl._cmd_setup_wizard(args)
+
+            self.assertEqual(result, 1)
+            self.assertIn("ERROR: setup apply failed", stderr.getvalue())
+            self.assertIn("rollback also failed", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+
+class BrokerctlSetupReferenceScanTests(unittest.TestCase):
+    def test_reference_scan_does_not_migrate_unversioned_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data.pop("schema_version")
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+            catalog = root / "catalog.json"
+            catalog.write_text("{}\n", encoding="utf-8")
+            manifest_before = profiles.read_bytes()
+            backups_before = {
+                path.name: path.read_bytes()
+                for path in profiles.parent.glob(f"{profiles.name}.bak-*")
+            }
+
+            with patch.object(brokerctl, "RUNTIME_CATALOG_PATH", catalog):
+                brokerctl._setup_referenced_paths(profiles)
+
+            self.assertEqual(profiles.read_bytes(), manifest_before)
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in profiles.parent.glob(f"{profiles.name}.bak-*")
+                },
+                backups_before,
+            )
