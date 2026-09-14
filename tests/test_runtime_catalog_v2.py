@@ -262,6 +262,20 @@ class ExternalRuntimeCatalogTests(unittest.TestCase):
         self.assertNotIn("--moe-cache-slots", args)
         self.assertNotIn("-md", args)
 
+    def test_manifest_schema_version_must_be_a_strict_supported_integer(self) -> None:
+        original = self.profiles.read_bytes()
+        for invalid_schema in (True, False, 1.0, 2.0, "1", "2"):
+            with self.subTest(invalid_schema=invalid_schema):
+                self.data["schema_version"] = invalid_schema
+                self.profiles.write_text(json.dumps(self.data), encoding="utf-8")
+                with patch.dict(
+                    os.environ,
+                    {"LLAMA_BROKER_RUNTIME_CATALOG": str(self.catalog)},
+                    clear=False,
+                ), self.assertRaisesRegex(ProfileError, "schema_version"):
+                    ProfileRegistry.from_path(self.profiles)
+                self.profiles.write_bytes(original)
+
 
 if __name__ == "__main__":
     unittest.main()

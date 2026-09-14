@@ -283,6 +283,86 @@ class SetupWizardTests(unittest.TestCase):
             self.assertIn("publish directory fsync failed", str(raised.exception))
             self.assertEqual(profiles.read_bytes(), original_manifest)
 
+    def test_failed_manifest_load_does_not_claim_concurrent_migration_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            profiles = materialize_fixture(root / "fixture")
+            data = json.loads(profiles.read_text(encoding="utf-8"))
+            data.pop("schema_version")
+            profiles.write_text(json.dumps(data), encoding="utf-8")
+            runtime = root / "llama-server"
+            runtime.write_bytes(b"runtime")
+            runtime.chmod(0o755)
+            model = root / "new-model.gguf"
+            model.write_bytes(b"model")
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+            )
+            concurrent_manifest = b"concurrent manifest\n"
+            concurrent_backup = profiles.with_name(f"{profiles.name}.bak-concurrent")
+            concurrent_backup_bytes = b"concurrent backup\n"
+
+            def failed_load(_path: Path, **_kwargs: object) -> dict[str, object]:
+                profiles.write_bytes(concurrent_manifest)
+                concurrent_backup.write_bytes(concurrent_backup_bytes)
+                raise ValueError("manifest load failed")
+
+            with patch(
+                "llama_broker.setup_wizard.load_manifest_source",
+                side_effect=failed_load,
+            ), self.assertRaisesRegex(ValueError, "manifest load failed"):
+                apply_profile_plan(plan, profiles)
+
+            self.assertEqual(profiles.read_bytes(), concurrent_manifest)
+            self.assertEqual(concurrent_backup.read_bytes(), concurrent_backup_bytes)
+
+    def test_model_link_rollback_preserves_concurrent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = root / "llama-server"
+            runtime.write_bytes(b"runtime")
+            runtime.chmod(0o755)
+            model = root / "new-model.gguf"
+            model.write_bytes(b"model")
+            plan = build_setup_plan(
+                discover_candidates([runtime, model]),
+                runtime_path=runtime,
+                model_path=model,
+                create_model_link=True,
+            )
+            profiles = root / "profiles.json"
+            models_dir = root / "models"
+            replacement = root / "replacement.gguf"
+            replacement.write_bytes(b"replacement")
+            calls = 0
+
+            def fail_after_link(*_args: object, **_kwargs: object) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return
+                destination = models_dir / model.name
+                destination.unlink()
+                destination.symlink_to(replacement)
+                raise ValueError("failure after model link")
+
+            with patch(
+                "llama_broker.setup_wizard._validate_setup_artifacts",
+                side_effect=fail_after_link,
+            ), self.assertRaisesRegex(ValueError, "failure after model link"):
+                apply_profile_plan(
+                    plan,
+                    profiles,
+                    models_dir=models_dir,
+                    create_model_link=True,
+                )
+
+            destination = models_dir / model.name
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(destination.resolve(), replacement.resolve())
+
     def test_schema1_setup_rejects_invalid_existing_profile_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

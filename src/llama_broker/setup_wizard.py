@@ -8,16 +8,27 @@ confirmation; these functions are deterministic and safe to exercise offline.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
+import stat
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from .broker_profiles import ProfileError
-from .profile_config import ApplyError, load_manifest_source, sha256_file, validate_manifest
+from .profile_config import (
+    ApplyError,
+    create_migration_backup,
+    legacy_manifest_candidate,
+    load_manifest_source,
+    sha256_file,
+    validate_manifest,
+)
+from .paths import LOCK_PATH
 from .runtime_builds import RuntimeBuild, RuntimeBuildError, infer_runtime_build
 
 
@@ -564,7 +575,42 @@ def _validate_setup_artifacts(
     _check_setup_artifact_hash(selected_model, expected_model, "selected model artifact")
 
 
+@contextmanager
+def _setup_operation_lock() -> Iterator[None]:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def apply_profile_plan(
+    plan: SetupPlan,
+    profiles_path: Path,
+    *,
+    models_dir: Path | None = None,
+    create_model_link: bool = False,
+) -> dict[str, object]:
+    """Apply a reviewed plan while serialising broker-owned mutations."""
+    if plan.errors or plan.profile_record is None:
+        return _apply_profile_plan(
+            plan,
+            profiles_path,
+            models_dir=models_dir,
+            create_model_link=create_model_link,
+        )
+    with _setup_operation_lock():
+        return _apply_profile_plan(
+            plan,
+            profiles_path,
+            models_dir=models_dir,
+            create_model_link=create_model_link,
+        )
+
+
+def _apply_profile_plan(
     plan: SetupPlan,
     profiles_path: Path,
     *,
@@ -584,16 +630,15 @@ def apply_profile_plan(
 
     original_manifest = profiles_path.read_bytes() if profiles_path.exists() else None
     original_mode = profiles_path.stat().st_mode & 0o777 if profiles_path.exists() else 0o600
-    existing_migration_backups = {
-        backup.name
-        for backup in profiles_path.parent.glob(f"{profiles_path.name}.bak-*")
-    }
-    migration_attempted = False
+    selected_model = plan.selected_model
+    migration_required = False
+    migration_backup: Path | None = None
+    migration_backup_bytes: bytes | None = None
     owned_manifest_bytes: bytes | None = None
-    owned_migration_backups: dict[Path, bytes] = {}
     temporary_path: Path | None = None
     destination: Path | None = None
     created_link = False
+    created_link_token: tuple[int, int, str] | None = None
     missing_manifest = object()
     unreadable_manifest = object()
 
@@ -604,29 +649,6 @@ def apply_profile_plan(
             return missing_manifest
         except OSError:
             return unreadable_manifest
-
-    def _capture_migration_state() -> None:
-        nonlocal owned_manifest_bytes
-        if not migration_attempted:
-            return
-        current = _current_manifest_bytes()
-        if isinstance(current, bytes) and current != original_manifest:
-            owned_manifest_bytes = current
-        try:
-            backups = profiles_path.parent.glob(f"{profiles_path.name}.bak-*")
-            for backup in backups:
-                if backup.name in existing_migration_backups or backup in owned_migration_backups:
-                    continue
-                try:
-                    contents = backup.read_bytes()
-                except OSError:
-                    continue
-                # Migration backups are exact copies of the pre-migration
-                # manifest. Anything else is not provably broker-owned.
-                if contents == original_manifest:
-                    owned_migration_backups[backup] = contents
-        except OSError:
-            return
 
     def _restore_original_manifest() -> None:
         if original_manifest is None:
@@ -652,11 +674,22 @@ def apply_profile_plan(
 
     def _rollback_state() -> list[str]:
         rollback_errors: list[str] = []
-        if created_link and destination is not None:
+        if created_link and destination is not None and created_link_token is not None:
             try:
-                destination.unlink(missing_ok=True)
+                current_link = os.lstat(destination)
+                same_inode = (
+                    stat.S_ISLNK(current_link.st_mode)
+                    and (current_link.st_dev, current_link.st_ino)
+                    == created_link_token[:2]
+                    and os.readlink(destination) == created_link_token[2]
+                    and selected_model is not None
+                    and destination.resolve() == selected_model.resolve()
+                )
+                if same_inode:
+                    destination.unlink()
             except BaseException as error:
-                rollback_errors.append(str(error))
+                if not isinstance(error, FileNotFoundError):
+                    rollback_errors.append(str(error))
         if owned_manifest_bytes is not None:
             current = _current_manifest_bytes()
             # The manifest is restored only while its bytes still prove that
@@ -667,39 +700,43 @@ def apply_profile_plan(
                     _restore_original_manifest()
                 except BaseException as error:
                     rollback_errors.append(str(error))
-        for backup, owned_bytes in owned_migration_backups.items():
+        if migration_backup is not None and migration_backup_bytes is not None:
             try:
-                if _current_manifest_bytes() is unreadable_manifest:
-                    continue
-                if backup.read_bytes() != owned_bytes:
-                    continue
-                backup.unlink()
+                if migration_backup.read_bytes() == migration_backup_bytes:
+                    migration_backup.unlink()
+                    _fsync_directory(profiles_path.parent)
             except FileNotFoundError:
-                continue
+                pass
             except BaseException as error:
                 rollback_errors.append(str(error))
         return rollback_errors
 
     try:
         if profiles_path.exists():
-            try:
-                source_payload = json.loads(original_manifest or b"")
-            except (TypeError, ValueError):
-                source_payload = None
-            migration_attempted = (
-                isinstance(source_payload, dict)
-                and source_payload.get("schema_version") not in (1, 2)
+            payload = load_manifest_source(
+                profiles_path,
+                validate=False,
+                migrate=False,
             )
-            try:
-                payload = load_manifest_source(profiles_path, validate=False)
-            finally:
-                _capture_migration_state()
         else:
             payload = {
                 "schema_version": 1,
                 "profiles": [],
             }
-        source_schema = payload.get("schema_version", 1)
+        source_schema = payload.get("schema_version")
+        if source_schema in (None, 0):
+            migrated = legacy_manifest_candidate(payload)
+            if migrated is None:
+                raise ProfileError(
+                    "profile manifest is ambiguous or unsupported for automatic migration"
+                )
+            payload = migrated
+            source_schema = 1
+            migration_required = True
+        elif source_schema not in (1, 2):
+            raise ProfileError(
+                f"unsupported profile manifest schema_version: {source_schema!r}"
+            )
         if source_schema == 2 and "runtime_builds" in payload:
             raise ProfileError(
                 "schema 2 uses the external catalog; remove the inline "
@@ -774,16 +811,22 @@ def apply_profile_plan(
         os.chmod(temporary_path, original_mode)
 
         if create_model_link:
-            if models_dir is None or plan.selected_model is None:
+            if models_dir is None or selected_model is None:
                 raise ValueError("model link requested without a models directory")
             models_dir.mkdir(parents=True, exist_ok=True)
-            destination = models_dir / plan.selected_model.name
+            destination = models_dir / selected_model.name
             if destination.exists() or destination.is_symlink():
-                if not destination.is_symlink() or destination.resolve() != plan.selected_model:
+                if not destination.is_symlink() or destination.resolve() != selected_model:
                     raise FileExistsError(f"model link target is not broker-owned: {destination}")
             else:
-                destination.symlink_to(plan.selected_model)
+                destination.symlink_to(selected_model)
                 created_link = True
+                link_stat = os.lstat(destination)
+                created_link_token = (
+                    link_stat.st_dev,
+                    link_stat.st_ino,
+                    os.readlink(destination),
+                )
 
         _validate_setup_artifacts(
             plan,
@@ -791,7 +834,18 @@ def apply_profile_plan(
             source_schema=source_schema,
             catalog_build=catalog_build,
         )
+        current_manifest = _current_manifest_bytes()
+        manifest_is_original = (
+            current_manifest is missing_manifest
+            if original_manifest is None
+            else current_manifest == original_manifest
+        )
+        if not manifest_is_original:
+            raise ApplyError("profile manifest changed during setup; refusing to overwrite it")
         published_manifest = temporary_path.read_bytes()
+        if migration_required:
+            migration_backup = create_migration_backup(profiles_path)
+            migration_backup_bytes = migration_backup.read_bytes()
         os.replace(temporary_path, profiles_path)
         owned_manifest_bytes = published_manifest
         _fsync_directory(profiles_path.parent)
