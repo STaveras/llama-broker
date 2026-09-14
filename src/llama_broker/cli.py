@@ -923,10 +923,23 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         print("integrate --dry-run is interactive and cannot be combined with --json", file=sys.stderr)
         return 2
     mode = getattr(args, "integrate_command", None)
+    clean_requested = bool(getattr(args, "clean", False))
     if mode == "configure":
+        if clean_requested:
+            print("integrate --clean requires the install mode", file=sys.stderr)
+            return 2
         return _cmd_integrate_configure(args)
     install_requested = mode in (None, "install")
     configure_requested = mode is None
+    if clean_requested and not install_requested:
+        print("integrate --clean requires the install mode", file=sys.stderr)
+        return 2
+    if clean_requested and not getattr(args, "install_units", True):
+        print(
+            "integrate --clean requires unit installation; remove --no-install-units",
+            file=sys.stderr,
+        )
+        return 2
     try:
         payload, inspections = inspect_manifest(
             args.profiles,
@@ -1063,6 +1076,15 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         }
         for item in planned
     ]
+    cleanup_report: dict[str, object] | None = None
+    if clean_requested:
+        cleanup_report = {
+            "action": "stale_unit_cleanup",
+            "requested": True,
+            "status": "planned",
+            "removed": [],
+        }
+        operations.append(cleanup_report)
     if not install_requested:
         operations = []
     if install_requested:
@@ -1105,16 +1127,41 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         apply_confirmed = True
 
     applied_errors: list[str] = list(plan_errors)
+    unit_install_succeeded = False
     if install_requested:
         if systemd_ready and getattr(args, "install_units", True) and controller is not None:
             try:
                 controller.install_units()
+                unit_install_succeeded = True
             except (BackendControllerError, OSError, ValueError) as error:
                 applied_errors.append(f"systemd unit integration failed: {error}")
         elif not systemd_ready:
             applied_errors.append("systemd user session unavailable; unit files were left untouched")
         elif controller is None:
             applied_errors.append("no profile rendered successfully; profile units were left untouched")
+
+    if clean_requested:
+        assert cleanup_report is not None
+        cleanup_report["status"] = "skipped"
+        if not systemd_ready:
+            cleanup_report["reason"] = "systemd user session unavailable"
+            applied_errors.append("stale unit cleanup skipped: systemd user session unavailable")
+        elif not unit_install_succeeded:
+            cleanup_report["reason"] = "profile unit installation did not complete"
+            applied_errors.append("stale unit cleanup skipped: profile unit installation did not complete")
+        elif controller is None:
+            cleanup_report["reason"] = "no profile controller available"
+            applied_errors.append("stale unit cleanup skipped: no profile controller available")
+        else:
+            try:
+                removed_paths = tuple(controller.cleanup_stale_units())
+                cleanup_report["status"] = "removed" if removed_paths else "unchanged"
+                cleanup_report["removed"] = [Path(path).name for path in removed_paths]
+                cleanup_report["paths"] = [str(path) for path in removed_paths]
+            except (BackendControllerError, OSError, ValueError) as error:
+                cleanup_report["status"] = "failed"
+                cleanup_report["error"] = str(error)
+                applied_errors.append(f"stale unit cleanup failed: {error}")
 
     # The broker unit is lightweight control-plane integration.  It is written
     # independently of profile units and never starts a backend.
@@ -1169,6 +1216,13 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             print(f"  broker unit: {plan_report['broker_unit']}")
         if plan_report.get("client_provider"):
             print(f"  client/provider: {plan_report['client_provider']}")
+        if cleanup_report is not None:
+            removed = cleanup_report.get("removed", [])
+            removed_count = len(removed) if isinstance(removed, list) else 0
+            print(
+                f"  stale unit cleanup: {removed_count} removed "
+                f"({cleanup_report['status']})"
+            )
         for error in applied_errors:
             print(f"  ERROR: {error}", file=sys.stderr)
     return 3 if partial else 0
