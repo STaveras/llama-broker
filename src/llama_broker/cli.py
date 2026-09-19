@@ -923,10 +923,23 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         print("integrate --dry-run is interactive and cannot be combined with --json", file=sys.stderr)
         return 2
     mode = getattr(args, "integrate_command", None)
+    clean_requested = bool(getattr(args, "clean", False))
     if mode == "configure":
+        if clean_requested:
+            print("integrate --clean requires the install mode", file=sys.stderr)
+            return 2
         return _cmd_integrate_configure(args)
     install_requested = mode in (None, "install")
     configure_requested = mode is None
+    if clean_requested and not install_requested:
+        print("integrate --clean requires the install mode", file=sys.stderr)
+        return 2
+    if clean_requested and not getattr(args, "install_units", True):
+        print(
+            "integrate --clean requires unit installation; remove --no-install-units",
+            file=sys.stderr,
+        )
+        return 2
     try:
         payload, inspections = inspect_manifest(
             args.profiles,
@@ -935,6 +948,14 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
     except (OSError, ProfileError, ValueError) as error:
         print(f"ERROR: integration cannot read profiles: {error}", file=sys.stderr)
         return 1
+
+    manifest_profile_ids: frozenset[str] | None = None
+    if clean_requested:
+        try:
+            manifest_profile_ids = _safe_manifest_profile_ids(payload)
+        except (ProfileError, ValueError) as error:
+            print(f"ERROR: integration cannot establish safe manifest ownership: {error}", file=sys.stderr)
+            return 1
 
     ready = [item for item in inspections if item.status == "ready" and item.profile is not None]
     if not ready:
@@ -1063,6 +1084,15 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         }
         for item in planned
     ]
+    cleanup_report: dict[str, object] | None = None
+    if clean_requested:
+        cleanup_report = {
+            "action": "stale_unit_cleanup",
+            "requested": True,
+            "status": "planned",
+            "removed": [],
+        }
+        operations.append(cleanup_report)
     if not install_requested:
         operations = []
     if install_requested:
@@ -1105,16 +1135,46 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         apply_confirmed = True
 
     applied_errors: list[str] = list(plan_errors)
+    unit_install_succeeded = False
     if install_requested:
         if systemd_ready and getattr(args, "install_units", True) and controller is not None:
             try:
                 controller.install_units()
+                unit_install_succeeded = True
             except (BackendControllerError, OSError, ValueError) as error:
                 applied_errors.append(f"systemd unit integration failed: {error}")
         elif not systemd_ready:
             applied_errors.append("systemd user session unavailable; unit files were left untouched")
         elif controller is None:
             applied_errors.append("no profile rendered successfully; profile units were left untouched")
+
+    if clean_requested:
+        assert cleanup_report is not None
+        cleanup_report["status"] = "skipped"
+        if not systemd_ready:
+            cleanup_report["reason"] = "systemd user session unavailable"
+            applied_errors.append("stale unit cleanup skipped: systemd user session unavailable")
+        elif not unit_install_succeeded:
+            cleanup_report["reason"] = "profile unit installation did not complete"
+            applied_errors.append("stale unit cleanup skipped: profile unit installation did not complete")
+        elif controller is None:
+            cleanup_report["reason"] = "no profile controller available"
+            applied_errors.append("stale unit cleanup skipped: no profile controller available")
+        else:
+            try:
+                assert manifest_profile_ids is not None
+                removed_paths = tuple(
+                    controller.cleanup_stale_units(
+                        manifest_profile_ids=manifest_profile_ids,
+                    )
+                )
+                cleanup_report["status"] = "removed" if removed_paths else "unchanged"
+                cleanup_report["removed"] = [Path(path).name for path in removed_paths]
+                cleanup_report["paths"] = [str(path) for path in removed_paths]
+            except (BackendControllerError, OSError, ValueError) as error:
+                cleanup_report["status"] = "failed"
+                cleanup_report["error"] = str(error)
+                applied_errors.append(f"stale unit cleanup failed: {error}")
 
     # The broker unit is lightweight control-plane integration.  It is written
     # independently of profile units and never starts a backend.
@@ -1169,6 +1229,13 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             print(f"  broker unit: {plan_report['broker_unit']}")
         if plan_report.get("client_provider"):
             print(f"  client/provider: {plan_report['client_provider']}")
+        if cleanup_report is not None:
+            removed = cleanup_report.get("removed", [])
+            removed_count = len(removed) if isinstance(removed, list) else 0
+            print(
+                f"  stale unit cleanup: {removed_count} removed "
+                f"({cleanup_report['status']})"
+            )
         for error in applied_errors:
             print(f"  ERROR: {error}", file=sys.stderr)
     return 3 if partial else 0
@@ -1222,6 +1289,24 @@ def _confirm_setup_plan(plan: object) -> bool:
     except EOFError:
         return False
     return answer in {"y", "yes"}
+
+
+def _safe_manifest_profile_ids(payload: Mapping[str, Any]) -> frozenset[str]:
+    """Return the complete manifest ID set or fail closed for cleanup."""
+    raw_profiles = payload.get("profiles")
+    if not isinstance(raw_profiles, list):
+        raise ProfileError("unsafe manifest profile id set: profiles must be a list")
+    profile_ids: list[str] = []
+    for index, raw_profile in enumerate(raw_profiles):
+        if not isinstance(raw_profile, dict):
+            raise ProfileError(f"unsafe manifest profile id at index {index}: profile is not an object")
+        profile_id = raw_profile.get("id")
+        if not isinstance(profile_id, str) or not PROFILE_ID_RE.fullmatch(profile_id):
+            raise ProfileError(f"unsafe manifest profile id at index {index}: {profile_id!r}")
+        if profile_id in profile_ids:
+            raise ProfileError(f"ambiguous manifest profile id: {profile_id!r} is duplicated")
+        profile_ids.append(profile_id)
+    return frozenset(profile_ids)
 
 
 def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
