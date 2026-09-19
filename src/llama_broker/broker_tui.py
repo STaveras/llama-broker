@@ -90,6 +90,15 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("server_binary", "Runtime binary", "path", advanced=True),
     EditorField("model_path", "Model file", "path", advanced=True),
     EditorField("model_draft", "Draft model file", "path", advanced=True),
+    EditorField(
+        "spec_type",
+        "Speculative decoding",
+        "select",
+        advanced=True,
+        options=("off", "mtp", "draft-mtp", "nextn"),
+    ),
+    EditorField("draft_max", "Draft max tokens", "int", advanced=True),
+    EditorField("draft_min", "Draft min tokens", "int", advanced=True),
     EditorField("native_vision", "Native vision", "toggle", advanced=True),
     EditorField("fit", "Auto-fit to VRAM", "toggle", advanced=True),
     EditorField("fit_target_mib", "Fit target MiB", "int", advanced=True),
@@ -343,6 +352,90 @@ def run_guided_wizard(
     return 0
 
 
+_SPECULATIVE_FLAG_BY_FIELD: Mapping[str, str] = {
+    "spec_type": "--spec-type",
+    "draft_max": "--draft-max",
+    "draft_min": "--draft-min",
+}
+_DRAFT_MAX_ALIASES = ("--draft-max", "--spec-draft-n-max")
+_SPECULATIVE_EDITOR_FIELDS = frozenset(_SPECULATIVE_FLAG_BY_FIELD)
+_SPECULATIVE_COUNT_FIELDS = _SPECULATIVE_EDITOR_FIELDS - {"spec_type"}
+_MANAGED_SPECULATIVE_FLAGS = frozenset(
+    ("--spec-type", "--draft-max", "--spec-draft-n-max", "--draft-min")
+)
+
+
+def _extra_arg_value(extra_args: Any, flag: str) -> str:
+    """Read a flag value without changing the raw extra-args representation."""
+    if not isinstance(extra_args, list):
+        return ""
+    for index, token in enumerate(extra_args):
+        if token == flag and index + 1 < len(extra_args):
+            value = extra_args[index + 1]
+            if isinstance(value, str) and not value.startswith("--"):
+                return value
+            return ""
+    return ""
+
+
+def _draft_max_value(extra_args: Any) -> str:
+    for flag in _DRAFT_MAX_ALIASES:
+        value = _extra_arg_value(extra_args, flag)
+        if value:
+            return value
+    return ""
+
+
+def _without_managed_speculative_args(extra_args: Any) -> list[str]:
+    if not isinstance(extra_args, list):
+        return []
+    result: list[str] = []
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token in _MANAGED_SPECULATIVE_FLAGS:
+            index += 1
+            if index < len(extra_args) and not extra_args[index].startswith("--"):
+                index += 1
+            continue
+        result.append(token)
+        index += 1
+    return result
+
+
+def _replace_extra_arg(
+    extra_args: Any,
+    flag: str,
+    value: str | None,
+) -> list[str]:
+    """Replace or remove one flag/value pair while preserving other arguments."""
+    if not isinstance(extra_args, list) or not all(
+        isinstance(item, str) and item for item in extra_args
+    ):
+        raise ValueError("extra_args must be a JSON string list")
+
+    updated: list[str] = []
+    replaced = False
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token != flag:
+            updated.append(token)
+            index += 1
+            continue
+
+        if value is not None and not replaced:
+            updated.extend((flag, value))
+            replaced = True
+        index += 1
+        if index < len(extra_args) and not extra_args[index].startswith("--"):
+            index += 1
+
+    if value is not None and not replaced:
+        updated.extend((flag, value))
+    return updated
+
+
 class TUIModel:
     """Testable state model for the field-oriented profile editor."""
 
@@ -489,7 +582,8 @@ class TUIModel:
     @property
     def visible_fields(self) -> list[EditorField]:
         current = self.current or {}
-        runtime_info = get_runtime_info(str(current.get("runtime", "llamacpp")))
+        runtime = str(current.get("runtime", "llamacpp")).strip().lower()
+        runtime_info = get_runtime_info(runtime)
         inferred = self._current_runtime_build(current)
         family = inferred.runtime if inferred is not None else "(custom/manual)"
         fields = []
@@ -503,7 +597,9 @@ class TUIModel:
                 field = replace(field, options=tuple(self._build_option(build) for build in builds))
             elif field.key == "runtime" and family != "(custom/manual)":
                 continue
-            elif field.key not in runtime_info.editable_fields:
+            elif field.key not in runtime_info.editable_fields and not (
+                runtime == "llamacpp" and field.key in _SPECULATIVE_EDITOR_FIELDS
+            ):
                 continue
             if field.advanced and not self.advanced:
                 continue
@@ -552,7 +648,14 @@ class TUIModel:
         if key in {"environment", "safety"}:
             return json.dumps(current.get(key, {}), sort_keys=True)
         if key == "extra_args":
-            return json.dumps(current.get(key, []))
+            return json.dumps(_without_managed_speculative_args(current.get(key, [])))
+        if key in _SPECULATIVE_FLAG_BY_FIELD:
+            value = (
+                _draft_max_value(current.get("extra_args", []))
+                if key == "draft_max"
+                else _extra_arg_value(current.get("extra_args", []), _SPECULATIVE_FLAG_BY_FIELD[key])
+            )
+            return value or ("off" if key == "spec_type" else "")
         if key == "runtime_family":
             inferred = self._current_runtime_build(current)
             if inferred is None:
@@ -589,7 +692,43 @@ class TUIModel:
             return current
         draft = clone_record(current)
 
-        if key == "runtime_family":
+        if key in _SPECULATIVE_FLAG_BY_FIELD:
+            raw = "" if value is None else str(value).strip()
+            if key == "spec_type":
+                if raw == "off":
+                    replacement = None
+                else:
+                    requested = tuple(part.strip() for part in raw.split(","))
+                    if not requested or any(
+                        part not in {"mtp", "draft-mtp", "nextn"} for part in requested
+                    ):
+                        raise ValueError(f"unsupported speculative decoding type: {raw!r}")
+                    replacement = ",".join(requested)
+            else:
+                replacement = str(int(raw)) if raw else None
+            if key == "draft_max":
+                draft["extra_args"] = _replace_extra_arg(
+                    _replace_extra_arg(draft.get("extra_args", []), "--spec-draft-n-max", None),
+                    "--draft-max",
+                    replacement,
+                )
+            else:
+                draft["extra_args"] = _replace_extra_arg(
+                    draft.get("extra_args", []), _SPECULATIVE_FLAG_BY_FIELD[key], replacement
+                )
+        elif key == "extra_args":
+            raw_args = json.loads(str(value)) if isinstance(value, str) else value
+            if not isinstance(raw_args, list) or not all(isinstance(item, str) and item for item in raw_args):
+                raise ValueError("extra_args must be a JSON string list")
+            preserved: list[str] = []
+            current_args = draft.get("extra_args", [])
+            for index, token in enumerate(current_args):
+                if isinstance(token, str) and token in _MANAGED_SPECULATIVE_FLAGS:
+                    preserved.append(token)
+                    if index + 1 < len(current_args) and not str(current_args[index + 1]).startswith("--"):
+                        preserved.append(current_args[index + 1])
+            draft["extra_args"] = list(raw_args) + preserved
+        elif key == "runtime_family":
             selected = self._family_for_value(value)
             if not selected or selected == "(custom/manual)":
                 draft.pop("runtime_build", None)
@@ -1045,7 +1184,13 @@ def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
             stdscr,
             field.label,
             value,
-            allow_empty=field.key in {"mmproj_path", "model_draft", "restore_profile"},
+            allow_empty=field.key
+            in {
+                "mmproj_path",
+                "model_draft",
+                "restore_profile",
+                *_SPECULATIVE_COUNT_FIELDS,
+            },
         )
     if cancelled:
         return

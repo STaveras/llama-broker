@@ -15,7 +15,7 @@ from llama_broker.broker_tui import (
     _read_curses_key,
     run_guided_wizard,
 )
-from llama_broker.profile_config import merge_manifest_drafts
+from llama_broker.profile_config import load_manifest_source, merge_manifest_drafts, validate_manifest
 
 
 class BrokerTUIModelTests(unittest.TestCase):
@@ -555,6 +555,124 @@ class BrokerTUIModelTests(unittest.TestCase):
         self.assertNotIn("server_binary", {field.key for field in model.visible_fields})
         model.toggle_advanced()
         self.assertIn("server_binary", {field.key for field in model.visible_fields})
+
+    def test_speculative_type_editor_updates_extra_args_without_losing_other_flags(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "extra_args": [
+                            "--no-warmup",
+                            "--spec-type",
+                            "draft-mtp",
+                            "--spec-draft-n-max",
+                            "4",
+                            "--jinja",
+                        ],
+                    }
+                ]
+            }
+        )
+        model.toggle_advanced()
+
+        self.assertEqual(model.field_value("spec_type"), "draft-mtp")
+        model.set_field("spec_type", "mtp")
+        assert model.current is not None
+
+        self.assertEqual(
+            model.current["extra_args"],
+            ["--no-warmup", "--spec-type", "mtp", "--spec-draft-n-max", "4", "--jinja"],
+        )
+
+    def test_speculative_count_editors_insert_update_and_remove_flag_pairs(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "extra_args": ["--spec-draft-n-max", "4", "--jinja"],
+                    }
+                ]
+            }
+        )
+        model.toggle_advanced()
+
+        self.assertEqual(model.field_value("draft_max"), "4")
+        model.set_field("draft_max", 8)
+        model.set_field("draft_min", "2")
+        assert model.current is not None
+
+        self.assertEqual(
+            model.current["extra_args"],
+            ["--jinja", "--draft-max", "8", "--draft-min", "2"],
+        )
+
+    def test_turning_speculative_decoding_off_preserves_draft_limits(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "extra_args": [
+                            "--no-warmup",
+                            "--spec-type",
+                            "draft-mtp",
+                            "--spec-draft-n-max",
+                            "4",
+                        ],
+                    }
+                ]
+            }
+        )
+
+        model.set_field("spec_type", "off")
+        assert model.current is not None
+        self.assertEqual(
+            model.current["extra_args"],
+            ["--no-warmup", "--spec-draft-n-max", "4"],
+        )
+        self.assertEqual(model.field_value("spec_type"), "off")
+
+    def test_speculative_editor_fields_are_llamacpp_only(self) -> None:
+        llamacpp = TUIModel(
+            {"profiles": [{"id": "one", "alias": "one", "runtime": "llamacpp"}]}
+        )
+        llamacpp.toggle_advanced()
+        llamacpp_keys = {field.key for field in llamacpp.visible_fields}
+        self.assertTrue(
+            {"draft_max", "draft_min"} <= llamacpp_keys
+        )
+
+        vllm = TUIModel(
+            {"profiles": [{"id": "one", "alias": "one", "runtime": "vllm"}]}
+        )
+        vllm.toggle_advanced()
+        self.assertFalse(
+            {"spec_type", "draft_max", "draft_min"}
+            & {field.key for field in vllm.visible_fields}
+        )
+
+    def test_speculative_editor_output_passes_production_manifest_validation(self) -> None:
+        from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            manifest_path = materialize_fixture(Path(tempdir))
+            manifest = load_manifest_source(manifest_path)
+            model = TUIModel(manifest)
+            model.set_field("spec_type", "draft-mtp")
+            model.set_field("draft_max", 4)
+
+            validate_manifest(model.manifest, directory=manifest_path.parent)
+            profile = model.current
+            assert profile is not None
+            self.assertNotIn("spec_type", profile)
+            self.assertEqual(
+                profile["extra_args"][-2:], ["--draft-max", "4"]
+            )
 
 
 class GuidedWizardTests(unittest.TestCase):
