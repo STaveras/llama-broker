@@ -776,29 +776,44 @@ class ProfileCoordinator:
         force_after_drain_timeout: bool = False,
         force_immediately: bool = False,
     ) -> bool:
-        deadline = time.monotonic() + self._drain_timeout
         forced = False
         with self._condition:
             try:
                 if self._shutdown_requested:
                     raise BrokerQuiescingError("Llama-Broker is shutting down")
-                while self._transitioning or self._active_requests > 0:
+
+                transition_deadline = time.monotonic() + self._transition_timeout
+                while self._transitioning:
                     if self._shutdown_requested:
                         raise BrokerQuiescingError("Llama-Broker is shutting down")
-                    if force_immediately and not self._transitioning:
-                        forced = True
-                        break
-                    remaining = deadline - time.monotonic()
+                    remaining = transition_deadline - time.monotonic()
                     if remaining <= 0:
-                        if force_after_drain_timeout and not self._transitioning:
-                            forced = True
-                            break
-                        raise BrokerDrainTimeoutError(
-                            f"{operation_name} could not drain "
-                            f"{self._active_requests} active request(s) within "
-                            f"{self._drain_timeout:g}s"
+                        transition = self._transition_name or "an existing transition"
+                        raise BrokerTransitionTimeoutError(
+                            f"{operation_name} waited for {transition} beyond "
+                            f"{self._transition_timeout:g}s; transition remains in progress"
                         )
                     self._condition.wait(timeout=remaining)
+
+                if force_immediately:
+                    forced = True
+                else:
+                    drain_deadline = time.monotonic() + self._drain_timeout
+                    while self._active_requests > 0:
+                        if self._shutdown_requested:
+                            raise BrokerQuiescingError("Llama-Broker is shutting down")
+                        remaining = drain_deadline - time.monotonic()
+                        if remaining <= 0:
+                            if force_after_drain_timeout:
+                                forced = True
+                                break
+                            raise BrokerDrainTimeoutError(
+                                f"{operation_name} could not drain "
+                                f"{self._active_requests} active request(s) within "
+                                f"{self._drain_timeout:g}s"
+                            )
+                        self._condition.wait(timeout=remaining)
+
                 if self._shutdown_requested:
                     raise BrokerQuiescingError("Llama-Broker is shutting down")
                 self._queued_transitions -= 1

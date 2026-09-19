@@ -16,7 +16,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .broker_profiles import launch_environment
 
@@ -803,7 +803,11 @@ class BackendController:
                 self._update_alias(state["profile"])
             return installed
 
-    def cleanup_stale_units(self) -> tuple[Path, ...]:
+    def cleanup_stale_units(
+        self,
+        *,
+        manifest_profile_ids: Iterable[str] | None = None,
+    ) -> tuple[Path, ...]:
         """Remove inactive broker-owned unit files absent from the manifest."""
 
         with self._lock:
@@ -812,7 +816,16 @@ class BackendController:
                     "cannot clean stale broker units without a systemd state probe"
                 )
 
-            manifest_ids = set(self.profiles)
+            if manifest_profile_ids is None:
+                manifest_ids = set(self.profiles)
+            else:
+                manifest_ids = set()
+                for profile_id in manifest_profile_ids:
+                    if not isinstance(profile_id, str) or not _UNIT_COMPONENT.fullmatch(profile_id):
+                        raise ServiceOwnershipError(
+                            f"cannot clean stale broker units with unsafe manifest profile id: {profile_id!r}"
+                        )
+                    manifest_ids.add(profile_id)
             prefixes = (self.service_prefix, self._verify_service_prefix())
             candidates: dict[str, Path] = {}
             for prefix in prefixes:
