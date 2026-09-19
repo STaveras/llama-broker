@@ -1643,6 +1643,50 @@ class CoordinatorTests(unittest.TestCase):
         release.set()
         held.join(timeout=1)
 
+    def test_transition_wait_with_zero_requests_is_not_reported_as_drain_timeout(self) -> None:
+        transition_started = threading.Event()
+        allow_transition = threading.Event()
+        transitions: list[str] = []
+        first_errors: list[BaseException] = []
+
+        def blocked_switch(profile: str) -> None:
+            transitions.append(profile)
+            transition_started.set()
+            allow_transition.wait(timeout=2)
+
+        coordinator = ProfileCoordinator(
+            "main",
+            blocked_switch,
+            drain_timeout=0.05,
+            transition_timeout=0.1,
+        )
+
+        def first_transition() -> None:
+            try:
+                with coordinator.lease("vision"):
+                    pass
+            except BaseException as error:
+                first_errors.append(error)
+
+        first = threading.Thread(target=first_transition)
+        first.start()
+        self.assertTrue(transition_started.wait(timeout=1))
+        self.assertEqual(coordinator.active_requests, 0)
+
+        try:
+            with self.assertRaises(BrokerTransitionTimeoutError):
+                coordinator.switch_when_idle("admin")
+            self.assertEqual(transitions, ["vision"])
+            self.assertEqual(coordinator.active_requests, 0)
+        finally:
+            allow_transition.set()
+            first.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertEqual(first_errors, [])
+        self.assertFalse(coordinator.snapshot()["transitioning"])
+        self.assertEqual(coordinator.active_requests, 0)
+
     def test_transition_timeout_quarantines_late_success_without_phantom_lease(self) -> None:
         transition_started = threading.Event()
         allow_transition = threading.Event()
