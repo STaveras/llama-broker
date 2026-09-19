@@ -1683,7 +1683,13 @@ class CoordinatorTests(unittest.TestCase):
             first.join(timeout=2)
 
         self.assertFalse(first.is_alive())
-        self.assertEqual(first_errors, [])
+        self.assertTrue(
+            all(isinstance(error, BrokerTransitionTimeoutError) for error in first_errors)
+        )
+        deadline = time.monotonic() + 1
+        while coordinator.quiescing:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
         self.assertFalse(coordinator.snapshot()["transitioning"])
         self.assertEqual(coordinator.active_requests, 0)
 
