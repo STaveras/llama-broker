@@ -11,9 +11,11 @@ from llama_broker.broker_tui import (
     EDITOR_FIELDS,
     TUIModel,
     _curses_prompt,
+    _curses_select,
+    _read_curses_key,
     run_guided_wizard,
 )
-from llama_broker.profile_config import merge_manifest_drafts
+from llama_broker.profile_config import load_manifest_source, merge_manifest_drafts, validate_manifest
 
 
 class BrokerTUIModelTests(unittest.TestCase):
@@ -189,6 +191,103 @@ class BrokerTUIModelTests(unittest.TestCase):
         model.set_field("display_name", value)
         assert model.current is not None
         self.assertEqual(model.current["display_name"], "New display name")
+
+    def test_curses_select_clips_multiline_choices_to_window(self) -> None:
+        import curses
+
+        class BoundsWindow:
+            def __init__(self, height: int, width: int, keys: list[int]) -> None:
+                self.height = height
+                self.width = width
+                self.keys = iter(keys)
+                self.rows: list[int] = []
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return self.height, self.width
+
+            def erase(self) -> None:
+                pass
+
+            def addnstr(self, row: int, column: int, _text: str, _count: int, *_args: int) -> None:
+                if not (0 <= row < self.height and 0 <= column < self.width):
+                    raise AssertionError(
+                        f"draw outside {self.height}x{self.width}: row={row}, column={column}"
+                    )
+                self.rows.append(row)
+
+            def getch(self) -> int:
+                return next(self.keys)
+
+        choices = tuple(
+            f"build-{index}\n  runtime: llamacpp\n  binary: /runtime/{index}\n  sha256: {'0' * 64}"
+            for index in range(6)
+        )
+        window = BoundsWindow(height=12, width=80, keys=[10])
+
+        value, cancelled = _curses_select(window, "Backend build", choices[0], choices)
+
+        self.assertEqual(value, choices[0])
+        self.assertFalse(cancelled)
+        self.assertTrue(window.rows)
+        self.assertLess(max(window.rows), window.height)
+
+        navigation_window = BoundsWindow(
+            height=12,
+            width=80,
+            keys=[curses.KEY_DOWN] * (len(choices) - 1) + [10],
+        )
+        value, cancelled = _curses_select(
+            navigation_window, "Backend build", choices[0], choices
+        )
+
+        self.assertEqual(value, choices[-1])
+        self.assertFalse(cancelled)
+        self.assertLess(max(navigation_window.rows), navigation_window.height)
+
+    def test_alt_arrow_sequences_do_not_become_escape(self) -> None:
+        import curses
+
+        class FakeWindow:
+            def __init__(self, keys: list[int]) -> None:
+                self.keys = iter(keys)
+                self.timeouts: list[int] = []
+
+            def getch(self) -> int:
+                try:
+                    return next(self.keys)
+                except StopIteration:
+                    return -1
+
+            def timeout(self, milliseconds: int) -> None:
+                self.timeouts.append(milliseconds)
+
+        sequences = (
+            (bytes([27]) + b"[1;3A", curses.KEY_UP),
+            (bytes([27]) + b"[1;3B", curses.KEY_DOWN),
+            (bytes([27]) + b"[1;3C", curses.KEY_RIGHT),
+            (bytes([27]) + b"[1;3D", curses.KEY_LEFT),
+            (bytes([27]) + b"OA", curses.KEY_UP),
+        )
+        for raw_sequence, expected in sequences:
+            with self.subTest(sequence=raw_sequence):
+                window = FakeWindow(list(raw_sequence))
+                self.assertEqual(_read_curses_key(window), expected)
+                self.assertEqual(window.timeouts, [50, -1])
+
+    def test_standalone_escape_remains_escape(self) -> None:
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.timeouts: list[int] = []
+
+            def getch(self) -> int:
+                return 27 if not self.timeouts else -1
+
+            def timeout(self, milliseconds: int) -> None:
+                self.timeouts.append(milliseconds)
+
+        window = FakeWindow()
+        self.assertEqual(_read_curses_key(window), 27)
+        self.assertEqual(window.timeouts, [50, -1])
 
     def test_curses_prompt_cancels_cleanly_on_keyboard_interrupt(self) -> None:
         class InterruptingWindow:
@@ -456,6 +555,124 @@ class BrokerTUIModelTests(unittest.TestCase):
         self.assertNotIn("server_binary", {field.key for field in model.visible_fields})
         model.toggle_advanced()
         self.assertIn("server_binary", {field.key for field in model.visible_fields})
+
+    def test_speculative_type_editor_updates_extra_args_without_losing_other_flags(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "extra_args": [
+                            "--no-warmup",
+                            "--spec-type",
+                            "draft-mtp",
+                            "--spec-draft-n-max",
+                            "4",
+                            "--jinja",
+                        ],
+                    }
+                ]
+            }
+        )
+        model.toggle_advanced()
+
+        self.assertEqual(model.field_value("spec_type"), "draft-mtp")
+        model.set_field("spec_type", "mtp")
+        assert model.current is not None
+
+        self.assertEqual(
+            model.current["extra_args"],
+            ["--no-warmup", "--spec-type", "mtp", "--spec-draft-n-max", "4", "--jinja"],
+        )
+
+    def test_speculative_count_editors_insert_update_and_remove_flag_pairs(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "extra_args": ["--spec-draft-n-max", "4", "--jinja"],
+                    }
+                ]
+            }
+        )
+        model.toggle_advanced()
+
+        self.assertEqual(model.field_value("draft_max"), "4")
+        model.set_field("draft_max", 8)
+        model.set_field("draft_min", "2")
+        assert model.current is not None
+
+        self.assertEqual(
+            model.current["extra_args"],
+            ["--jinja", "--draft-max", "8", "--draft-min", "2"],
+        )
+
+    def test_turning_speculative_decoding_off_preserves_draft_limits(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "extra_args": [
+                            "--no-warmup",
+                            "--spec-type",
+                            "draft-mtp",
+                            "--spec-draft-n-max",
+                            "4",
+                        ],
+                    }
+                ]
+            }
+        )
+
+        model.set_field("spec_type", "off")
+        assert model.current is not None
+        self.assertEqual(
+            model.current["extra_args"],
+            ["--no-warmup", "--spec-draft-n-max", "4"],
+        )
+        self.assertEqual(model.field_value("spec_type"), "off")
+
+    def test_speculative_editor_fields_are_llamacpp_only(self) -> None:
+        llamacpp = TUIModel(
+            {"profiles": [{"id": "one", "alias": "one", "runtime": "llamacpp"}]}
+        )
+        llamacpp.toggle_advanced()
+        llamacpp_keys = {field.key for field in llamacpp.visible_fields}
+        self.assertTrue(
+            {"draft_max", "draft_min"} <= llamacpp_keys
+        )
+
+        vllm = TUIModel(
+            {"profiles": [{"id": "one", "alias": "one", "runtime": "vllm"}]}
+        )
+        vllm.toggle_advanced()
+        self.assertFalse(
+            {"spec_type", "draft_max", "draft_min"}
+            & {field.key for field in vllm.visible_fields}
+        )
+
+    def test_speculative_editor_output_passes_production_manifest_validation(self) -> None:
+        from tests.fixtures import materialize_fixture  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            manifest_path = materialize_fixture(Path(tempdir))
+            manifest = load_manifest_source(manifest_path)
+            model = TUIModel(manifest)
+            model.set_field("spec_type", "draft-mtp")
+            model.set_field("draft_max", 4)
+
+            validate_manifest(model.manifest, directory=manifest_path.parent)
+            profile = model.current
+            assert profile is not None
+            self.assertNotIn("spec_type", profile)
+            self.assertEqual(
+                profile["extra_args"][-2:], ["--draft-max", "4"]
+            )
 
 
 class GuidedWizardTests(unittest.TestCase):

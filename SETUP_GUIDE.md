@@ -105,20 +105,20 @@ The effective profile settings are:
 | `example-9b-vision` | `example-9b-vision` | 32,768 / 1 | `-ngl auto` | stock Qwen plus F16 projector; transient; restores v3 |
 | `example-9b-mtp` | `example-9b-mtp` | 32,768 / 1 | `-ngl all` | embedded MTP profile |
 
-Legacy profiles use their pinned settings. The active v3 profile uses:
+Legacy profiles use their pinned settings. The active v3 production profile uses:
 
 ```text
 -b 64 -ub 64 -ctk kvarn4 -ctv kvarn4 --flash-attn on
 --no-context-shift --no-warmup
-GGML_CUDA_DISABLE_GRAPHS=1 GGML_CUDA_GRAPH_OPT=0
-GGML_CUDA_PDL=0 LLAMA_GRAPH_REUSE_DISABLE=1
-LLAMA_KVARN_MULTI_STREAM=1 Restart=no
+GGML_CUDA_PDL=0 LLAMA_KVARN_MULTI_STREAM=1 Restart=no
 ```
 
-`GGML_CUDA_DISABLE_GRAPHS=1` disables CUDA graph capture; the separate graph
-optimizer, PDL, and llama graph-reuse controls are also disabled for the active
-KVarN qualification profile. This is a conservative stability baseline; graph A/B testing is not a
-production gate yet.
+CUDA graph capture, graph optimization, and graph-reuse controls are not
+production profile settings. `brokerctl autotune` adds
+`GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_CUDA_GRAPH_OPT=0`, and
+`LLAMA_GRAPH_REUSE_DISABLE=1` only to its disposable candidate units; those
+units are removed after each candidate. This keeps graph capture enabled for
+normal llama.cpp serving while preserving the conservative autotune baseline.
 
 ### Full-context semantics
 
@@ -129,7 +129,9 @@ halve the per-slot window and is not the canonical profile.
 
 The stock and Example 9B text profiles use two slots in a 262,144-token server
 context, yielding 131,072 tokens per slot. Vision and MTP retain their smaller
-single-slot windows. `/v1/models` reports these profile-specific values.
+single-slot windows. `/v1/models` reports the aggregate server context as
+`context_length`, the configured slot count as `parallel`, and the per-slot
+window as `slot_context_window`.
 
 Qwen 3.5 MRoPE KV shifting is unsupported. `--no-context-shift` is therefore a
 required invariant; the configured contexts are fixed windows rather than
@@ -515,19 +517,22 @@ journalctl --user -u llama-broker-profile-example-9b-v3.service -n 200 --no-page
 nvidia-smi
 ```
 
-Confirm the active safety environment from the running process:
+Confirm the active production safety environment from the running process:
 
 ```bash
 pid=$(systemctl --user show \
   llama-broker-profile-example-9b-v3.service -p MainPID --value)
 tr '\0' '\n' < "/proc/$pid/environ" | \
-  grep -E '^(GGML_CUDA_DISABLE_GRAPHS|GGML_CUDA_GRAPH_OPT|GGML_CUDA_PDL|LLAMA_GRAPH_REUSE_DISABLE)='
+  grep -E '^(GGML_CUDA_PDL|LLAMA_KVARN_MULTI_STREAM)='
 readlink -f "/proc/$pid/exe"
 ```
 
-Expected values are `GGML_CUDA_DISABLE_GRAPHS=1`, `GGML_CUDA_GRAPH_OPT=0`,
-`GGML_CUDA_PDL=0`, and `LLAMA_GRAPH_REUSE_DISABLE=1`. The resolved executable
-must be the Phase 2 primary runtime shown in the manifest.
+Production output should include `GGML_CUDA_PDL=0` and any profile-specific
+non-graph settings such as `LLAMA_KVARN_MULTI_STREAM=1`; it must not include
+`GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_GRAPH_OPT`, or
+`LLAMA_GRAPH_REUSE_DISABLE`. Those three values are expected only in temporary
+autotune candidate units. The resolved executable must be the Phase 2 primary
+runtime shown in the manifest.
 
 ## Conservative rollback
 

@@ -280,6 +280,61 @@ class ConfigureSafetyTests(unittest.TestCase):
             self.assertIn("  base_url: https://127.0.0.1:11434/v1", content)
             self.assertIn("    default_model: fixture-text-7b", content)
 
+    def test_hermes_integration_normalizes_internal_profile_id_to_public_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp = Path(tempdir)
+            profiles_path = temp / "profiles.json"
+            profiles_path.write_text(
+                json.dumps(
+                    {
+                        "profiles": [
+                            {
+                                "id": "gemma4-12b-qat",
+                                "alias": "gemma4-12b",
+                                "aliases": ["gemma4-12b", "gemma4-12b-qat"],
+                                "context_size": 131072,
+                                "parallel": 2,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ToolRegistry(
+                broker_url="https://127.0.0.1:11434/v1",
+                profiles_path=str(profiles_path),
+                api_key="[REDACTED]",
+            )
+            config_path = temp / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  llama-broker:\n"
+                "    default_model: gemma4-12b-qat\n"
+                "    models:\n"
+                "      gemma4-12b:\n"
+                "        context_length: 65536\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch("llama_broker.configure.hermes.HERMES_CONFIG", config_path),
+                patch(
+                    "llama_broker.configure.hermes.load_security_config",
+                    return_value=SecurityConfig(
+                        broker_tls_ca_file=Path("/tmp/lan-ca.crt")
+                    ),
+                ),
+            ):
+                result = HermesProvider().configure(registry)
+
+            content = config_path.read_text(encoding="utf-8")
+
+        self.assertTrue(result.written)
+        self.assertIn("default_model: gemma4-12b\n", content)
+        self.assertNotIn("default_model: gemma4-12b-qat\n", content)
+        self.assertIn("      gemma4-12b:\n", content)
+        self.assertNotIn("      gemma4-12b-qat:\n", content)
+
     def test_active_route_tools_preserve_endpoints_without_opt_in(self) -> None:
         root = Path(__file__).resolve().parents[1]
         registry = ToolRegistry(

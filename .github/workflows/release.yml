@@ -6,11 +6,10 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  release:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,54 +18,120 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Check sanitized public tree
-        run: python tools/check_public_tree.py
-      - name: Build source and wheel distributions
-        run: |
-          python -m pip install build
-          python -m build
-      - name: Generate checksums and release manifest
+      - name: Check release tag matches package version
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          sha256sum dist/* > dist/SHA256SUMS
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          expected = f"v{version}"
+          actual = os.environ["RELEASE_VERSION"]
+          if actual != expected:
+              raise SystemExit(f"release tag {actual!r} does not match package version {expected!r}")
+          PY
+      - name: Check sanitized public tree
+        run: python tools/check_public_tree.py
+      - name: Compile source
+        run: python -m compileall -q src tests
+      - name: Install build frontend
+        run: python -m pip install build
+      - name: Build source and wheel distributions
+        run: python -m build --outdir dist
+      - name: Install built wheel
+        run: python -m pip install --no-deps dist/*.whl
+      - name: Run offline release suite
+        run: python tests/run_offline.py
+      - name: Smoke installed console entry point
+        run: |
+          brokerctl --help
+          python -c "import llama_broker; print(llama_broker.__name__)"
+      - name: Prepare GitHub release assets
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
           python - <<'PY'
           import hashlib
           import json
           import os
           import pathlib
+          import shutil
           import subprocess
           import tomllib
 
           dist = pathlib.Path("dist")
-          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
-          artifacts = {}
-          for path in sorted(dist.iterdir()):
-              if path.name == "release-manifest.json":
-                  continue
-              if path.is_file():
-                  artifacts[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+          assets = pathlib.Path("release-assets")
+          assets.mkdir()
+          packages = sorted(
+              path for path in dist.iterdir()
+              if path.is_file() and (path.name.endswith(".whl") or path.name.endswith(".tar.gz"))
+          )
+          if len(packages) != 2:
+              raise SystemExit(f"expected wheel and source archive, found {len(packages)} distributions")
+          for package in packages:
+              shutil.copy2(package, assets / package.name)
+          (assets / "SHA256SUMS").write_text(
+              "".join(
+                  f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+                  for path in sorted(assets.iterdir())
+              ),
+              encoding="utf-8",
+          )
+
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
+          artifacts = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in sorted(assets.iterdir())
+          }
           manifest = {
               "schema_version": 1,
-              "version": project["project"]["version"],
+              "version": project["version"],
               "tag": os.environ["RELEASE_VERSION"],
-              "commit": subprocess.check_output(
-                  ["git", "rev-parse", "HEAD"], text=True
-              ).strip(),
+              "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
               "supported_python": ["3.11", "3.12", "3.13", "3.14"],
               "artifacts": artifacts,
           }
-          (dist / "release-manifest.json").write_text(
+          (assets / "release-manifest.json").write_text(
               json.dumps(manifest, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
           PY
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/*
+          name: release-artifacts
+          path: |
+            dist/
+            release-assets/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-pypi:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
       - name: Publish to PyPI with trusted publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  publish-github-release:
+    needs: publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

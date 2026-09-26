@@ -471,8 +471,8 @@ class BackendControllerTest(unittest.TestCase):
             '"--alias" "main-27b" "-c" "65536" "-ngl" "auto"',
             unit,
         )
-        self.assertIn('Environment="GGML_CUDA_DISABLE_GRAPHS=1"', unit)
-        self.assertIn('Environment="GGML_CUDA_GRAPH_OPT=0"', unit)
+        self.assertNotIn('Environment="GGML_CUDA_DISABLE_GRAPHS=1"', unit)
+        self.assertNotIn('Environment="GGML_CUDA_GRAPH_OPT=0"', unit)
         self.assertIn('Environment="LITERAL_DOLLAR=$HOME"', unit)
         self.assertIn('Environment="PERCENT_VALUE=95%%"', unit)
         self.assertIn("Restart=no", unit)

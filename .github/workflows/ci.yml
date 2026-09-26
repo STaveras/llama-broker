@@ -11,19 +11,14 @@ jobs:
   offline:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - python-version: "3.11"
-            experimental: false
           - python-version: "3.12"
-            experimental: false
           - python-version: "3.13"
-            experimental: false
           - python-version: "3.14"
-            experimental: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

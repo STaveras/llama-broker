@@ -58,6 +58,7 @@ from .paths import (
     PROFILES_PATH as XDG_PROFILES_PATH,
     STATE_PATH as XDG_STATE_PATH,
     SYSTEMD_USER_DIR as XDG_SYSTEMD_USER_DIR,
+    migrate_legacy_state,
 )
 
 
@@ -75,6 +76,43 @@ SERVICE_PREFIX = os.environ.get("LLAMA_BROKER_SERVICE_PREFIX", "llama-broker-pro
 LEGACY_SERVICE_UNIT = "llama-server.service"
 
 _DEFAULT_BACKEND_URL = "http://127.0.0.1:10000"
+
+_ARTIFACT_VERIFICATION_CACHE: dict[tuple[object, ...], None] = {}
+_ARTIFACT_VERIFICATION_CACHE_LOCK = threading.Lock()
+_ARTIFACT_VERIFICATION_CACHE_MAX = 1024
+
+
+def _artifact_verification_key(path: Path, expected: str) -> tuple[object, ...] | None:
+    """Return a process-local identity for a file and its expected digest."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (
+        str(path),
+        expected,
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _artifact_verification_cached(key: tuple[object, ...] | None) -> bool:
+    if key is None:
+        return False
+    with _ARTIFACT_VERIFICATION_CACHE_LOCK:
+        return key in _ARTIFACT_VERIFICATION_CACHE
+
+
+def _remember_artifact_verification(key: tuple[object, ...] | None) -> None:
+    if key is None:
+        return
+    with _ARTIFACT_VERIFICATION_CACHE_LOCK:
+        _ARTIFACT_VERIFICATION_CACHE[key] = None
+        while len(_ARTIFACT_VERIFICATION_CACHE) > _ARTIFACT_VERIFICATION_CACHE_MAX:
+            _ARTIFACT_VERIFICATION_CACHE.pop(next(iter(_ARTIFACT_VERIFICATION_CACHE)))
 
 
 def _env_value(canonical: str, legacy: str, default: str) -> str:
@@ -235,6 +273,13 @@ def backend_endpoint_ready(host: str, port: int, timeout: float = 0.25) -> bool:
         return False
 
 
+def _backend_auth_headers(security: SecurityConfig) -> dict[str, str]:
+    keys = read_api_keys(security.api_key_file) if security.api_key_file else []
+    if not keys and security.api_key:
+        keys = [security.api_key]
+    return {"Authorization": f"Bearer {keys[-1]}"} if keys else {}
+
+
 def backend_serves_alias(
     host: str,
     port: int,
@@ -243,6 +288,7 @@ def backend_serves_alias(
     *,
     scheme: str = "http",
     ca_file: str | Path | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> bool:
     """Return whether the private backend advertises *alias* exactly."""
 
@@ -253,6 +299,7 @@ def backend_serves_alias(
         f"{scheme}://{host_for_url}:{port}",
         timeout=timeout,
         ca_file=ca_file,
+        default_headers=headers,
     )
     try:
         payload = client.list_models()
@@ -350,30 +397,56 @@ def _verify_profile_artifacts(profile: Any) -> None:
             raise BackendControllerError(
                 f"{profile.id} {kind} has no configured SHA-256 digest"
             )
+        key = _artifact_verification_key(path, str(expected))
+        if _artifact_verification_cached(key):
+            continue
         try:
             actual = sha256_file(path)
         except OSError as error:
             raise BackendControllerError(
                 f"{profile.id} {kind} is unavailable: {error}"
             ) from error
+        after_key = _artifact_verification_key(path, str(expected))
+        if key is not None and after_key != key:
+            raise BackendControllerError(
+                f"{profile.id} {kind} changed during verification: {path}"
+            )
         if actual != expected:
             raise BackendControllerError(
                 f"{profile.id} {kind} SHA mismatch: expected {expected}, "
                 f"got {actual} ({path})"
             )
+        _remember_artifact_verification(key)
 
 
 def apply_reasoning_policy(
-    payload: Mapping[str, Any], *, runtime: str, max_output_tokens: int | None = None
+    payload: Mapping[str, Any],
+    *,
+    runtime: str,
+    max_output_tokens: int | None = None,
+    request_max_output_tokens: int | None = None,
+    batch_size: int = 1,
+    ubatch_size: int = 1,
 ) -> dict[str, Any]:
-    """Apply the client reasoning policy for runtimes with template controls."""
+    """Apply the experimental client reasoning policy for llama.cpp templates."""
 
     rewritten = dict(payload)
     if runtime != "llamacpp":
         return rewritten
     if max_output_tokens is None or max_output_tokens <= 0:
         raise ValueError("llamacpp reasoning policy requires a positive output limit")
+    if request_max_output_tokens is not None and (
+        isinstance(request_max_output_tokens, bool)
+        or not isinstance(request_max_output_tokens, int)
+        or request_max_output_tokens <= 0
+    ):
+        raise ValueError("request output limit must be a positive integer")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if isinstance(ubatch_size, bool) or not isinstance(ubatch_size, int) or ubatch_size <= 0:
+        raise ValueError("ubatch_size must be a positive integer")
 
+    budget_limit = request_max_output_tokens or max_output_tokens
     raw_kwargs = rewritten.get("chat_template_kwargs")
     kwargs = dict(raw_kwargs) if isinstance(raw_kwargs, Mapping) else {}
     explicit_template = "enable_thinking" in kwargs
@@ -387,6 +460,12 @@ def apply_reasoning_policy(
     raw_effort = rewritten.get("reasoning_effort")
     if effort is None and isinstance(raw_effort, str):
         effort = raw_effort
+    if effort is not None:
+        effort = {
+            "min": "minimal",
+            "med": "medium",
+            "xhigh": "extra high",
+        }.get(effort.strip().casefold(), effort.strip().casefold())
 
     explicit_budget = (
         "reasoning_budget_tokens" in rewritten
@@ -441,17 +520,18 @@ def apply_reasoning_policy(
             and "reasoning_budget_tokens" not in rewritten
             and "thinking_budget_tokens" not in rewritten
         ):
-            divisor = {
-                "minimal": 16,
-                "low": 8,
-                "medium": 4,
-                "high": 2,
-                "extra high": 4 / 3,
-                "max": 1,
-            }[effort]
-            rewritten["thinking_budget_tokens"] = max(
-                1, int(max_output_tokens / divisor)
-            )
+            levels = ("minimal", "low", "medium", "high", "extra high", "max")
+            index = levels.index(effort)
+            low_budget = max(1, budget_limit // ubatch_size)
+            if effort == "minimal":
+                budget = min(batch_size, budget_limit)
+            elif effort == "low":
+                budget = low_budget
+            elif effort == "max":
+                budget = budget_limit
+            else:
+                budget = min(budget_limit, low_budget * (2 ** (index + 1)))
+            rewritten["thinking_budget_tokens"] = max(1, budget)
         rewritten["reasoning_effort"] = effort
     else:
         # Be tolerant of client-specific effort enums. Unsupported values
@@ -528,6 +608,16 @@ def route_payload(
     rewritten = dict(payload)
     rewritten["model"] = profile.alias
     return profile, rewritten
+
+
+def _requested_output_tokens(payload: Mapping[str, Any]) -> int | None:
+    """Return a valid client output budget, if one was supplied."""
+
+    for key in ("max_tokens", "max_completion_tokens"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
 
 
 def enforce_output_limit(
@@ -685,27 +775,46 @@ class ProfileCoordinator:
         operation_name: str,
         *,
         force_after_drain_timeout: bool = False,
+        force_immediately: bool = False,
     ) -> bool:
-        deadline = time.monotonic() + self._drain_timeout
         forced = False
         with self._condition:
             try:
                 if self._shutdown_requested:
                     raise BrokerQuiescingError("Llama-Broker is shutting down")
-                while self._transitioning or self._active_requests > 0:
+
+                transition_deadline = time.monotonic() + self._transition_timeout
+                while self._transitioning:
                     if self._shutdown_requested:
                         raise BrokerQuiescingError("Llama-Broker is shutting down")
-                    remaining = deadline - time.monotonic()
+                    remaining = transition_deadline - time.monotonic()
                     if remaining <= 0:
-                        if force_after_drain_timeout and not self._transitioning:
-                            forced = True
-                            break
-                        raise BrokerDrainTimeoutError(
-                            f"{operation_name} could not drain "
-                            f"{self._active_requests} active request(s) within "
-                            f"{self._drain_timeout:g}s"
+                        transition = self._transition_name or "an existing transition"
+                        raise BrokerTransitionTimeoutError(
+                            f"{operation_name} waited for {transition} beyond "
+                            f"{self._transition_timeout:g}s; transition remains in progress"
                         )
                     self._condition.wait(timeout=remaining)
+
+                if force_immediately:
+                    forced = True
+                else:
+                    drain_deadline = time.monotonic() + self._drain_timeout
+                    while self._active_requests > 0:
+                        if self._shutdown_requested:
+                            raise BrokerQuiescingError("Llama-Broker is shutting down")
+                        remaining = drain_deadline - time.monotonic()
+                        if remaining <= 0:
+                            if force_after_drain_timeout:
+                                forced = True
+                                break
+                            raise BrokerDrainTimeoutError(
+                                f"{operation_name} could not drain "
+                                f"{self._active_requests} active request(s) within "
+                                f"{self._drain_timeout:g}s"
+                            )
+                        self._condition.wait(timeout=remaining)
+
                 if self._shutdown_requested:
                     raise BrokerQuiescingError("Llama-Broker is shutting down")
                 self._queued_transitions -= 1
@@ -1040,7 +1149,7 @@ class ProfileCoordinator:
             raise
 
     def restart_when_idle(self, profile_id: str | None = None) -> Any:
-        """Drain active requests, then restart the currently active profile."""
+        """Immediately interrupt active requests, then restart the active profile."""
 
         with self._condition:
             target_profile = profile_id or self._active_profile
@@ -1054,7 +1163,17 @@ class ProfileCoordinator:
             self._condition.notify_all()
         self._queue_transition()
         operation_name = f"restart active profile {target_profile!r}"
-        self._wait_for_transition_slot(operation_name)
+        forced = self._wait_for_transition_slot(
+            operation_name,
+            force_immediately=True,
+        )
+        if forced:
+            with self._condition:
+                active_requests = self._active_requests
+            _log(
+                f"[broker] {operation_name} interrupting "
+                f"{active_requests} active request(s); restarting immediately"
+            )
         return self._run_transition(
             operation_name,
             lambda: self._restart_profile(target_profile),
@@ -1252,6 +1371,7 @@ class BrokerApplication:
                 probe_timeout,
                 scheme=backend_parts.scheme or "http",
                 ca_file=self._backend_ca_file,
+                headers=_backend_auth_headers(self.security),
             )
         )
 
@@ -1357,6 +1477,21 @@ class BrokerApplication:
             thread.join(timeout=max(1.0, RECOVERY_INTERVAL + 1.0))
         self._recovery_thread = None
 
+    def restart_when_idle(self) -> Any:
+        """Restart the active profile or recover the last failed target."""
+
+        if self.coordinator.active_profile is None:
+            state = self._controller_state_snapshot()
+            if state.get("phase") == "failed":
+                target_profile = state.get("target_profile")
+                if isinstance(target_profile, str) and target_profile:
+                    _log(
+                        f"[broker] restart requested with no active profile; "
+                        f"recovering failed target {target_profile!r}"
+                    )
+                    return self.coordinator.switch_when_idle(target_profile)
+        return self.coordinator.restart_when_idle()
+
     def max_output_tokens_for(self, profile: Profile) -> int:
         """Return the maximum client-requested output for a profile."""
 
@@ -1460,6 +1595,7 @@ class BrokerApplication:
             self._backend_url,
             timeout=self.backend_timeout if timeout is None else timeout,
             ca_file=self._backend_ca_file,
+            default_headers=_backend_auth_headers(self.security),
         )
 
     def authentication_keys(self) -> tuple[str, ...]:
@@ -1532,7 +1668,10 @@ class BrokerApplication:
         if profile is not None:
             result.update(
                 {
-                    "context_length": profile.slot_context_window,
+                    # ``context_length`` is the aggregate ``-c`` value.  The
+                    # per-slot window is exposed separately for parallel
+                    # backends using ``-np``.
+                    "context_length": profile.context_size,
                     "parallel": profile.parallel,
                     "slot_context_window": profile.slot_context_window,
                     "max_output_tokens": self.max_output_tokens_for(profile),
@@ -1654,15 +1793,37 @@ class BrokerApplication:
                 else "degraded"
             )
         )
+        profile = (
+            self.registry.try_resolve(str(profile_id))
+            if isinstance(profile_id, str)
+            else None
+        )
+        backend_state = {
+            "host": self.backend_host,
+            "port": self.backend_port,
+            **state,
+            "ready": ready,
+        }
+        if profile is not None:
+            backend_state.update(
+                {
+                    "runtime": getattr(profile, "runtime", None),
+                    "runtime_build": getattr(profile, "runtime_build", None),
+                    "deployment_revision": getattr(profile, "deployment_revision", None),
+                    "warnings": list(getattr(profile, "warnings", ())),
+                    "degraded_features": list(getattr(profile, "degraded_features", ())),
+                }
+            )
+        catalog_path = getattr(self.registry, "runtime_catalog_path", None)
+        deployment_revision = getattr(self.registry, "deployment_revision", None)
         return {
             "name": "Llama-Broker",
             "status": health_status,
-            "backend": {
-                "host": self.backend_host,
-                "port": self.backend_port,
-                **state,
-                "ready": ready,
+            "catalog": {
+                "path": str(catalog_path) if catalog_path else None,
+                "deployment_revision": deployment_revision,
             },
+            "backend": backend_state,
             "leases": self.coordinator.snapshot(),
             "maintenance": {
                 "autotune": self._autotune_lease.status(),
@@ -1903,6 +2064,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         rewritten,
                         runtime=profile.runtime,
                         max_output_tokens=self.application.max_output_tokens_for(profile),
+                        request_max_output_tokens=_requested_output_tokens(payload),
+                        batch_size=profile.batch_size or 1,
+                        ubatch_size=profile.ubatch_size or 1,
                     )
                 except ValueError:
                     rejected_metadata = reasoning_policy_metadata(
@@ -2031,7 +2195,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             elif path == "/admin/restart":
                 model = payload.get("model")
                 if model is None:
-                    self.application.coordinator.restart_when_idle()
+                    self.application.restart_when_idle()
                 else:
                     profile = self.application.registry.resolve(model)
                     if self.application.coordinator.active_profile == profile.id:
@@ -2450,6 +2614,14 @@ class LockedController:
     def state(self) -> dict[str, Any]:
         return self.controller.state()
 
+    def replace_profiles(self, profiles: Mapping[str, Profile]) -> None:
+        with _operation_lock(self.lock_path):
+            self.controller.replace_profiles(profiles)
+
+    def install_units(self) -> dict[str, Path]:
+        with _operation_lock(self.lock_path):
+            return self.controller.install_units()
+
     def switch(self, profile_id: str) -> dict[str, Any]:
         with _operation_lock(self.lock_path):
             return self.controller.switch(profile_id)
@@ -2488,6 +2660,7 @@ def _readiness_probe(
             backend_url,
             timeout=min(1.0, remaining),
             ca_file=security.backend_tls_ca_file,
+            default_headers=_backend_auth_headers(security),
         )
         try:
             payload = client.list_models()
@@ -2511,6 +2684,8 @@ def create_production_controller(
     shutdown_requested: threading.Event | None = None,
     security: SecurityConfig | None = None,
 ) -> BackendController:
+    if migrate_legacy_state():
+        _log(f"[broker] migrated controller state to {STATE_PATH}")
     security = security or load_security_config()
     security.validate()
     backend_listen_host = effective_backend_listen_host(security)

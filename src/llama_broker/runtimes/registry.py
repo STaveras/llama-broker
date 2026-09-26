@@ -102,6 +102,8 @@ _LLAMACPP_FIELDS = _BASE_FIELDS | frozenset(
         "ctx_checkpoints",
         "cache_ram_mib",
         "model_draft",
+        "model_draft_sha256",
+        "moe_cache_slots_limit",
     }
 )
 

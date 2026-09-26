@@ -8,6 +8,7 @@ backend process.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -17,7 +18,14 @@ from typing import Any, Mapping
 
 from .runtimes import get_runtime, get_runtime_info
 from .runtimes.registry import RuntimeError as RuntimeRegistryError
-from .runtime_builds import RuntimeBuild, RuntimeBuildError, parse_runtime_builds
+from .runtime_builds import (
+    RuntimeBuild,
+    RuntimeBuildError,
+    RuntimeCatalog,
+    external_catalog_for_manifest,
+    parse_runtime_builds,
+    resolve_profile_runtime,
+)
 
 
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -39,6 +47,8 @@ MAX_MEMORY_MAX_MIB = 20_480
 MAX_MEMORY_SWAP_MAX_MIB = 1_024
 MAX_TIMEOUT_STOP_SEC = 20
 MAX_SPECULATIVE_DRAFT_TOKENS = 64
+MAX_MOE_CACHE_SLOTS = 8
+MAX_QUALIFIED_MOE_CACHE_SLOTS = 112
 MAX_CACHE_RAM_SHARE_DIVISOR = 2
 MIN_ADMISSION_RAM_AVAILABLE_MIB = 8_192
 MAX_ADMISSION_SWAP_USED_MIB = 1_024
@@ -51,6 +61,44 @@ ALLOWED_SPECULATIVE_TYPES = frozenset({"mtp", "draft-mtp", "nextn"})
 SPECULATIVE_COUNT_FLAGS = frozenset(
     {"--draft-max", "--spec-draft-n-max", "--draft-min"}
 )
+MOE_CACHE_VALUE_FLAGS = frozenset(
+    {"--moe-cache-profile", "--moe-cache-slots"}
+)
+LLAMACPP_AUTOTUNE_ENVIRONMENT = MappingProxyType(
+    {
+        "GGML_CUDA_DISABLE_GRAPHS": "1",
+        "GGML_CUDA_GRAPH_OPT": "0",
+        "LLAMA_GRAPH_REUSE_DISABLE": "1",
+    }
+)
+LLAMACPP_AUTOTUNE_ONLY_ENVIRONMENT = frozenset(LLAMACPP_AUTOTUNE_ENVIRONMENT)
+
+
+def launch_environment(
+    environment: Mapping[str, str],
+    *,
+    runtime: str,
+    autotune: bool = False,
+) -> dict[str, str]:
+    """Return the environment for a normal or autotune runtime launch.
+
+    CUDA graph controls are deliberately candidate-only.  Strip legacy values
+    from normal llama.cpp launches, then force the conservative values for
+    autotune candidates so profile data cannot leak the tuning policy into
+    production units.
+    """
+
+    effective = dict(environment)
+    if runtime != "llamacpp":
+        return effective
+
+    for name in LLAMACPP_AUTOTUNE_ONLY_ENVIRONMENT:
+        effective.pop(name, None)
+    if autotune:
+        effective.update(LLAMACPP_AUTOTUNE_ENVIRONMENT)
+    return effective
+
+
 VLLM_KV_CACHE_DTYPES = frozenset(
     {
         "auto",
@@ -187,7 +235,11 @@ def _parse_vllm_extra_args(
 
 
 def _parse_extra_args(
-    raw: object, profile_id: str, *, runtime: str
+    raw: object,
+    profile_id: str,
+    *,
+    runtime: str,
+    moe_cache_slots_limit: int = MAX_MOE_CACHE_SLOTS,
 ) -> tuple[tuple[str, ...], frozenset[str]]:
     if not isinstance(raw, list) or not all(
         isinstance(item, str) and item for item in raw
@@ -213,6 +265,7 @@ def _parse_extra_args(
             "--reasoning",
             "--spec-type",
             *SPECULATIVE_COUNT_FLAGS,
+            *MOE_CACHE_VALUE_FLAGS,
         }:
             raise ProfileError(
                 f"extra_args for {profile_id!r} contain unsupported token: {flag!r}"
@@ -224,7 +277,26 @@ def _parse_extra_args(
 
         value = args[i + 1]
         seen_flags.add(flag)
-        if flag == "--reasoning":
+        if flag == "--moe-cache-profile":
+            path = Path(value).expanduser()
+            if not path.is_absolute() or not path.is_file():
+                raise ProfileError(
+                    f"extra_args flag {flag} for {profile_id!r} requires an "
+                    f"absolute existing file: {value!r}"
+                )
+        elif flag == "--moe-cache-slots":
+            if not re.fullmatch(r"[0-9]+", value):
+                raise ProfileError(
+                    f"extra_args flag {flag} for {profile_id!r} must be a "
+                    "non-negative integer"
+                )
+            slots = int(value, 10)
+            if slots > moe_cache_slots_limit:
+                raise ProfileError(
+                    f"extra_args flag {flag} for {profile_id!r} exceeds "
+                    f"profile cache-slot limit {moe_cache_slots_limit}"
+                )
+        elif flag == "--reasoning":
             if value not in ALLOWED_REASONING_MODES:
                 raise ProfileError(
                     f"extra_args flag {flag} for {profile_id!r} has unsupported "
@@ -465,8 +537,23 @@ class Profile:
     environment: Mapping[str, str]
     extra_args: tuple[str, ...]
     model_draft: Path | None
+    moe_cache_slots_limit: int
     max_output_tokens: int | None = None
     autotune: Mapping[str, Any] | None = None
+    bundle_root: Path | None = None
+    source_repository: Path | None = None
+    provenance_file: Path | None = None
+    source_branch: str | None = None
+    source_commit: str | None = None
+    dirty: bool | None = None
+    selected_profile_ids: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    degraded_features: tuple[str, ...] = ()
+    declared_extra_args: tuple[str, ...] = ()
+    effective_extra_args: tuple[str, ...] = ()
+    effective_model_draft: Path | None = None
+    model_draft_sha256: str | None = None
+    deployment_revision: str | None = None
 
     @property
     def is_transient(self) -> bool:
@@ -510,7 +597,12 @@ class Profile:
 
 
 class ProfileRegistry:
-    def __init__(self, profiles: tuple[Profile, ...]):
+    def __init__(
+        self,
+        profiles: tuple[Profile, ...],
+        *,
+        runtime_catalog: RuntimeCatalog | None = None,
+    ):
         by_id = {profile.id: profile for profile in profiles}
 
         aliases: dict[str, Profile] = {}
@@ -534,6 +626,7 @@ class ProfileRegistry:
         self._profiles = profiles
         self._by_id = MappingProxyType(by_id)
         self._by_alias = MappingProxyType(aliases)
+        self._runtime_catalog = runtime_catalog
 
     @classmethod
     def from_path(
@@ -548,34 +641,99 @@ class ProfileRegistry:
             raise
         except OSError as exc:
             raise ProfileError(f"cannot read profile manifest {manifest_path}: {exc}") from exc
-        if payload.get("schema_version") != 1:
-            raise ProfileError("unsupported profile manifest schema_version")
+        schema = payload.get("schema_version")
+        if schema not in {1, 2}:
+            raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
         raw_profiles = payload.get("profiles")
         if not isinstance(raw_profiles, list) or not raw_profiles:
             raise ProfileError("profile manifest must contain a non-empty profiles list")
 
         try:
-            runtime_builds = parse_runtime_builds(
-                payload.get("runtime_builds", []),
+            runtime_catalog = external_catalog_for_manifest(
+                payload,
                 allow_missing_artifacts=allow_missing_artifacts,
+            )
+            runtime_builds = (
+                runtime_catalog.builds
+                if runtime_catalog is not None
+                else parse_runtime_builds(
+                    payload.get("runtime_builds", []),
+                    allow_missing_artifacts=allow_missing_artifacts,
+                )
             )
         except RuntimeBuildError as error:
             raise ProfileError(str(error)) from error
-        profiles = tuple(
-            _parse_profile(
-                item,
-                allow_missing_artifacts=allow_missing_artifacts,
-                runtime_builds=runtime_builds,
-            ) for item in raw_profiles
-        )
-        ids = [profile.id for profile in profiles]
+
+        profiles: list[Profile] = []
+        for item in raw_profiles:
+            try:
+                if isinstance(item, dict):
+                    resolved_item, resolved_build = resolve_profile_runtime(
+                        payload,
+                        item,
+                        allow_missing_artifacts=allow_missing_artifacts,
+                    )
+                else:
+                    resolved_item, resolved_build = item, None
+                profiles.append(
+                    _parse_profile(
+                        resolved_item,
+                        allow_missing_artifacts=allow_missing_artifacts,
+                        runtime_builds=runtime_builds,
+                        runtime_catalog=runtime_catalog,
+                        resolved_runtime_build=resolved_build,
+                    )
+                )
+            except RuntimeBuildError as error:
+                profile_id = (
+                    item.get("id", "<unknown>")
+                    if isinstance(item, dict)
+                    else "<unknown>"
+                )
+                raise ProfileError(
+                    f"{error} for profile {profile_id!r}"
+                ) from error
+        parsed_profiles = tuple(profiles)
+        ids = [profile.id for profile in parsed_profiles]
         if len(ids) != len(set(ids)):
             raise ProfileError("duplicate profile id")
-        return cls(profiles)
+        return cls(parsed_profiles, runtime_catalog=runtime_catalog)
 
     @property
     def profiles(self) -> tuple[Profile, ...]:
         return self._profiles
+
+    @property
+    def runtime_catalog(self) -> RuntimeCatalog | None:
+        return self._runtime_catalog
+
+    @property
+    def runtime_catalog_path(self) -> Path | None:
+        return self._runtime_catalog.path if self._runtime_catalog is not None else None
+
+    @property
+    def deployment_revision(self) -> str | None:
+        return (
+            self._runtime_catalog.deployment_revision
+            if self._runtime_catalog is not None
+            else None
+        )
+
+    @property
+    def runtime_builds(self) -> tuple[RuntimeBuild, ...]:
+        if self._runtime_catalog is not None:
+            return self._runtime_catalog.builds
+        return tuple(
+            RuntimeBuild(
+                id=profile.runtime_build or "",
+                runtime=profile.runtime,
+                display_name=profile.display_name,
+                server_binary=profile.server_binary,
+                server_sha256=profile.server_sha256,
+            )
+            for profile in self._profiles
+            if profile.runtime_build
+        )
 
     def get(self, profile_id: str) -> Profile:
         try:
@@ -596,15 +754,89 @@ class ProfileRegistry:
         return profile
 
 
+def _optional_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _degrade_optional_moe_args(
+    raw: object,
+    profile_id: str,
+    *,
+    slots_limit: int,
+) -> tuple[object, tuple[str, ...], tuple[str, ...]]:
+    """Remove only an invalid optional MoE cache pair from effective argv."""
+    if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
+        return raw, (), ()
+    args = list(raw)
+    cache_flags = {"--moe-cache-profile", "--moe-cache-slots"}
+    positions: dict[str, list[int]] = {flag: [] for flag in cache_flags}
+    for index, value in enumerate(args):
+        if value in cache_flags:
+            positions[value].append(index)
+
+    if not positions["--moe-cache-profile"]:
+        return args, (), ()
+
+    valid = all(len(positions[flag]) == 1 for flag in cache_flags)
+    profile_index = positions["--moe-cache-profile"][0] if len(positions["--moe-cache-profile"]) == 1 else -1
+    slots_index = positions["--moe-cache-slots"][0] if len(positions["--moe-cache-slots"]) == 1 else -1
+    if valid:
+        if profile_index + 1 >= len(args):
+            valid = False
+        else:
+            cache_path = Path(args[profile_index + 1]).expanduser()
+            valid = cache_path.is_absolute() and cache_path.is_file()
+        if slots_index + 1 >= len(args):
+            valid = False
+        else:
+            raw_slots = args[slots_index + 1]
+            valid = valid and bool(re.fullmatch(r"[0-9]+", raw_slots)) and int(raw_slots) <= slots_limit
+
+    if valid:
+        return args, (), ()
+
+    cleaned: list[str] = []
+    index = 0
+    while index < len(args):
+        if args[index] in cache_flags:
+            index += 2 if index + 1 < len(args) else 1
+            continue
+        cleaned.append(args[index])
+        index += 1
+    return (
+        cleaned,
+        (f"{profile_id}: optional MoE cache optimization is unavailable",),
+        ("moe-cache",),
+    )
+
+
 def _parse_profile(
     raw: object,
     *,
     allow_missing_artifacts: bool = False,
     runtime_builds: tuple[RuntimeBuild, ...] = (),
+    runtime_catalog: RuntimeCatalog | None = None,
+    resolved_runtime_build: RuntimeBuild | None = None,
 ) -> Profile:
     if not isinstance(raw, dict):
         raise ProfileError("every profile must be a JSON object")
     record: Mapping[str, Any] = raw
+    resolved_build = resolved_runtime_build
+    if resolved_build is None and isinstance(record.get("runtime_build"), str):
+        requested_build = record["runtime_build"].strip().casefold()
+        resolved_build = next(
+            (
+                build
+                for build in runtime_builds
+                if build.id.casefold() == requested_build
+                or build.display_name.casefold() == requested_build
+            ),
+            None,
+        )
 
     runtime = str(record.get("runtime", "llamacpp")).strip().lower()
     try:
@@ -650,21 +882,35 @@ def _parse_profile(
     if not capabilities or not capabilities <= ALLOWED_CAPABILITIES:
         raise ProfileError(f"invalid capabilities for {profile_id!r}: {sorted(capabilities)!r}")
 
+    warnings: list[str] = []
+    degraded_features: list[str] = []
     server_binary = _absolute_existing_path(
         record, "server_binary", allow_missing=allow_missing_artifacts
     )
     server_sha256 = _sha256(record, "server_sha256")
     runtime_build: str | None = None
+    build: RuntimeBuild | None = None
     if "runtime_build" in record:
         raw_runtime_build = record["runtime_build"]
         if not isinstance(raw_runtime_build, str) or not raw_runtime_build.strip():
             raise ProfileError(f"runtime_build must be a non-empty string for {profile_id!r}")
-        runtime_build = raw_runtime_build.strip()
-        build = next((item for item in runtime_builds if item.id == runtime_build), None)
+        build = resolved_build
+        if build is None:
+            runtime_build_name = raw_runtime_build.strip().casefold()
+            build = next(
+                (
+                    item
+                    for item in runtime_builds
+                    if item.id.casefold() == runtime_build_name
+                    or item.display_name.casefold() == runtime_build_name
+                ),
+                None,
+            )
         if build is None:
             raise ProfileError(
-                f"unknown runtime build for profile {profile_id!r}: {runtime_build!r}"
+                f"unknown runtime build for profile {profile_id!r}: {raw_runtime_build.strip()!r}"
             )
+        runtime_build = build.id
         if build.runtime != runtime:
             raise ProfileError(
                 f"runtime build {runtime_build!r} does not match runtime {runtime!r} "
@@ -702,10 +948,39 @@ def _parse_profile(
         raise ProfileError(f"vision profile {profile_id!r} requires an existing mmproj_path")
 
     model_draft: Path | None = None
+    effective_model_draft: Path | None = None
+    model_draft_sha256: str | None = None
     if record.get("model_draft"):
-        model_draft = _absolute_existing_path(
-            record, "model_draft", allow_missing=allow_missing_artifacts
-        )
+        raw_draft = str(record["model_draft"]).strip()
+        candidate = Path(raw_draft).expanduser()
+        if not candidate.is_absolute():
+            model_draft = candidate
+            warnings.append(f"{profile_id}: optional model draft path is not absolute")
+            degraded_features.append("speculative-draft")
+        else:
+            model_draft = candidate.resolve()
+            raw_draft_hash = record.get("model_draft_sha256")
+            if raw_draft_hash is not None:
+                if isinstance(raw_draft_hash, str) and SHA256_RE.fullmatch(raw_draft_hash.strip().lower()):
+                    model_draft_sha256 = raw_draft_hash.strip().lower()
+                else:
+                    warnings.append(f"{profile_id}: optional model draft hash is invalid")
+                    degraded_features.append("speculative-draft")
+            if not model_draft.is_file():
+                warnings.append(f"{profile_id}: optional model draft is unavailable")
+                degraded_features.append("speculative-draft")
+            elif model_draft_sha256 is not None:
+                try:
+                    actual_draft_hash = _optional_file_sha256(model_draft)
+                except OSError:
+                    actual_draft_hash = ""
+                if actual_draft_hash != model_draft_sha256:
+                    warnings.append(f"{profile_id}: optional model draft hash mismatch")
+                    degraded_features.append("speculative-draft")
+                else:
+                    effective_model_draft = model_draft
+            else:
+                effective_model_draft = model_draft
 
     context_size = _positive_int(record, "context_size")
     if context_size > MAX_CONTEXT_SIZE:
@@ -912,10 +1187,6 @@ def _parse_profile(
         raise ProfileError(f"environment must be a string mapping for {profile_id!r}")
     environment = MappingProxyType(dict(raw_environment))
     if runtime == "llamacpp":
-        if environment.get("GGML_CUDA_DISABLE_GRAPHS") != "1":
-            raise ProfileError(f"{profile_id!r} must disable CUDA graph capture")
-        if environment.get("GGML_CUDA_GRAPH_OPT") != "0":
-            raise ProfileError(f"{profile_id!r} must disable CUDA graph optimization")
         if environment.get("GGML_CUDA_PDL") != "0":
             raise ProfileError(f"{profile_id!r} must disable CUDA PDL")
         if (
@@ -936,8 +1207,40 @@ def _parse_profile(
             f"vllm profile {profile_id!r} contains llama.cpp-only environment settings"
         )
 
+    if runtime == "llamacpp":
+        if "moe_cache_slots_limit" in record:
+            moe_cache_slots_limit = _positive_int(record, "moe_cache_slots_limit")
+        else:
+            moe_cache_slots_limit = MAX_MOE_CACHE_SLOTS
+        if moe_cache_slots_limit > MAX_QUALIFIED_MOE_CACHE_SLOTS:
+            raise ProfileError(
+                f"moe_cache_slots_limit for {profile_id!r} exceeds fail-closed limit "
+                f"{MAX_QUALIFIED_MOE_CACHE_SLOTS}"
+            )
+    else:
+        moe_cache_slots_limit = MAX_MOE_CACHE_SLOTS
+
+    raw_extra_args = record.get("extra_args", [])
+    declared_extra_args = (
+        tuple(raw_extra_args)
+        if isinstance(raw_extra_args, list)
+        and all(isinstance(item, str) and item for item in raw_extra_args)
+        else ()
+    )
+    effective_raw_extra_args: object = raw_extra_args
+    if runtime == "llamacpp":
+        effective_raw_extra_args, cache_warnings, cache_degraded = _degrade_optional_moe_args(
+            raw_extra_args,
+            profile_id,
+            slots_limit=moe_cache_slots_limit,
+        )
+        warnings.extend(cache_warnings)
+        degraded_features.extend(cache_degraded)
     extra_args, speculative_types = _parse_extra_args(
-        record.get("extra_args", []), profile_id, runtime=runtime
+        effective_raw_extra_args,
+        profile_id,
+        runtime=runtime,
+        moe_cache_slots_limit=moe_cache_slots_limit,
     )
 
     if (
@@ -1028,6 +1331,23 @@ def _parse_profile(
         environment=environment,
         extra_args=extra_args,
         model_draft=model_draft,
+        moe_cache_slots_limit=moe_cache_slots_limit,
         max_output_tokens=max_output_tokens,
         autotune=autotune,
+        bundle_root=build.bundle_root if build is not None else None,
+        source_repository=build.source_repository if build is not None else None,
+        provenance_file=build.provenance_file if build is not None else None,
+        source_branch=build.source_branch if build is not None else None,
+        source_commit=build.source_commit if build is not None else None,
+        dirty=build.dirty if build is not None else None,
+        selected_profile_ids=(build.selected_profile_ids if build is not None else ()),
+        warnings=tuple(dict.fromkeys(warnings)),
+        degraded_features=tuple(dict.fromkeys(degraded_features)),
+        declared_extra_args=declared_extra_args,
+        effective_extra_args=extra_args,
+        effective_model_draft=effective_model_draft,
+        model_draft_sha256=model_draft_sha256,
+        deployment_revision=(
+            runtime_catalog.deployment_revision if runtime_catalog is not None else None
+        ),
     )
