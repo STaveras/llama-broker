@@ -1823,7 +1823,13 @@ class CoordinatorTests(unittest.TestCase):
                 rewritten = apply_reasoning_policy(
                     {
                         "max_tokens": 8192,
-                        "reasoning_effort": "min" if effort == "minimal" else effort,
+                        "reasoning_effort": (
+                            "min"
+                            if effort == "minimal"
+                            else "med"
+                            if effort == "medium"
+                            else effort
+                        ),
                     },
                     runtime="llamacpp",
                     max_output_tokens=131072,
