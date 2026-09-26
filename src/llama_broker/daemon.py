@@ -463,6 +463,7 @@ def apply_reasoning_policy(
     if effort is not None:
         effort = {
             "min": "minimal",
+            "med": "medium",
             "xhigh": "extra high",
         }.get(effort.strip().casefold(), effort.strip().casefold())
 
