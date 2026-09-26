@@ -75,6 +75,7 @@ ADVANCED_FIELDS: tuple[str, ...] = (
     "environment",
     "extra_args",
     "model_draft",
+    "model_draft_sha256",
 )
 
 _GGUF_TYPES = {
@@ -139,7 +140,19 @@ def _create_migration_backup(path: Path) -> Path:
     return backup
 
 
-def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
+def legacy_manifest_candidate(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return a validated in-memory schema-1 candidate without writing it."""
+    return _legacy_manifest_candidate(payload)
+
+
+def create_migration_backup(path: Path | str) -> Path:
+    """Create the standard backup used when a legacy manifest is published."""
+    return _create_migration_backup(Path(path))
+
+
+def _load_manifest_payload(
+    path: Path | str, *, migrate: bool = True
+) -> tuple[Path, dict[str, Any]]:
     manifest_path = Path(path)
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -148,36 +161,50 @@ def _load_manifest_payload(path: Path | str) -> tuple[Path, dict[str, Any]]:
     if not isinstance(payload, dict):
         raise ProfileError("profile manifest must be a JSON object")
     schema = payload.get("schema_version")
-    if schema != 1:
-        if schema not in (None, 0):
-            raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
-        migrated = _legacy_manifest_candidate(payload)
-        if migrated is None:
-            raise ProfileError("profile manifest is ambiguous or unsupported for automatic migration")
-        _create_migration_backup(manifest_path)
-        try:
-            write_manifest_atomically(manifest_path, migrated)
-        except Exception as error:
-            raise ProfileError(f"profile manifest migration failed: {error}") from error
-        payload = migrated
+    if isinstance(schema, bool) or (
+        schema is not None and not isinstance(schema, int)
+    ):
+        raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
+    if schema in (1, 2):
+        pass
+    elif schema in (None, 0):
+        if migrate:
+            migrated = _legacy_manifest_candidate(payload)
+            if migrated is None:
+                raise ProfileError(
+                    "profile manifest is ambiguous or unsupported for automatic migration"
+                )
+            _create_migration_backup(manifest_path)
+            try:
+                write_manifest_atomically(manifest_path, migrated)
+            except Exception as error:
+                raise ProfileError(f"profile manifest migration failed: {error}") from error
+            payload = migrated
+    else:
+        raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
     payload = copy.deepcopy(payload)
     payload.pop("default_profile", None)
     return manifest_path, payload
 
 
 def load_manifest_source(
-    path: Path | str, *, allow_missing_artifacts: bool = False
+    path: Path | str,
+    *,
+    allow_missing_artifacts: bool = False,
+    validate: bool = True,
+    migrate: bool = True,
 ) -> dict[str, Any]:
     """Load the persisted manifest while preserving explicit inheritance links."""
 
-    manifest_path, payload = _load_manifest_payload(path)
+    manifest_path, payload = _load_manifest_payload(path, migrate=migrate)
     try:
         resolve_manifest_inheritance(payload)
-        validate_manifest(
-            payload,
-            directory=manifest_path.parent,
-            allow_missing_artifacts=allow_missing_artifacts,
-        )
+        if validate:
+            validate_manifest(
+                payload,
+                directory=manifest_path.parent,
+                allow_missing_artifacts=allow_missing_artifacts,
+            )
     except ValueError as error:
         raise ProfileError(str(error)) from error
     return payload
@@ -744,8 +771,9 @@ def apply_manifest_transaction(
     install_units: Callable[[], Any],
     restart_broker: Callable[[], Any],
     writer: Callable[[Path, Mapping[str, Any]], None] = write_manifest_atomically,
+    reload_broker: Callable[[], Any] | None = None,
 ) -> ApplyResult:
-    """Publish a profile edit without restarting a running backend."""
+    """Publish a profile edit and refresh the broker registry without restarting the backend."""
 
     path = Path(profiles_path)
     old_manifest = load_manifest_source(path)
@@ -753,14 +781,20 @@ def apply_manifest_transaction(
         return ApplyResult(changed=False, restarted=False)
     validate_manifest(new_manifest, directory=path.parent)
     writer(path, new_manifest)
+    reload_attempted = False
     try:
         install_units()
+        if reload_broker is not None:
+            reload_attempted = True
+            reload_broker()
         return ApplyResult(changed=True, restarted=False)
     except Exception as error:
         rollback_errors: list[str] = []
         try:
             writer(path, old_manifest)
             install_units()
+            if reload_broker is not None and reload_attempted:
+                reload_broker()
         except Exception as rollback_error:
             rollback_errors.append(str(rollback_error))
         detail = f"profile apply failed: {error}"

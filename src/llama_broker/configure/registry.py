@@ -49,9 +49,17 @@ class ToolProfile:
     parallel: int
     capabilities: list[str]
     role: str
+    profile_id: str = ""
+    aliases: tuple[str, ...] = ()
 
     @classmethod
     def from_broker(cls, profile: dict[str, Any]) -> "ToolProfile":
+        raw_aliases = profile.get("aliases", [])
+        aliases = tuple(
+            str(alias)
+            for alias in raw_aliases
+            if isinstance(alias, str) and alias.strip()
+        ) if isinstance(raw_aliases, list) else ()
         return cls(
             alias=profile["alias"],
             display_name=profile.get("display_name", profile["alias"]),
@@ -59,6 +67,8 @@ class ToolProfile:
             parallel=profile["parallel"],
             capabilities=profile.get("capabilities", ["text"]),
             role=profile.get("role", "persistent"),
+            profile_id=str(profile.get("id", "")),
+            aliases=aliases,
         )
 
 
@@ -106,7 +116,28 @@ class ToolRegistry:
         return data.get("profiles", [])
 
     def get_model_names(self) -> list[str]:
+        """Return only canonical public model IDs for generated configs."""
         return [p.alias for p in self.profiles]
+
+    def canonical_model_name(self, reference: str) -> str | None:
+        """Resolve an internal profile reference to its public model ID.
+
+        Profile IDs and compatibility aliases remain valid inputs for
+        resolution, but generated client model catalogs must contain only the
+        canonical ``alias`` value.
+        """
+        value = str(reference or "").strip()
+        if not value:
+            return None
+        folded = value.casefold()
+        for profile in self.profiles:
+            references = (profile.profile_id, profile.alias, *profile.aliases)
+            if any(
+                candidate and str(candidate).strip().casefold() == folded
+                for candidate in references
+            ):
+                return profile.alias
+        return None
 
     def get_model_by_alias(self, alias: str) -> ToolProfile | None:
         for p in self.profiles:

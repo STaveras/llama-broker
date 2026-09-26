@@ -90,6 +90,15 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("server_binary", "Runtime binary", "path", advanced=True),
     EditorField("model_path", "Model file", "path", advanced=True),
     EditorField("model_draft", "Draft model file", "path", advanced=True),
+    EditorField(
+        "spec_type",
+        "Speculative decoding",
+        "select",
+        advanced=True,
+        options=("off", "mtp", "draft-mtp", "nextn"),
+    ),
+    EditorField("draft_max", "Draft max tokens", "int", advanced=True),
+    EditorField("draft_min", "Draft min tokens", "int", advanced=True),
     EditorField("native_vision", "Native vision", "toggle", advanced=True),
     EditorField("fit", "Auto-fit to VRAM", "toggle", advanced=True),
     EditorField("fit_target_mib", "Fit target MiB", "int", advanced=True),
@@ -343,6 +352,90 @@ def run_guided_wizard(
     return 0
 
 
+_SPECULATIVE_FLAG_BY_FIELD: Mapping[str, str] = {
+    "spec_type": "--spec-type",
+    "draft_max": "--draft-max",
+    "draft_min": "--draft-min",
+}
+_DRAFT_MAX_ALIASES = ("--draft-max", "--spec-draft-n-max")
+_SPECULATIVE_EDITOR_FIELDS = frozenset(_SPECULATIVE_FLAG_BY_FIELD)
+_SPECULATIVE_COUNT_FIELDS = _SPECULATIVE_EDITOR_FIELDS - {"spec_type"}
+_MANAGED_SPECULATIVE_FLAGS = frozenset(
+    ("--spec-type", "--draft-max", "--spec-draft-n-max", "--draft-min")
+)
+
+
+def _extra_arg_value(extra_args: Any, flag: str) -> str:
+    """Read a flag value without changing the raw extra-args representation."""
+    if not isinstance(extra_args, list):
+        return ""
+    for index, token in enumerate(extra_args):
+        if token == flag and index + 1 < len(extra_args):
+            value = extra_args[index + 1]
+            if isinstance(value, str) and not value.startswith("--"):
+                return value
+            return ""
+    return ""
+
+
+def _draft_max_value(extra_args: Any) -> str:
+    for flag in _DRAFT_MAX_ALIASES:
+        value = _extra_arg_value(extra_args, flag)
+        if value:
+            return value
+    return ""
+
+
+def _without_managed_speculative_args(extra_args: Any) -> list[str]:
+    if not isinstance(extra_args, list):
+        return []
+    result: list[str] = []
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token in _MANAGED_SPECULATIVE_FLAGS:
+            index += 1
+            if index < len(extra_args) and not extra_args[index].startswith("--"):
+                index += 1
+            continue
+        result.append(token)
+        index += 1
+    return result
+
+
+def _replace_extra_arg(
+    extra_args: Any,
+    flag: str,
+    value: str | None,
+) -> list[str]:
+    """Replace or remove one flag/value pair while preserving other arguments."""
+    if not isinstance(extra_args, list) or not all(
+        isinstance(item, str) and item for item in extra_args
+    ):
+        raise ValueError("extra_args must be a JSON string list")
+
+    updated: list[str] = []
+    replaced = False
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token != flag:
+            updated.append(token)
+            index += 1
+            continue
+
+        if value is not None and not replaced:
+            updated.extend((flag, value))
+            replaced = True
+        index += 1
+        if index < len(extra_args) and not extra_args[index].startswith("--"):
+            index += 1
+
+    if value is not None and not replaced:
+        updated.extend((flag, value))
+    return updated
+
+
 class TUIModel:
     """Testable state model for the field-oriented profile editor."""
 
@@ -489,7 +582,8 @@ class TUIModel:
     @property
     def visible_fields(self) -> list[EditorField]:
         current = self.current or {}
-        runtime_info = get_runtime_info(str(current.get("runtime", "llamacpp")))
+        runtime = str(current.get("runtime", "llamacpp")).strip().lower()
+        runtime_info = get_runtime_info(runtime)
         inferred = self._current_runtime_build(current)
         family = inferred.runtime if inferred is not None else "(custom/manual)"
         fields = []
@@ -503,7 +597,9 @@ class TUIModel:
                 field = replace(field, options=tuple(self._build_option(build) for build in builds))
             elif field.key == "runtime" and family != "(custom/manual)":
                 continue
-            elif field.key not in runtime_info.editable_fields:
+            elif field.key not in runtime_info.editable_fields and not (
+                runtime == "llamacpp" and field.key in _SPECULATIVE_EDITOR_FIELDS
+            ):
                 continue
             if field.advanced and not self.advanced:
                 continue
@@ -552,7 +648,14 @@ class TUIModel:
         if key in {"environment", "safety"}:
             return json.dumps(current.get(key, {}), sort_keys=True)
         if key == "extra_args":
-            return json.dumps(current.get(key, []))
+            return json.dumps(_without_managed_speculative_args(current.get(key, [])))
+        if key in _SPECULATIVE_FLAG_BY_FIELD:
+            value = (
+                _draft_max_value(current.get("extra_args", []))
+                if key == "draft_max"
+                else _extra_arg_value(current.get("extra_args", []), _SPECULATIVE_FLAG_BY_FIELD[key])
+            )
+            return value or ("off" if key == "spec_type" else "")
         if key == "runtime_family":
             inferred = self._current_runtime_build(current)
             if inferred is None:
@@ -589,7 +692,43 @@ class TUIModel:
             return current
         draft = clone_record(current)
 
-        if key == "runtime_family":
+        if key in _SPECULATIVE_FLAG_BY_FIELD:
+            raw = "" if value is None else str(value).strip()
+            if key == "spec_type":
+                if raw == "off":
+                    replacement = None
+                else:
+                    requested = tuple(part.strip() for part in raw.split(","))
+                    if not requested or any(
+                        part not in {"mtp", "draft-mtp", "nextn"} for part in requested
+                    ):
+                        raise ValueError(f"unsupported speculative decoding type: {raw!r}")
+                    replacement = ",".join(requested)
+            else:
+                replacement = str(int(raw)) if raw else None
+            if key == "draft_max":
+                draft["extra_args"] = _replace_extra_arg(
+                    _replace_extra_arg(draft.get("extra_args", []), "--spec-draft-n-max", None),
+                    "--draft-max",
+                    replacement,
+                )
+            else:
+                draft["extra_args"] = _replace_extra_arg(
+                    draft.get("extra_args", []), _SPECULATIVE_FLAG_BY_FIELD[key], replacement
+                )
+        elif key == "extra_args":
+            raw_args = json.loads(str(value)) if isinstance(value, str) else value
+            if not isinstance(raw_args, list) or not all(isinstance(item, str) and item for item in raw_args):
+                raise ValueError("extra_args must be a JSON string list")
+            preserved: list[str] = []
+            current_args = draft.get("extra_args", [])
+            for index, token in enumerate(current_args):
+                if isinstance(token, str) and token in _MANAGED_SPECULATIVE_FLAGS:
+                    preserved.append(token)
+                    if index + 1 < len(current_args) and not str(current_args[index + 1]).startswith("--"):
+                        preserved.append(current_args[index + 1])
+            draft["extra_args"] = list(raw_args) + preserved
+        elif key == "runtime_family":
             selected = self._family_for_value(value)
             if not selected or selected == "(custom/manual)":
                 draft.pop("runtime_build", None)
@@ -732,6 +871,87 @@ def _truncate_field_value(value: str, width: int) -> str:
     return "..." + value[-(width - 3) :]
 
 
+def _alt_arrow_from_sequence(sequence: list[int]) -> int | None:
+    """Decode an Alt+Arrow sequence that curses did not recognize."""
+
+    import curses
+
+    if not sequence or sequence[0] not in (ord("["), ord("O")):
+        return None
+    arrow_keys = {
+        ord("A"): curses.KEY_UP,
+        ord("B"): curses.KEY_DOWN,
+        ord("C"): curses.KEY_RIGHT,
+        ord("D"): curses.KEY_LEFT,
+    }
+    final = sequence[-1]
+    if final not in arrow_keys:
+        return None
+    parameters = sequence[1:-1]
+    if sequence[0] == ord("O") and parameters:
+        return None
+    if sequence[0] == ord("[") and any(
+        value != ord(";")
+        and value != ord("?")
+        and not ord("0") <= value <= ord("9")
+        for value in parameters
+    ):
+        return None
+    return arrow_keys[final]
+
+
+def _read_curses_key(stdscr: Any) -> int:
+    """Read a key while keeping Alt-modified arrows from becoming Escape."""
+
+    import curses
+
+    key = stdscr.getch()
+    if key != 27:
+        return key
+
+    sequence: list[int] = []
+    try:
+        # Alt is commonly encoded as ESC followed by a CSI/SS3 arrow
+        # sequence.  curses.keypad() does not decode every modifier variant,
+        # so wait briefly for the tail before treating ESC as cancellation.
+        stdscr.timeout(50)
+        for _ in range(16):
+            next_key = stdscr.getch()
+            if next_key == -1:
+                break
+            sequence.append(next_key)
+            if len(sequence) == 1 and next_key in (
+                curses.KEY_UP,
+                curses.KEY_DOWN,
+                curses.KEY_LEFT,
+                curses.KEY_RIGHT,
+            ):
+                return next_key
+            decoded = _alt_arrow_from_sequence(sequence)
+            if decoded is not None:
+                return decoded
+            if sequence[0] not in (ord("["), ord("O")):
+                break
+            if sequence[0] == ord("O") and len(sequence) > 1:
+                break
+            if sequence[0] == ord("[") and any(
+                value != ord(";")
+                and value != ord("?")
+                and not ord("0") <= value <= ord("9")
+                and value not in (ord("A"), ord("B"), ord("C"), ord("D"))
+                for value in sequence[1:]
+            ):
+                break
+    finally:
+        stdscr.timeout(-1)
+
+    # Preserve an unrecognized Escape sequence for the caller instead of
+    # dropping the bytes that followed the Escape prefix.
+    for value in reversed(sequence):
+        curses.ungetch(value)
+    return key
+
+
 def _curses_prompt(
     stdscr: Any,
     prompt: str,
@@ -768,7 +988,7 @@ def _curses_prompt(
     render()
     while True:
         try:
-            key = stdscr.getch()
+            key = _read_curses_key(stdscr)
         except KeyboardInterrupt:
             return original
 
@@ -812,7 +1032,7 @@ def _curses_confirm(stdscr: Any, prompt: str, *, default: bool = True) -> bool:
     choices = "Y/n" if default else "y/N"
     stdscr.addnstr(max(height - 2, 0), 0, f"{prompt} [{choices}]", max(width - 1, 1))
     stdscr.clrtoeol()
-    key = stdscr.getch()
+    key = _read_curses_key(stdscr)
     if key in (ord("y"), ord("Y")):
         return True
     if key in (ord("n"), ord("N")):
@@ -831,13 +1051,26 @@ def _curses_select(
 
     choices = list(dict.fromkeys([str(current), *options]))
     selected = choices.index(str(current)) if str(current) in choices else 0
+    scroll = 0
     while True:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
-        stdscr.addnstr(0, 0, f"{label} — choose a value" , max(width - 1, 1), curses.A_BOLD)
-        stdscr.addnstr(1, 0, "↑/↓ move  Enter select  Esc cancel", max(width - 1, 1))
-        row = 3
-        for choice_index, choice in enumerate(choices):
+
+        def draw_line(row: int, column: int, text: str, attr: int = 0) -> None:
+            # addnstr() raises curses.error when its starting cell is outside
+            # the window.  Dropdown entries can be taller than the viewport,
+            # so clip both the row and the available columns explicitly.
+            if not (0 <= row < height and 0 <= column < width):
+                return
+            count = width - column - 1
+            if count > 0:
+                stdscr.addnstr(row, column, text, count, attr)
+
+        draw_line(0, 0, f"{label} — choose a value", curses.A_BOLD)
+        draw_line(1, 0, "↑/↓ move  Enter select  Esc cancel")
+
+        rendered_choices: list[list[str]] = []
+        for choice in choices:
             choice_lines: list[str] = []
             for line in str(choice).splitlines() or [""]:
                 choice_lines.extend(
@@ -849,20 +1082,41 @@ def _curses_select(
                     )
                     or [""]
                 )
-            for line_index, line in enumerate(choice_lines):
-                marker = (
-                    "●" if choice_index == selected else "○"
-                ) if line_index == 0 else " "
-                prefix = f"{marker} " if line_index == 0 else "  "
-                stdscr.addnstr(
-                    row,
-                    2,
-                    f"{prefix}{line}",
-                    max(width - 3, 1),
-                    curses.A_REVERSE if choice_index == selected else 0,
-                )
-                row += 1
-        key = stdscr.getch()
+            rendered_choices.append(choice_lines or [""])
+
+        viewport_height = max(height - 3, 0)
+        if viewport_height:
+            starts: list[int] = []
+            line_count = 0
+            for choice_lines in rendered_choices:
+                starts.append(line_count)
+                line_count += len(choice_lines)
+
+            selected_start = starts[selected]
+            selected_end = selected_start + len(rendered_choices[selected])
+            if selected_start < scroll:
+                scroll = selected_start
+            elif selected_end > scroll + viewport_height:
+                scroll = selected_end - viewport_height
+            scroll = max(0, min(scroll, max(line_count - viewport_height, 0)))
+
+            line_number = 0
+            for choice_index, choice_lines in enumerate(rendered_choices):
+                for line_index, line in enumerate(choice_lines):
+                    if scroll <= line_number < scroll + viewport_height:
+                        marker = (
+                            "●" if choice_index == selected else "○"
+                        ) if line_index == 0 else " "
+                        prefix = f"{marker} " if line_index == 0 else "  "
+                        draw_line(
+                            3 + line_number - scroll,
+                            2,
+                            f"{prefix}{line}",
+                            curses.A_REVERSE if choice_index == selected else 0,
+                        )
+                    line_number += 1
+
+        key = _read_curses_key(stdscr)
         if key in (27, ord("q")):
             return str(current), True
         if key in (curses.KEY_UP, ord("k")):
@@ -894,7 +1148,7 @@ def _curses_checklist(
             marker = "[x]" if choice in selected else "[ ]"
             attr = curses.A_REVERSE if row - 3 == cursor else 0
             stdscr.addnstr(row, 2, f"{marker} {choice}", max(width - 3, 1), attr)
-        key = stdscr.getch()
+        key = _read_curses_key(stdscr)
         if key == 27:
             return list(current or []), True
         if key in (curses.KEY_UP, ord("k")):
@@ -930,7 +1184,13 @@ def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
             stdscr,
             field.label,
             value,
-            allow_empty=field.key in {"mmproj_path", "model_draft", "restore_profile"},
+            allow_empty=field.key
+            in {
+                "mmproj_path",
+                "model_draft",
+                "restore_profile",
+                *_SPECULATIVE_COUNT_FIELDS,
+            },
         )
     if cancelled:
         return
@@ -991,7 +1251,7 @@ def run_tui(
             stdscr.addnstr(0, 0, "Llama-Broker profile editor", max(width - 1, 1), curses.A_BOLD)
             if current is None:
                 stdscr.addnstr(2, 0, "No profiles configured. Press q to quit.", max(width - 1, 1))
-                key = stdscr.getch()
+                key = _read_curses_key(stdscr)
                 if key in (ord("q"), 27):
                     return 0
                 continue
@@ -1020,7 +1280,7 @@ def run_tui(
             if status:
                 stdscr.addnstr(max(height - 3, 0), 0, status, max(width - 1, 1), curses.A_BOLD)
             stdscr.addnstr(max(height - 2, 0), 0, "Enter opens a text box/dropdown; changes stay in memory until Save.", max(width - 1, 1))
-            key = stdscr.getch()
+            key = _read_curses_key(stdscr)
             if key in (ord("q"), 27):
                 if model.dirty:
                     if not _curses_confirm(stdscr, "Discard unsaved changes?", default=False):

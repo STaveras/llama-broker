@@ -119,11 +119,33 @@ class ProfileConfigTests(unittest.TestCase):
         self.assertEqual(self.manifest_path.read_text(encoding="utf-8"), original)
         self.assertFalse(list(self.root.glob("profiles.json.bak-*")))
 
-        unsupported = json.dumps({"schema_version": 2, "profiles": []})
-        self.manifest_path.write_text(unsupported, encoding="utf-8")
-        with self.assertRaisesRegex(Exception, "unsupported"):
-            load_manifest(self.manifest_path)
-        self.assertEqual(self.manifest_path.read_text(encoding="utf-8"), unsupported)
+        v2_manifest = json.dumps({"schema_version": 2, "profiles": []})
+        self.manifest_path.write_text(v2_manifest, encoding="utf-8")
+        self.assertEqual(
+            load_manifest(self.manifest_path),
+            {"schema_version": 2, "profiles": []},
+        )
+        self.assertEqual(self.manifest_path.read_text(encoding="utf-8"), v2_manifest)
+
+    def test_active_apply_refreshes_broker_registry_after_install(self) -> None:
+        updated = json.loads(json.dumps(self.data))
+        record = next(item for item in updated["profiles"] if item["id"] == "fixture-vision-12b")
+        record["batch_size"] = 32
+        record["ubatch_size"] = 32
+        reload_broker = Mock()
+
+        result = apply_manifest_transaction(
+            self.manifest_path,
+            updated,
+            active_profile="fixture-vision-12b",
+            install_units=Mock(),
+            restart_broker=Mock(),
+            reload_broker=reload_broker,
+        )
+
+        self.assertTrue(result.changed)
+        self.assertFalse(result.restarted)
+        reload_broker.assert_called_once_with()
 
     def test_active_apply_updates_without_restarting(self) -> None:
         updated = json.loads(json.dumps(self.data))

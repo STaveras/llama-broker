@@ -4,7 +4,7 @@
 Usage:
     brokerctl model list                   List client-facing model references
     brokerctl status                       Show broker state
-    brokerctl render MODEL                 Render a profile unit
+    brokerctl profile render MODEL         Render a profile unit
     brokerctl load MODEL                   Load model profile
     brokerctl unload                       Unload the backend
     brokerctl verify [MODEL]               Verify SHA-256 hashes
@@ -57,6 +57,7 @@ from .broker_profiles import (
     Profile,
     ProfileError,
     ProfileRegistry,
+    launch_environment,
 )
 from .discovery import discover_backends
 from .profile_config import (
@@ -74,11 +75,12 @@ from .runtime_builds import (
 )
 from .runtimes import get_runtime_info, list_runtimes, runtime_names
 from .integration import filtered_manifest, inspect_manifest, report_for
-from .paths import MODELS_DIR
+from .paths import MODELS_DIR, RUNTIME_CATALOG_PATH, RUNTIMES_DIR
 from .setup_wizard import (
     apply_profile_plan,
     build_setup_plan,
     discover_candidates,
+    ensure_runtime_catalog,
     render_report,
 )
 from .autotune import (
@@ -222,6 +224,33 @@ def _service_exec_start() -> str:
     return f"{sys.executable} {BROKER_DIR / 'llama_broker.py'}"
 
 
+def _profile_verification_result(
+    profile: Profile, *, verify_artifacts: bool = True
+) -> dict[str, object]:
+    failures = _verify_profile(profile) if verify_artifacts else []
+    return {
+        "id": profile.id,
+        "status": "ok" if not failures else "unverified",
+        "errors": failures,
+        "runtime": profile.runtime,
+        "runtime_build": profile.runtime_build,
+        "deployment_revision": profile.deployment_revision,
+        "bundle_root": str(profile.bundle_root) if profile.bundle_root else None,
+        "source_repository": (
+            str(profile.source_repository) if profile.source_repository else None
+        ),
+        "provenance_file": (
+            str(profile.provenance_file) if profile.provenance_file else None
+        ),
+        "source_branch": profile.source_branch,
+        "source_commit": profile.source_commit,
+        "dirty": profile.dirty,
+        "selected_profile_ids": list(profile.selected_profile_ids),
+        "warnings": list(profile.warnings),
+        "degraded_features": list(profile.degraded_features),
+    }
+
+
 def _verify_profile(profile: Profile) -> list[str]:
     failures: list[str] = []
     checks = [
@@ -250,9 +279,7 @@ PROFILE_MUTATION_REMINDER = (
 CLI_CACHE_TYPES = ("f16", "kvarn4", "turbo4")
 KNOWN_CACHE_TYPES = ALLOWED_CACHE_TYPES
 ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-REQUIRED_LLAMACPP_ENVIRONMENT = frozenset(
-    {"GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_GRAPH_OPT", "GGML_CUDA_PDL"}
-)
+REQUIRED_LLAMACPP_ENVIRONMENT = frozenset({"GGML_CUDA_PDL"})
 
 
 def _load_editable_manifest(
@@ -296,14 +323,45 @@ def _record_for_selector(
     raise ProfileError(f"profile record not found: {profile.id}")
 
 
+def _is_authoritative_manifest(profiles_path: Path) -> bool:
+    return profiles_path.resolve() == PROFILES_PATH.resolve()
+
+
+def _refresh_live_profile_registry(profiles_path: Path) -> None:
+    if not _is_authoritative_manifest(profiles_path):
+        return
+    try:
+        _broker_admin("/admin/autotune/reload", {})
+    except Exception as error:
+        raise ApplyError(f"live broker profile registry refresh failed: {error}") from error
+
+
 def _publish_profile_change(
     profiles_path: Path,
     data: dict[str, object],
     description: str,
 ) -> int:
+    old_manifest = json.loads(profiles_path.read_text(encoding="utf-8"))
+    if not isinstance(old_manifest, dict):
+        raise ApplyError("profile manifest must contain a JSON object")
+    live_manifest = _is_authoritative_manifest(profiles_path)
     _write_validated_manifest(profiles_path, data)
+    try:
+        _refresh_live_profile_registry(profiles_path)
+    except Exception:
+        try:
+            _write_validated_manifest(profiles_path, old_manifest)
+        except Exception as rollback_error:
+            raise ApplyError(
+                "profile mutation failed and manifest rollback also failed: "
+                f"{rollback_error}"
+            ) from rollback_error
+        raise
     print(f"{description} in {profiles_path}")
-    print(PROFILE_MUTATION_REMINDER)
+    if live_manifest:
+        print("Live broker profile registry refreshed.")
+    else:
+        print(PROFILE_MUTATION_REMINDER)
     return 0
 
 
@@ -355,6 +413,7 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         "ubatch": "ubatch_size",
         "cache-k": "cache_type_k",
         "cache-v": "cache_type_v",
+        "moe-cache-slots-limit": "moe_cache_slots_limit",
         "flash": "flash_attention",
         "gpu-layers": "gpu_layers",
         "mmproj": "mmproj_path",
@@ -378,7 +437,14 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         if not value:
             raise ProfileError("alias must not be empty")
         record[key] = value
-    elif field in {"context", "parallel", "batch", "ubatch", "startup-timeout"}:
+    elif field in {
+        "context",
+        "parallel",
+        "batch",
+        "ubatch",
+        "startup-timeout",
+        "moe-cache-slots-limit",
+    }:
         try:
             value = int(raw_value, 10)
         except ValueError as error:
@@ -492,10 +558,104 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
     if not PROFILE_ID_RE.fullmatch(profile_id):
         raise ProfileError(f"invalid profile id: {profile_id!r}")
     record = _template_profile_record(data)
+
+    template_build = None
+    raw_template_build = record.get("runtime_build")
+    if isinstance(raw_template_build, str) and raw_template_build.strip():
+        try:
+            template_build = resolve_runtime_build(data, raw_template_build)
+        except ValueError as error:
+            raise ProfileError(str(error)) from error
+
+    requested_server_path = None
+    requested_server_sha256 = None
+    if args.server_binary:
+        requested_server_path = _normalise_existing_path(
+            args.server_binary, "server-binary"
+        )
+        requested_server_sha256 = sha256_file(requested_server_path)
+
+    selected_build = None
+    requested_runtime_build = getattr(args, "runtime_build", None)
+    if requested_runtime_build is not None:
+        try:
+            selected_build = resolve_runtime_build(data, requested_runtime_build)
+        except ValueError as error:
+            raise ProfileError(str(error)) from error
+    elif requested_server_path is not None:
+        selected_build = infer_runtime_build(
+            data,
+            {
+                "runtime": record.get("runtime"),
+                "server_binary": str(requested_server_path),
+                "server_sha256": requested_server_sha256,
+            },
+        )
+    if selected_build is None:
+        selected_build = template_build
+
+    if selected_build is not None:
+        if requested_server_path is not None and (
+            requested_server_path != selected_build.server_binary
+            or requested_server_sha256 != selected_build.server_sha256
+        ):
+            raise ProfileError(
+                f"server_binary {requested_server_path} does not match runtime build "
+                f"{selected_build.id!r}"
+            )
+        template_runtime = (
+            template_build.runtime
+            if template_build is not None
+            else str(record.get("runtime") or "llamacpp").strip().lower()
+        )
+        runtime_changed = template_runtime != selected_build.runtime
+        if runtime_changed:
+            editable_fields = get_runtime_info(selected_build.runtime).editable_fields
+            for field in tuple(record):
+                if field not in editable_fields:
+                    record.pop(field, None)
+            # Extra arguments are runtime-specific; callers can add new ones
+            # through --arg after the target runtime has been selected.
+            record["extra_args"] = []
+        record.update(
+            {
+                "runtime": selected_build.runtime,
+                "runtime_build": selected_build.id,
+                "server_binary": str(selected_build.server_binary),
+                "server_sha256": selected_build.server_sha256,
+            }
+        )
+        raw_environment = record.get("environment", {})
+        if not isinstance(raw_environment, dict):
+            raise ProfileError("environment must be a mapping for the new profile")
+        inherited_environment = {} if runtime_changed else dict(raw_environment)
+        if template_build is not None and not runtime_changed:
+            for key, value in template_build.environment.items():
+                if inherited_environment.get(key) == value:
+                    inherited_environment.pop(key)
+        if selected_build.runtime == "vllm":
+            inherited_environment = {
+                key: value
+                for key, value in inherited_environment.items()
+                if not key.startswith(("GGML_", "LLAMA_"))
+            }
+        environment = dict(selected_build.environment)
+        environment.update(inherited_environment)
+        if selected_build.runtime == "llamacpp":
+            environment.setdefault("GGML_CUDA_PDL", "0")
+        record["environment"] = environment
+    else:
+        server_path = requested_server_path or _normalise_existing_path(
+            str(record.get("server_binary", "")), "server-binary"
+        )
+        record["server_binary"] = str(server_path)
+        record["server_sha256"] = (
+            requested_server_sha256
+            if requested_server_sha256 is not None
+            else sha256_file(server_path)
+        )
+
     model_path = _normalise_existing_path(args.model, "model")
-    server_path = _normalise_existing_path(
-        args.server_binary or str(record.get("server_binary", "")), "server-binary"
-    )
     aliases = [item.strip() for item in (args.alias or [profile_id]) if item.strip()]
     if not aliases:
         raise ProfileError("at least one non-empty alias is required")
@@ -512,8 +672,6 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
     record.pop("fit", None)
     for key in ("fit_target_mib", "fit_ctx", "ctx_checkpoints", "cache_ram_mib"):
         record.pop(key, None)
-    record["server_binary"] = str(server_path)
-    record["server_sha256"] = sha256_file(server_path)
     record["model_path"] = str(model_path)
     record["model_sha256"] = sha256_file(model_path)
 
@@ -712,9 +870,11 @@ def _interactive_edit(
             print(f"  {field_label}: {current} -> {new_value}")
 
     if changed:
-        _write_validated_manifest(profiles_path, data)
-        print(f"\nUpdated {profile_id} in {profiles_path}")
-        print(PROFILE_MUTATION_REMINDER)
+        return _publish_profile_change(
+            profiles_path,
+            data,
+            f"Updated {profile_id}",
+        )
     else:
         print("\nNo changes.")
 
@@ -763,10 +923,23 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         print("integrate --dry-run is interactive and cannot be combined with --json", file=sys.stderr)
         return 2
     mode = getattr(args, "integrate_command", None)
+    clean_requested = bool(getattr(args, "clean", False))
     if mode == "configure":
+        if clean_requested:
+            print("integrate --clean requires the install mode", file=sys.stderr)
+            return 2
         return _cmd_integrate_configure(args)
     install_requested = mode in (None, "install")
     configure_requested = mode is None
+    if clean_requested and not install_requested:
+        print("integrate --clean requires the install mode", file=sys.stderr)
+        return 2
+    if clean_requested and not getattr(args, "install_units", True):
+        print(
+            "integrate --clean requires unit installation; remove --no-install-units",
+            file=sys.stderr,
+        )
+        return 2
     try:
         payload, inspections = inspect_manifest(
             args.profiles,
@@ -775,6 +948,14 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
     except (OSError, ProfileError, ValueError) as error:
         print(f"ERROR: integration cannot read profiles: {error}", file=sys.stderr)
         return 1
+
+    manifest_profile_ids: frozenset[str] | None = None
+    if clean_requested:
+        try:
+            manifest_profile_ids = _safe_manifest_profile_ids(payload)
+        except (ProfileError, ValueError) as error:
+            print(f"ERROR: integration cannot establish safe manifest ownership: {error}", file=sys.stderr)
+            return 1
 
     ready = [item for item in inspections if item.status == "ready" and item.profile is not None]
     if not ready:
@@ -903,6 +1084,15 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         }
         for item in planned
     ]
+    cleanup_report: dict[str, object] | None = None
+    if clean_requested:
+        cleanup_report = {
+            "action": "stale_unit_cleanup",
+            "requested": True,
+            "status": "planned",
+            "removed": [],
+        }
+        operations.append(cleanup_report)
     if not install_requested:
         operations = []
     if install_requested:
@@ -945,16 +1135,46 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
         apply_confirmed = True
 
     applied_errors: list[str] = list(plan_errors)
+    unit_install_succeeded = False
     if install_requested:
         if systemd_ready and getattr(args, "install_units", True) and controller is not None:
             try:
                 controller.install_units()
+                unit_install_succeeded = True
             except (BackendControllerError, OSError, ValueError) as error:
                 applied_errors.append(f"systemd unit integration failed: {error}")
         elif not systemd_ready:
             applied_errors.append("systemd user session unavailable; unit files were left untouched")
         elif controller is None:
             applied_errors.append("no profile rendered successfully; profile units were left untouched")
+
+    if clean_requested:
+        assert cleanup_report is not None
+        cleanup_report["status"] = "skipped"
+        if not systemd_ready:
+            cleanup_report["reason"] = "systemd user session unavailable"
+            applied_errors.append("stale unit cleanup skipped: systemd user session unavailable")
+        elif not unit_install_succeeded:
+            cleanup_report["reason"] = "profile unit installation did not complete"
+            applied_errors.append("stale unit cleanup skipped: profile unit installation did not complete")
+        elif controller is None:
+            cleanup_report["reason"] = "no profile controller available"
+            applied_errors.append("stale unit cleanup skipped: no profile controller available")
+        else:
+            try:
+                assert manifest_profile_ids is not None
+                removed_paths = tuple(
+                    controller.cleanup_stale_units(
+                        manifest_profile_ids=manifest_profile_ids,
+                    )
+                )
+                cleanup_report["status"] = "removed" if removed_paths else "unchanged"
+                cleanup_report["removed"] = [Path(path).name for path in removed_paths]
+                cleanup_report["paths"] = [str(path) for path in removed_paths]
+            except (BackendControllerError, OSError, ValueError) as error:
+                cleanup_report["status"] = "failed"
+                cleanup_report["error"] = str(error)
+                applied_errors.append(f"stale unit cleanup failed: {error}")
 
     # The broker unit is lightweight control-plane integration.  It is written
     # independently of profile units and never starts a backend.
@@ -1009,6 +1229,13 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             print(f"  broker unit: {plan_report['broker_unit']}")
         if plan_report.get("client_provider"):
             print(f"  client/provider: {plan_report['client_provider']}")
+        if cleanup_report is not None:
+            removed = cleanup_report.get("removed", [])
+            removed_count = len(removed) if isinstance(removed, list) else 0
+            print(
+                f"  stale unit cleanup: {removed_count} removed "
+                f"({cleanup_report['status']})"
+            )
         for error in applied_errors:
             print(f"  ERROR: {error}", file=sys.stderr)
     return 3 if partial else 0
@@ -1064,24 +1291,118 @@ def _confirm_setup_plan(plan: object) -> bool:
     return answer in {"y", "yes"}
 
 
+def _safe_manifest_profile_ids(payload: Mapping[str, Any]) -> frozenset[str]:
+    """Return the complete manifest ID set or fail closed for cleanup."""
+    raw_profiles = payload.get("profiles")
+    if not isinstance(raw_profiles, list):
+        raise ProfileError("unsafe manifest profile id set: profiles must be a list")
+    profile_ids: list[str] = []
+    for index, raw_profile in enumerate(raw_profiles):
+        if not isinstance(raw_profile, dict):
+            raise ProfileError(f"unsafe manifest profile id at index {index}: profile is not an object")
+        profile_id = raw_profile.get("id")
+        if not isinstance(profile_id, str) or not PROFILE_ID_RE.fullmatch(profile_id):
+            raise ProfileError(f"unsafe manifest profile id at index {index}: {profile_id!r}")
+        if profile_id in profile_ids:
+            raise ProfileError(f"ambiguous manifest profile id: {profile_id!r} is duplicated")
+        profile_ids.append(profile_id)
+    return frozenset(profile_ids)
+
+
+def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
+    references: list[Path] = []
+    if profiles_path.is_file():
+        payload: object = {}
+        try:
+            payload = json.loads(profiles_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict) and isinstance(payload.get("profiles"), list):
+            for profile in payload["profiles"]:
+                if not isinstance(profile, dict):
+                    continue
+                for field_name in ("server_binary", "model_path", "mmproj_path", "model_draft"):
+                    value = profile.get(field_name)
+                    if isinstance(value, str):
+                        references.append(Path(value).expanduser())
+                extra_args = profile.get("extra_args", [])
+                if isinstance(extra_args, list):
+                    for index, value in enumerate(extra_args):
+                        if value == "--moe-cache-profile" and index + 1 < len(extra_args):
+                            references.append(Path(str(extra_args[index + 1])).expanduser())
+    raw_schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    strict_schema = (
+        isinstance(raw_schema, int)
+        and not isinstance(raw_schema, bool)
+        and raw_schema in {1, 2}
+    )
+    try:
+        if RUNTIME_CATALOG_PATH.is_file() and profiles_path.is_file() and strict_schema:
+            registry = ProfileRegistry.from_path(profiles_path, allow_missing_artifacts=True)
+            for profile in registry.profiles:
+                references.extend(
+                    path
+                    for path in (
+                        profile.server_binary,
+                        profile.model_path,
+                        profile.mmproj_path,
+                        profile.model_draft,
+                    )
+                    if path is not None
+                )
+    except (ProfileError, OSError, ValueError):
+        pass
+    unique: dict[str, Path] = {}
+    for path in references:
+        unique[str(path)] = path
+    return list(unique.values())
+
+
 def _cmd_setup_wizard(args: argparse.Namespace) -> int:
     """Discover existing artifacts and apply only an explicitly reviewed plan."""
+
+    catalog_was_missing = not RUNTIME_CATALOG_PATH.is_file()
+    referenced_paths = _setup_referenced_paths(args.profiles)
+    explicit_paths: list[Path] = []
+    if getattr(args, "runtime_path", None) is not None:
+        explicit_paths.append(Path(args.runtime_path).expanduser())
+    if getattr(args, "model_path", None) is not None:
+        explicit_paths.append(Path(args.model_path).expanduser())
+    try:
+        catalog_report = ensure_runtime_catalog(
+            RUNTIME_CATALOG_PATH,
+            inventory_roots=[RUNTIMES_DIR, MODELS_DIR],
+            referenced_paths=referenced_paths,
+            explicit_paths=explicit_paths,
+        )
+        print(
+            f"Runtime catalog: {catalog_report['mode']} "
+            f"(broad_scan={catalog_report['broad_scan']})"
+        )
+    except (OSError, ValueError) as error:
+        print(f"ERROR: runtime catalog setup failed: {error}", file=sys.stderr)
+        return 1
 
     scan_paths = [Path(item).expanduser() for item in getattr(args, "scan_path", [])]
     runtime_path = getattr(args, "runtime_path", None)
     model_path = getattr(args, "model_path", None)
     if runtime_path is not None:
-        scan_paths.append(Path(runtime_path).expanduser().parent)
+        runtime_candidate = Path(runtime_path).expanduser()
+        scan_paths.append(runtime_candidate.parent if catalog_was_missing else runtime_candidate)
     if model_path is not None:
-        scan_paths.append(Path(model_path).expanduser().parent)
+        model_candidate = Path(model_path).expanduser()
+        scan_paths.append(model_candidate.parent if catalog_was_missing else model_candidate)
     if not scan_paths:
-        scan_paths = [
-            Path.home() / "bin",
-            Path.home() / ".local" / "bin",
-            Path.home() / ".local" / "share" / "runtimes",
-            MODELS_DIR,
-        ]
-        if sys.stdin.isatty() and sys.stdout.isatty():
+        if catalog_was_missing:
+            scan_paths = [
+                Path.home() / "bin",
+                Path.home() / ".local" / "bin",
+                RUNTIMES_DIR,
+                MODELS_DIR,
+            ]
+        else:
+            scan_paths = [path for path in referenced_paths if path.exists()]
+        if catalog_was_missing and sys.stdin.isatty() and sys.stdout.isatty():
             print("Enter additional scan paths one at a time; press Enter when finished.")
             while True:
                 try:
@@ -1160,7 +1481,7 @@ def _cmd_setup_wizard(args: argparse.Namespace) -> int:
             models_dir=MODELS_DIR,
             create_model_link=bool(getattr(args, "link_model", False)),
         )
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (ApplyError, OSError, ValueError, json.JSONDecodeError) as error:
         print(f"ERROR: setup apply failed: {error}", file=sys.stderr)
         return 1
 
@@ -1388,36 +1709,183 @@ def _cmd_security_init(args: argparse.Namespace) -> int:
 
 # ── Subcommands: model list and profiles list ───────────────────────────────
 
-def _render_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
-    """Render a small dependency-free table for human-facing CLI output."""
+_DEFAULT_TABLE_WIDTH = 80
+_MIN_TABLE_WIDTH = 40
+_MIN_COLUMN_WIDTH = 8
+_COLUMN_GUTTER = 2
+
+
+def _terminal_width(explicit: int | None = None) -> int:
+    """Best available terminal width in columns, with a sane floor.
+
+    *explicit* wins when given; otherwise the controlling terminal is probed
+    and a conservative default is used for pipes and non-terminals.
+    """
+
+    columns = explicit if explicit is not None else shutil.get_terminal_size().columns
+    return max(int(columns), _MIN_TABLE_WIDTH)
+
+
+def _wrap_cell(text: str, width: int) -> list[str]:
+    """Word-wrap one cell so every line fits in *width* columns."""
+
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        line = ""
+        for word in words:
+            if len(word) > width:
+                # One token longer than the whole column: hard-break it so the
+                # table keeps its shape instead of silently overflowing.
+                for chunk in range(0, len(word), width):
+                    piece = word[chunk : chunk + width]
+                    if not line:
+                        line = piece
+                    else:
+                        lines.append(line)
+                        line = piece
+                continue
+            if not line:
+                line = word
+                continue
+            if len(line) + 1 + len(word) > width:
+                lines.append(line)
+                line = word
+            else:
+                line += " " + word
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _cell_width(text: str) -> int:
+    """Natural width of one cell: its longest raw line, ignoring wrapping.
+
+    Word-wrapping turns long text into *rows*, not *columns*, so a cell only
+    contributes as much width as its widest single line needs.
+    """
+
+    return max((len(line) for line in text.split("\n")), default=0)
+
+
+def _word_width(text: str) -> int:
+    """Widest single word in a cell; the floor below which wrapping hard-breaks."""
+
+    return max((len(word) for word in text.split()), default=0)
+
+
+def _allocate_widths(
+    natural: list[int], word_widths: list[int], budget: int
+) -> list[int]:
+    """Fit *natural* column widths into *budget* columns.
+
+    Phase 1 shrinks the widest columns' slack toward their word floor (no
+    hard-breaking, just more rows); phase 2, only when a word is wider than
+    the terminal, shrinks below the floor so wrapping hard-breaks it. Either
+    way the table fits the budget instead of overflowing.
+    """
+
+    widths = list(natural)
+    gutters = _COLUMN_GUTTER * (len(widths) - 1)
+    floors = [max(w, _MIN_COLUMN_WIDTH) for w in word_widths]
+
+    while sum(widths) + gutters > budget:
+        # Phase 1: give up slack above the word floor, widest first.
+        candidates = [i for i, w in enumerate(widths) if w > floors[i]]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda i: widths[i] - floors[i])
+        widths[widest] -= 1
+    # Phase 2: a word is wider than the terminal; hard-break below the floor.
+    while sum(widths) + gutters > budget:
+        candidates = [i for i, w in enumerate(widths) if w > _MIN_COLUMN_WIDTH]
+        if not candidates:
+            break
+        widest = max(candidates, key=lambda i: widths[i])
+        widths[widest] -= 1
+    return widths
+
+
+def _render_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[object]],
+    *,
+    width: int = _DEFAULT_TABLE_WIDTH,
+) -> str:
+    """Render a small dependency-free table for human-facing CLI output.
+
+    Columns size to their content when the table fits within *width* columns;
+    otherwise long cells wrap vertically so the output always fits the terminal
+    instead of scrolling sideways.
+    """
 
     rendered_rows = [[str(value) for value in row] for row in rows]
     rendered_headers = [str(header) for header in headers]
-    widths = [len(header) for header in rendered_headers]
-    for row in rendered_rows:
-        for index, value in enumerate(row):
-            widths[index] = max(widths[index], len(value))
+    columns = len(rendered_headers)
 
-    def render_row(row: Sequence[str]) -> str:
-        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+    def column_natural(index: int) -> int:
+        # As wide as the widest single line in the column.
+        return max(
+            _cell_width(rendered_headers[index]),
+            max((_cell_width(row[index]) for row in rendered_rows), default=0),
+        )
 
-    lines = [render_row(rendered_headers), render_row(["-" * width for width in widths])]
-    lines.extend(render_row(row) for row in rendered_rows)
-    return "\n".join(lines)
+    def column_word(index: int) -> int:
+        # As wide as the widest single word in the column.
+        return max(
+            _word_width(rendered_headers[index]),
+            max((_word_width(row[index]) for row in rendered_rows), default=0),
+        )
+
+    # Natural width of each column: as wide as its widest single line.
+    natural = [column_natural(index) for index in range(columns)]
+    word_widths = [column_word(index) for index in range(columns)]
+    if sum(natural) + _COLUMN_GUTTER * (columns - 1) > width:
+        natural = _allocate_widths(natural, word_widths, width)
+    widths = natural
+    header_cells = [_wrap_cell(header, widths[index]) for index, header in enumerate(rendered_headers)]
+    row_cells = [
+        [_wrap_cell(cell, widths[index]) for index, cell in enumerate(row)] for row in rendered_rows
+    ]
+
+    def render_block(cells: list[list[str]]) -> list[str]:
+        height = max(len(cell) for cell in cells)
+        lines: list[str] = []
+        for line_index in range(height):
+            parts = [
+                cell[line_index] if line_index < len(cell) else ""
+                for cell in cells
+            ]
+            line = (
+                _COLUMN_GUTTER * " "
+            ).join(
+                part.ljust(widths[index]) if index < columns - 1 else part
+                for index, part in enumerate(parts)
+            )
+            lines.append(line.rstrip())
+        return lines
+
+    parts: list[str] = []
+    parts.extend(render_block(header_cells))
+    parts.extend(render_block([["-" * widths[index]] for index in range(columns)]))
+    for row in row_cells:
+        parts.extend(render_block(row))
+    return "\n".join(parts)
 
 
 def _model_payload(profile: Profile) -> dict[str, object]:
-    """Return the profile-backed model fields intended for CLI consumers."""
+    """Return one canonical, client-facing model record for CLI consumers."""
 
     return {
         "id": profile.alias,
-        "profile": profile.id,
         "display_name": profile.display_name,
         "runtime": profile.runtime,
         "capabilities": sorted(profile.capabilities),
         "context_size": profile.context_size,
         "parallel": profile.parallel,
-        "aliases": [alias for alias in profile.aliases if alias != profile.alias],
     }
 
 
@@ -1443,7 +1911,7 @@ def _cmd_model_list(args: argparse.Namespace) -> int:
     rows = [
         (
             profile.alias,
-            profile.id,
+            profile.display_name,
             profile.runtime,
             ", ".join(sorted(profile.capabilities)),
             f"{profile.context_size:,}",
@@ -1453,8 +1921,16 @@ def _cmd_model_list(args: argparse.Namespace) -> int:
     ]
     print(
         _render_table(
-            ("MODEL", "PROFILE", "RUNTIME", "CAPABILITIES", "CONTEXT", "SLOTS"),
+            (
+                "PROFILE",
+                "MODEL",
+                "RUNTIME",
+                "CAPABILITIES",
+                "CONTEXT",
+                "SLOTS",
+            ),
             rows,
+            width=_terminal_width(getattr(args, "width", None)),
         )
     )
     return 0
@@ -1464,8 +1940,12 @@ def _cmd_profiles_list(args: argparse.Namespace) -> int:
     registry = ProfileRegistry.from_path(args.profiles)
     for profile in registry.profiles:
         caps = ",".join(sorted(profile.capabilities))
-        ctx_k = profile.context_size // profile.parallel if profile.parallel else profile.context_size
-        print(f"{profile.alias:<30} role={profile.role:<12} ctx={ctx_k:<8} parallel={profile.parallel} caps=[{caps}]")
+        slot_ctx = profile.slot_context_window
+        print(
+            f"{profile.alias:<30} role={profile.role:<12} "
+            f"ctx={profile.context_size:<8} parallel={profile.parallel} "
+            f"slot_ctx={slot_ctx:<8} caps=[{caps}]"
+        )
     return 0
 
 
@@ -1473,6 +1953,29 @@ def _autotune_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _autotune_unit_directives(profile: Profile) -> Sequence[str]:
+    service = profile.safety.service
+    lines = [
+        f"MemoryMax={service.memory_max_mib}M",
+        f"MemorySwapMax={service.memory_swap_max_mib}M",
+        f"TasksMax={service.tasks_max}",
+        "KillMode=control-group",
+        "SendSIGKILL=no",
+    ]
+    import shlex
+
+    environment = launch_environment(
+        profile.environment,
+        runtime=profile.runtime,
+        autotune=True,
+    )
+    lines.extend(
+        f"Environment={shlex.quote(f'{key}={value}')}"
+        for key, value in sorted(environment.items())
+    )
+    return lines
 
 
 def _run_live_autotune(
@@ -1597,21 +2100,7 @@ def _run_live_autotune(
         return False
 
     def unit_directives(_candidate: Candidate) -> Sequence[str]:
-        service = profile.safety.service
-        lines = [
-            f"MemoryMax={service.memory_max_mib}M",
-            f"MemorySwapMax={service.memory_swap_max_mib}M",
-            f"TasksMax={service.tasks_max}",
-            "KillMode=control-group",
-            "SendSIGKILL=no",
-        ]
-        import shlex
-
-        lines.extend(
-            f"Environment={shlex.quote(f'{key}={value}')}"
-            for key, value in sorted(profile.environment.items())
-        )
-        return lines
+        return _autotune_unit_directives(profile)
 
     lifecycle = SystemdCandidateLifecycle(
         command_for,
@@ -2196,38 +2685,68 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
     """List registered runtimes and the profile-backed models selecting each."""
 
     registry = ProfileRegistry.from_path(args.profiles)
-    runtime_rows: list[tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]]] = []
+    catalog_builds = registry.runtime_builds
+    runtime_rows: list[dict[str, object]] = []
     for runtime in list_runtimes():
         profiles = [
             profile
             for profile in registry.profiles
             if profile.runtime == runtime.name
         ]
-        runtime_rows.append(
-            (
-                runtime.name,
-                runtime.capabilities,
-                tuple((profile.id, profile.alias) for profile in profiles),
+        builds: list[dict[str, object]] = []
+        seen_builds: set[str] = set()
+        for build in catalog_builds:
+            if build.runtime != runtime.name or build.id in seen_builds:
+                continue
+            seen_builds.add(build.id)
+            builds.append(
+                {
+                    "id": build.id,
+                    "display_name": build.display_name,
+                    "runtime": build.runtime,
+                    "bundle_root": str(build.bundle_root) if build.bundle_root else None,
+                    "server_binary": str(build.server_binary),
+                    "server_sha256": build.server_sha256,
+                    "environment": dict(build.environment),
+                    "source_repository": (
+                        str(build.source_repository) if build.source_repository else None
+                    ),
+                    "provenance_file": (
+                        str(build.provenance_file) if build.provenance_file else None
+                    ),
+                    "source_branch": build.source_branch,
+                    "source_commit": build.source_commit,
+                    "dirty": build.dirty,
+                    "selected_profile_ids": list(build.selected_profile_ids),
+                    "aliases": list(build.aliases),
+                    "deprecated": build.deprecated,
+                }
             )
+        runtime_rows.append(
+            {
+                "name": runtime.name,
+                "capabilities": list(runtime.capabilities),
+                "profiles": [
+                    {"id": profile.id, "model": profile.alias}
+                    for profile in profiles
+                ],
+                "builds": builds,
+            }
         )
 
     if getattr(args, "json", False):
         print(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "object": "runtime_list",
-                    "data": [
-                        {
-                            "name": name,
-                            "capabilities": list(capabilities),
-                            "profiles": [
-                                {"id": profile_id, "model": model_id}
-                                for profile_id, model_id in profiles
-                            ],
-                        }
-                        for name, capabilities, profiles in runtime_rows
-                    ],
+                    "catalog_path": (
+                        str(registry.runtime_catalog_path)
+                        if registry.runtime_catalog_path
+                        else None
+                    ),
+                    "deployment_revision": registry.deployment_revision,
+                    "data": runtime_rows,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2239,15 +2758,62 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
         print("No runtimes registered.")
         return 0
 
-    rows = [
-        (
-            name,
-            ", ".join(model_id for _profile_id, model_id in profiles) or "(none)",
-            ", ".join(capabilities),
+    # One row per (family, bundle) pair so the table reads:
+    # family -> bundle -> the profiles using that bundle. The family cell
+    # spans its bundle rows (blanked on continuation rows).
+    rows: list[tuple[str, str, str]] = []
+    for row in runtime_rows:
+        family = str(row["name"])
+        family_profiles = [
+            profile
+            for profile in registry.profiles
+            if profile.runtime == family
+        ]
+        # Catalog build ids for this family, in catalog order.
+        catalog_builds = [
+            str(build["id"]) for build in row["builds"]  # type: ignore[index]
+        ]
+        # Ordered, deduplicated bundle list: catalog order first, then any
+        # profile references not in the catalog.
+        ordered: list[str] = []
+        for build_id in catalog_builds:
+            if build_id not in ordered:
+                ordered.append(build_id)
+        for profile in family_profiles:
+            bundle_id = profile.runtime_build
+            if bundle_id is not None and bundle_id not in ordered:
+                ordered.append(bundle_id)
+        bundles = ordered if ordered else ["(none)"]
+        # Profiles grouped under each bundle, in registry order.
+        profiles_by_bundle: dict[str, list[str]] = {}
+        for profile in family_profiles:
+            profiles_by_bundle.setdefault(
+                profile.runtime_build or "(none)", []
+            ).append(profile.alias)
+        for bundle in bundles:
+            aliases = profiles_by_bundle.get(bundle)
+            rows.append(
+                (
+                    family,
+                    bundle,
+                    ", ".join(aliases) if aliases else "(none)",
+                )
+            )
+    # Blank the family cell on continuation rows (one family per visual block).
+    rendered: list[tuple[str, str, str]] = []
+    last_family: str | None = None
+    for family, bundle, profiles in rows:
+        rendered.append(
+            ("" if family == last_family else family, bundle, profiles)
         )
-        for name, capabilities, profiles in runtime_rows
-    ]
-    print(_render_table(("RUNTIME", "PROFILES", "CAPABILITIES"), rows))
+        last_family = family
+    print(
+        _render_table(
+            ("RUNTIME", "BUNDLE", "PROFILES"),
+            rendered,
+            width=_terminal_width(getattr(args, "width", None)),
+        )
+    )
     return 0
 
 
@@ -2329,6 +2895,55 @@ def _cmd_profiles_discover(args: argparse.Namespace) -> int:
 
 # ── Subcommand: profiles edit ───────────────────────────────────────────────
 
+def _select_profile_for_edit(profiles_path: Path) -> str | None:
+    """Prompt for an explicit profile selection before opening the editor."""
+    manifest = load_manifest_source(profiles_path, allow_missing_artifacts=True)
+    profiles = [
+        profile
+        for profile in manifest.get("profiles", [])
+        if isinstance(profile, dict) and isinstance(profile.get("id"), str)
+    ]
+    if not profiles:
+        print("No profiles configured.", file=sys.stderr)
+        return None
+
+    print("Select a profile to edit:")
+    for index, profile in enumerate(profiles, start=1):
+        profile_id = str(profile["id"])
+        alias = str(profile.get("alias", ""))
+        display_name = str(profile.get("display_name", alias or profile_id))
+        runtime_build = str(profile.get("runtime_build", profile.get("runtime", "")))
+        labels = [display_name, profile_id]
+        if alias and alias not in labels:
+            labels.append(alias)
+        if runtime_build:
+            labels.append(f"runtime={runtime_build}")
+        print(f"  {index}. {' | '.join(labels)}")
+
+    by_selector = {
+        selector: str(profile["id"])
+        for profile in profiles
+        for selector in (profile["id"], profile.get("alias"))
+        if isinstance(selector, str) and selector
+    }
+    while True:
+        try:
+            choice = input("Profile number or ID (blank/q to cancel): ").strip()
+        except EOFError:
+            print("\nEdit cancelled.")
+            return None
+        if not choice or choice.casefold() in {"q", "quit", "cancel"}:
+            print("Edit cancelled.")
+            return None
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(profiles):
+                return str(profiles[index - 1]["id"])
+        elif choice in by_selector:
+            return by_selector[choice]
+        print("Invalid selection; choose a listed number, profile ID, or alias.", file=sys.stderr)
+
+
 def _cmd_profiles_edit(args: argparse.Namespace) -> int:
     """Open the field-oriented editor or apply a compatibility flag edit."""
     flags = {
@@ -2367,10 +2982,16 @@ def _cmd_profiles_edit(args: argparse.Namespace) -> int:
 
     from .broker_tui import run_tui
 
+    selected_model = args.model
+    if selected_model is None:
+        selected_model = _select_profile_for_edit(args.profiles)
+        if selected_model is None:
+            return 0
+
     def apply_callback(updated: dict[str, object], changed_ids: set[str]) -> object:
         return _apply_profile_configuration(args.profiles, updated, changed_ids)
 
-    return run_tui(args.profiles, args.model, apply_callback=apply_callback)
+    return run_tui(args.profiles, selected_model, apply_callback=apply_callback)
 
 
 # ── Subcommand: profiles add ────────────────────────────────────────────────
@@ -2474,23 +3095,27 @@ def _apply_profile_configuration(
 ) -> object:
     """Apply a wizard/TUI draft under the same lifecycle lock as model switches."""
 
-    with _operation_lock(LOCK_PATH):
-        before_registry = ProfileRegistry.from_path(profiles_path)
-        active_profile: str | None = None
-        try:
-            state = create_production_controller(before_registry).state()
-            if state.get("phase") == "active":
-                raw_active = state.get("profile")
-                active_profile = str(raw_active) if raw_active else None
-        except (BackendControllerError, OSError, KeyError):
-            # A stopped broker has no active lease; edits remain safe and units
-            # can be installed for the next controlled start.
-            active_profile = None
+    before_registry = ProfileRegistry.from_path(profiles_path)
+    active_profile: str | None = None
+    try:
+        state = create_production_controller(before_registry).state()
+        if state.get("phase") == "active":
+            raw_active = state.get("profile")
+            active_profile = str(raw_active) if raw_active else None
+    except (BackendControllerError, OSError, KeyError):
+        # A stopped broker has no active lease; edits remain safe and units
+        # can be installed for the next controlled start.
+        active_profile = None
 
-        def install_units() -> object:
-            registry = ProfileRegistry.from_path(profiles_path)
-            return create_production_controller(registry).install_units()
+    def install_units() -> object:
+        if _is_authoritative_manifest(profiles_path):
+            # The live broker reload endpoint installs its own generated
+            # units after replacing the in-memory registry.
+            return None
+        registry = ProfileRegistry.from_path(profiles_path)
+        return create_production_controller(registry).install_units()
 
+    def apply_transaction() -> object:
         try:
             return apply_manifest_transaction(
                 profiles_path,
@@ -2498,9 +3123,15 @@ def _apply_profile_configuration(
                 active_profile=active_profile,
                 install_units=install_units,
                 restart_broker=_restart_broker_control_plane,
+                reload_broker=lambda: _refresh_live_profile_registry(profiles_path),
             )
         except ApplyError:
             raise
+
+    if _is_authoritative_manifest(profiles_path):
+        return apply_transaction()
+    with _operation_lock(LOCK_PATH):
+        return apply_transaction()
 
 
 # ── Argument parser ─────────────────────────────────────────────────────────
@@ -2552,12 +3183,15 @@ def build_parser() -> argparse.ArgumentParser:
         "list", help="list canonical model references from the profile manifest"
     )
     model_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    model_list.add_argument(
+        "--width",
+        type=int,
+        help="target output width in columns; the table wraps to fit instead of overflowing the terminal (default: detected terminal width)",
+    )
 
     status = subparsers.add_parser("status", help="show durable backend state")
     status.add_argument("-v", "--verbose", action="store_true", help="show full JSON state")
     status.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
-    render = subparsers.add_parser("render", help="render a profile unit without installing it")
-    render.add_argument("model")
 
     load = subparsers.add_parser("load", help="queue a model profile load")
     load.add_argument("model")
@@ -2637,6 +3271,11 @@ def build_parser() -> argparse.ArgumentParser:
         "list", help="list runtimes and the profile-backed models selecting each"
     )
     runtime_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    runtime_list.add_argument(
+        "--width",
+        type=int,
+        help="target output width in columns; the table wraps to fit instead of overflowing the terminal (default: detected terminal width)",
+    )
 
     security = subparsers.add_parser(
         "security", help="provision and rotate deployment-owned API-key and TLS material"
@@ -2701,6 +3340,8 @@ def build_parser() -> argparse.ArgumentParser:
     profiles_sub = profiles.add_subparsers(dest="profiles_command", required=True)
 
     profiles_sub.add_parser("list", help="list profiles with status")
+    render = profiles_sub.add_parser("render", help="render a profile unit without installing it")
+    render.add_argument("model")
     show = profiles_sub.add_parser("show", help="show one complete profile as JSON")
     show.add_argument("profile_id")
 
@@ -2754,6 +3395,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--alias", action="append", help="profile alias; repeat for more aliases")
     add.add_argument("--display-name", help="human-readable display name")
     add.add_argument("--role", choices=sorted(ALLOWED_ROLES), default=None)
+    add.add_argument("--runtime-build", help="select a concrete cataloged runtime build")
     add.add_argument("--server-binary", help="absolute llama-server binary path")
     add.add_argument("--context", type=int, help="context size")
     add.add_argument("--parallel", type=int, help="parallel slots")
@@ -3042,7 +3684,7 @@ def main(argv: list[str] | None = None) -> int:
                     detail["live"] = live_state
                 print("\n" + json.dumps(detail, indent=2, sort_keys=True))
             return 1 if stale_active or phase not in {"active", "inactive"} else 0
-        if args.command == "render":
+        if args.command == "profile" and args.profiles_command == "render":
             profile = registry.resolve(args.model)
             print(controller.render_unit(profile.id), end="")
             return 0
@@ -3074,21 +3716,26 @@ def main(argv: list[str] | None = None) -> int:
             failures: list[str] = []
             results: list[dict[str, object]] = []
             for profile in profiles:
-                profile_failures = _verify_profile(profile)
+                result = _profile_verification_result(profile)
+                profile_failures = result["errors"]
+                assert isinstance(profile_failures, list)
                 failures.extend(profile_failures)
-                results.append(
-                    {
-                        "id": profile.id,
-                        "status": "ok" if not profile_failures else "unverified",
-                        "errors": profile_failures,
-                    }
-                )
+                results.append(result)
                 if not profile_failures and not getattr(args, "json", False):
                     print(f"verified: {profile.id}")
             if getattr(args, "json", False):
                 print(
                     json.dumps(
-                        {"schema_version": 1, "profiles": results},
+                        {
+                            "schema_version": 2,
+                            "catalog_path": (
+                                str(registry.runtime_catalog_path)
+                                if registry.runtime_catalog_path
+                                else None
+                            ),
+                            "deployment_revision": registry.deployment_revision,
+                            "profiles": results,
+                        },
                         indent=2,
                         sort_keys=True,
                     )

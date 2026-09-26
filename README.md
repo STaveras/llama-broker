@@ -1,7 +1,7 @@
 <!-- retrospective-release:start -->
-## Retrospective version: 0.6.16
+## Retrospective version: 0.7.0
 
-**Profile editor row and dirty-state fixes** — source checkpoint c34c5e8fba6f (2026-08-27).
+**Development integration** — source checkpoint 3e6606c2dea6 (2026-09-26).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
@@ -60,8 +60,10 @@ shown there.
   bounds from a validated manifest budget.
 - **Fail-closed profiles.** Each entry pins the runtime, model, optional
   projector (mmproj), SHA-256 hashes, context, cache types, and safety
-  environment. CUDA graph capture/optimization/PDL must be explicitly
-  disabled; unknown or empty model requests are rejected, never substituted.
+  environment. `GGML_CUDA_PDL=0` remains an explicit llama.cpp safety
+  invariant; CUDA graph capture/optimization controls are scoped to autotune
+  candidate units and are omitted from production units. Unknown or empty model
+  requests are rejected, never substituted.
 - **llama.cpp + vLLM runtimes.** A small runtime registry
   (`runtimes/`) owns each backend's complete command shape, so vLLM profiles
   emit `vllm serve MODEL` and llama.cpp profiles emit llama-server flags —
@@ -120,7 +122,7 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 | `brokerctl` (bare) | (planned) launches the interactive TUI |
 | `brokerctl model list` | list client-facing model references from canonical profiles (`--json` for a schema-versioned report) |
 | `brokerctl status` | show durable/live backend state (`--json` for schema-versioned JSON) |
-| `brokerctl render <model>` | render a profile unit without installing |
+| `brokerctl profile render <model>` | render a profile unit without installing |
 | `brokerctl load <model>` | queue a profile load (`start` is an alias) |
 | `brokerctl restart` | reload the active model or start a new one |
 | `brokerctl unload` | stop the current backing backend |
@@ -134,7 +136,7 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 | `brokerctl integrate configure [TOOLS...]` | configure coding tools only |
 | `brokerctl integrate --dry-run` | show the combined integration plan and ask before applying it |
 | `brokerctl update` | deferred from 0.1.0; runtime acquisition is never automatic |
-| `brokerctl profiles list\|discover\|edit\|add` | profile management; profiles remain the canonical model-to-runtime binding and client naming source |
+| `brokerctl profiles list\|discover\|edit\|add` | profile management; `profile edit` opens a numbered selection menu when no model ID/alias is supplied; profiles remain the canonical model-to-runtime binding and client naming source |
 | `brokerctl profiles calibrate ... --autotemp` | (planned) hardware calibration with optional model-keyed behavioral evaluation |
 
 ## API and security
@@ -143,7 +145,7 @@ The stable additive OpenAI-compatible subset is under `/v1`:
 
 | Route | Contract |
 | --- | --- |
-| `GET /v1/models` | Authenticated list of currently healthy/serving models; stopped broken or unverifiable profiles are hidden. |
+| `GET /v1/models` | Authenticated list of currently healthy/serving broker profiles; stopped, broken, or unverifiable profiles are hidden. Each model reports aggregate `context_length` (the profile's `-c` value), `parallel` (the profile's `-np` value), and per-slot `slot_context_window`. |
 | `GET /v1/models/{model}` | Authenticated model metadata for a verified profile, or the currently healthy active backend. |
 | `POST /v1/chat/completions` | Authenticated chat request; an explicit `model` id/alias is routed to the matching profile, while an omitted model uses the currently loaded profile. `stream: true` preserves SSE streaming. |
 | `POST /v1/completions` | Authenticated completion request with the same explicit/currently-loaded model routing and streaming behavior. |
@@ -222,7 +224,46 @@ directly.
   target, clear the active alias, and do not automatically restore or restart
   the previous profile; structured `[broker-event]` JSON records the outcome.
 
-## Development
+## Canonical model and runtime store
+
+Broker-served artifacts use the XDG roots below:
+
+```text
+~/.local/share/models/
+~/.local/share/runtimes/catalog.json
+~/.local/share/runtimes/<runtime-bundle-id>/
+~/.cache/llama-broker/<family>/<model>/
+```
+
+The canonical overrides are `LLAMA_BROKER_MODELS_DIR`,
+`LLAMA_BROKER_RUNTIMES_DIR`, `LLAMA_BROKER_CACHE_DIR`, and
+`LLAMA_BROKER_RUNTIME_CATALOG`. Existing scripts retain `MODELS_DIR` as a
+compatibility fallback. The superseded `$HOME/local/share/models` path is not used.
+
+Schema-v1 manifests with inline `runtime_builds` remain readable. Schema-v2
+manifests use `runtime_build` IDs and resolve executable, hash, bundle root,
+launch environment, repository, and provenance metadata from the external
+catalog. The manifest and catalog share a `deployment_revision`; mismatches
+fail closed. Profile IDs, aliases, restore targets, and serving settings are
+not rewritten by normal loading.
+
+The reusable migration tool is non-destructive by default:
+
+```bash
+python3 tools/model_store_migrate.py plan --profiles ~/.config/llama-broker/profiles.json --output migration-plan.json
+python3 tools/model_store_migrate.py stage --plan migration-plan.json
+python3 tools/model_store_migrate.py verify --plan migration-plan.json
+python3 tools/model_store_migrate.py apply --plan migration-plan.json --apply
+python3 tools/model_store_migrate.py cleanup --plan migration-plan.json --cleanup --confirm
+```
+
+`apply` and `cleanup` are separate gates. Staging verifies hashes and loader
+resolution without changing the manifest. Cleanup removes only exact paths
+recorded in the verified plan, after paired backups, broker-coordinated live
+smoke tests, and provenance checks succeed. Missing optional drafts or MoE
+cache files degrade the affected profile with warnings; missing required
+models, projectors, or runtimes fail closed.
+
 
 Offline-only regression suite — never starts a model, never touches systemd,
 and does not require GPUs, CUDA, model files, runtime binaries, drivers,

@@ -47,8 +47,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        metavar="ALIAS",
-        help="explicitly select this broker profile alias for the configured tool",
+        metavar="MODEL",
+        help="explicitly select this broker model reference; generated configs use its canonical alias",
     )
     parser.add_argument(
         "--broker-url",
@@ -94,8 +94,13 @@ def main(argv: list[str] | None = None, *, indent: bool = False) -> int:
         broker_url=args.broker_url,
         profiles_path=args.profiles,
     )
-    if args.model is not None and registry.get_model_by_alias(args.model) is None:
-        parser.error(f"unknown broker profile alias: {args.model}")
+    if args.model is not None:
+        canonical_model = registry.canonical_model_name(args.model)
+        if canonical_model is None:
+            parser.error(f"unknown broker model reference: {args.model}")
+        # Accept profile IDs/compatibility aliases as input, but pass only the
+        # canonical public model ID to every tool-specific config writer.
+        args.model = canonical_model
 
     for tool_name in tools:
         try:

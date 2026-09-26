@@ -179,8 +179,6 @@ class BrokerHttpTests(unittest.TestCase):
                 },
             },
             "environment": {
-                "GGML_CUDA_DISABLE_GRAPHS": "1",
-                "GGML_CUDA_GRAPH_OPT": "0",
                 "GGML_CUDA_PDL": "0",
             },
             "extra_args": [],
@@ -213,6 +211,7 @@ class BrokerHttpTests(unittest.TestCase):
                     "mmproj_path": str(mmproj),
                     "mmproj_sha256": sha256_file(mmproj),
                     "context_size": 32768,
+                    "parallel": 2,
                     "gpu_layers": "auto",
                     "safety": {
                         "service": {
@@ -642,7 +641,22 @@ class BrokerHttpTests(unittest.TestCase):
             forwarded["chat_template_kwargs"], {"enable_thinking": True}
         )
         self.assertEqual(forwarded["reasoning_effort"], "high")
-        self.assertEqual(forwarded["thinking_budget_tokens"], 32768)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 16384)
+
+    def test_experimental_effort_uses_request_max_and_profile_ubatch(self) -> None:
+        status, _ = self._post(
+            {
+                "model": "main",
+                "messages": [{"role": "user", "content": "think"}],
+                "max_tokens": 8192,
+                "reasoning_effort": "high",
+            }
+        )
+
+        self.assertEqual(status, 200)
+        forwarded = self.backend.seen_payloads[-1]  # type: ignore[attr-defined]
+        self.assertEqual(forwarded["max_tokens"], 8192)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 2048)
 
     def test_llamacpp_reasoning_policy_defaults_off_in_forwarded_payload(self) -> None:
         status, _ = self._post(
@@ -856,7 +870,10 @@ class BrokerHttpTests(unittest.TestCase):
             self.assertIsInstance(model["permission"], list)
         self.assertEqual(by_id["main-27b"]["context_length"], 65536)
         self.assertEqual(by_id["main-27b"]["max_output_tokens"], 65536)
-        self.assertEqual(by_id["qwen3.5-9b-vision"]["max_output_tokens"], 32768)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["context_length"], 32768)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["parallel"], 2)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["slot_context_window"], 16384)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["max_output_tokens"], 16384)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["capabilities"], ["text", "vision"])
 
     def test_admin_switch_uses_coordinator_and_reports_consistent_health(self) -> None:
@@ -902,6 +919,26 @@ class BrokerHttpTests(unittest.TestCase):
         while self.controller.transitions != ["vision"]:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.005)
+
+    def test_admin_restart_recovers_last_failed_target_without_model(self) -> None:
+        application = self.broker.application  # type: ignore[attr-defined]
+        application._remember_controller_state(  # type: ignore[attr-defined]
+            {
+                "generation": 9,
+                "profile": None,
+                "phase": "failed",
+                "target_profile": "main",
+            }
+        )
+        application.coordinator.synchronize_after_controller_failure(None)
+        self.controller.profile = None
+
+        status, payload = self._post({}, "/admin/restart")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["backend"]["profile"], "main")  # type: ignore[index]
+        self.assertEqual(self.controller.transitions, ["main"])
+        self.assertEqual(self.controller.profile, "main")
 
     def test_admin_restart_reloads_active_profile_without_unloading_it(self) -> None:
         status, payload = self._post({}, "/admin/restart")
@@ -993,6 +1030,22 @@ class BrokerHttpTests(unittest.TestCase):
 
         with self.assertRaisesRegex(BackendControllerError, "mmproj SHA mismatch"):
             llama_broker._verify_profile_artifacts(profile)
+
+    def test_profile_artifact_verifier_reuses_unchanged_hashes(self) -> None:
+        llama_broker._ARTIFACT_VERIFICATION_CACHE.clear()
+        profile = self.registry.get("main")
+
+        with patch.object(llama_broker, "sha256_file", wraps=sha256_file) as digest:
+            llama_broker._verify_profile_artifacts(profile)
+            first_call_count = digest.call_count
+            llama_broker._verify_profile_artifacts(profile)
+            self.assertGreater(first_call_count, 0)
+            self.assertEqual(digest.call_count, first_call_count)
+
+            Path(profile.model_path).write_bytes(b"changed-model")
+            with self.assertRaisesRegex(BackendControllerError, "model SHA mismatch"):
+                llama_broker._verify_profile_artifacts(profile)
+            self.assertGreater(digest.call_count, first_call_count)
 
     def test_failed_recovery_cannot_republish_dead_profile_as_active(self) -> None:
         application = self.broker.application  # type: ignore[attr-defined]
@@ -1455,6 +1508,67 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(transitions, ["vision"])
         self.assertEqual(coordinator.active_profile, "vision")
 
+    def test_administrative_restart_interrupts_active_lease(self) -> None:
+        transitions: list[str] = []
+        restart_started = threading.Event()
+        release = threading.Event()
+
+        def restart(profile: str) -> None:
+            transitions.append(f"restart:{profile}")
+            restart_started.set()
+
+        coordinator = ProfileCoordinator(
+            "main",
+            lambda _profile: None,
+            restart_profile=restart,
+            drain_timeout=1,
+            transition_timeout=1,
+        )
+        entered = threading.Event()
+        request = threading.Thread(
+            target=lambda: self._hold_active_lease(coordinator, entered, release)
+        )
+        request.start()
+        self.assertTrue(entered.wait(timeout=1))
+
+        errors: list[BaseException] = []
+
+        def administrative_restart() -> None:
+            try:
+                coordinator.restart_when_idle()
+            except BaseException as error:
+                errors.append(error)
+
+        admin = threading.Thread(target=administrative_restart)
+        admin.start()
+        try:
+            self.assertTrue(
+                restart_started.wait(timeout=0.2),
+                "administrative restart must not drain an active request first",
+            )
+            self.assertEqual(transitions, ["restart:main"])
+            self.assertEqual(coordinator.active_requests, 1)
+        finally:
+            release.set()
+            admin.join(timeout=1)
+            request.join(timeout=1)
+
+        self.assertFalse(admin.is_alive())
+        self.assertFalse(request.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(coordinator.active_profile, "main")
+        self.assertEqual(coordinator.active_requests, 0)
+
+    @staticmethod
+    def _hold_active_lease(
+        coordinator: ProfileCoordinator,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        with coordinator.lease("main"):
+            entered.set()
+            release.wait(timeout=2)
+
     def test_administrative_stop_waits_for_active_lease(self) -> None:
         stops: list[str] = []
         coordinator = ProfileCoordinator(
@@ -1528,6 +1642,56 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(transitions, [])
         release.set()
         held.join(timeout=1)
+
+    def test_transition_wait_with_zero_requests_is_not_reported_as_drain_timeout(self) -> None:
+        transition_started = threading.Event()
+        allow_transition = threading.Event()
+        transitions: list[str] = []
+        first_errors: list[BaseException] = []
+
+        def blocked_switch(profile: str) -> None:
+            transitions.append(profile)
+            transition_started.set()
+            allow_transition.wait(timeout=2)
+
+        coordinator = ProfileCoordinator(
+            "main",
+            blocked_switch,
+            drain_timeout=0.05,
+            transition_timeout=0.1,
+        )
+
+        def first_transition() -> None:
+            try:
+                with coordinator.lease("vision"):
+                    pass
+            except BaseException as error:
+                first_errors.append(error)
+
+        first = threading.Thread(target=first_transition)
+        first.start()
+        self.assertTrue(transition_started.wait(timeout=1))
+        self.assertEqual(coordinator.active_requests, 0)
+
+        try:
+            with self.assertRaises(BrokerTransitionTimeoutError):
+                coordinator.switch_when_idle("admin")
+            self.assertEqual(transitions, ["vision"])
+            self.assertEqual(coordinator.active_requests, 0)
+        finally:
+            allow_transition.set()
+            first.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertTrue(
+            all(isinstance(error, BrokerTransitionTimeoutError) for error in first_errors)
+        )
+        deadline = time.monotonic() + 1
+        while coordinator.quiescing:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        self.assertFalse(coordinator.snapshot()["transitioning"])
+        self.assertEqual(coordinator.active_requests, 0)
 
     def test_transition_timeout_quarantines_late_success_without_phantom_lease(self) -> None:
         transition_started = threading.Event()
@@ -1645,7 +1809,68 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIsNone(coordinator.active_profile)
         self.assertEqual(coordinator.active_requests, 0)
 
-    def test_llamacpp_reasoning_policy_defaults_off_and_maps_effort(self) -> None:
+    def test_experimental_effort_scaling_uses_request_budget_and_alias(self) -> None:
+        expected = {
+            "minimal": 256,
+            "low": 128,
+            "medium": 1024,
+            "high": 2048,
+            "extra high": 4096,
+            "max": 8192,
+        }
+        for effort, budget in expected.items():
+            with self.subTest(effort=effort):
+                rewritten = apply_reasoning_policy(
+                    {
+                        "max_tokens": 8192,
+                        "reasoning_effort": (
+                            "min"
+                            if effort == "minimal"
+                            else "med"
+                            if effort == "medium"
+                            else effort
+                        ),
+                    },
+                    runtime="llamacpp",
+                    max_output_tokens=131072,
+                    request_max_output_tokens=8192,
+                    batch_size=256,
+                    ubatch_size=64,
+                )
+                self.assertEqual(rewritten["reasoning_effort"], effort)
+                self.assertEqual(rewritten["thinking_budget_tokens"], budget)
+
+    def test_experimental_effort_scaling_accepts_opencode_xhigh_alias(self) -> None:
+        rewritten = apply_reasoning_policy(
+            {
+                "max_tokens": 8192,
+                "reasoning_effort": "xhigh",
+            },
+            runtime="llamacpp",
+            max_output_tokens=131072,
+            request_max_output_tokens=8192,
+            batch_size=256,
+            ubatch_size=64,
+        )
+        self.assertEqual(rewritten["reasoning_effort"], "extra high")
+        self.assertEqual(rewritten["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(rewritten["thinking_budget_tokens"], 4096)
+
+    def test_experimental_effort_scaling_preserves_explicit_budget(self) -> None:
+        rewritten = apply_reasoning_policy(
+            {
+                "max_tokens": 8192,
+                "reasoning_effort": "high",
+                "thinking_budget_tokens": 777,
+            },
+            runtime="llamacpp",
+            max_output_tokens=131072,
+            request_max_output_tokens=8192,
+            batch_size=256,
+            ubatch_size=64,
+        )
+        self.assertEqual(rewritten["thinking_budget_tokens"], 777)
+
         self.assertEqual(
             apply_reasoning_policy({}, runtime="llamacpp", max_output_tokens=32768),
             {
@@ -1654,16 +1879,19 @@ class CoordinatorTests(unittest.TestCase):
                 "thinking_budget_tokens": 0,
             },
         )
+        rewritten = apply_reasoning_policy(
+            {"reasoning": {"effort": "low"}},
+            runtime="llamacpp",
+            max_output_tokens=32768,
+            batch_size=256,
+            ubatch_size=64,
+        )
         self.assertEqual(
-            apply_reasoning_policy(
-                {"reasoning": {"effort": "low"}},
-                runtime="llamacpp",
-                max_output_tokens=32768,
-            ),
+            rewritten,
             {
                 "reasoning": {"effort": "low"},
                 "chat_template_kwargs": {"enable_thinking": True},
-                "thinking_budget_tokens": 4096,
+                "thinking_budget_tokens": 512,
                 "reasoning_effort": "low",
             },
         )
@@ -1672,8 +1900,10 @@ class CoordinatorTests(unittest.TestCase):
                 {"reasoning": {"effort": "high"}},
                 runtime="llamacpp",
                 max_output_tokens=32768,
+                batch_size=256,
+                ubatch_size=64,
             )["thinking_budget_tokens"],
-            16384,
+            8192,
         )
 
     def test_zero_thinking_budget_disables_reasoning_safely(self) -> None:
@@ -1728,11 +1958,11 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_llamacpp_reasoning_policy_maps_extended_efforts(self) -> None:
         expected = {
-            "minimal": 2048,
-            "low": 4096,
-            "medium": 8192,
-            "high": 16384,
-            "extra high": 24576,
+            "minimal": 256,
+            "low": 512,
+            "medium": 4096,
+            "high": 8192,
+            "extra high": 16384,
             "max": 32768,
         }
         for effort, budget in expected.items():
@@ -1741,6 +1971,8 @@ class CoordinatorTests(unittest.TestCase):
                     {"reasoning_effort": effort},
                     runtime="llamacpp",
                     max_output_tokens=32768,
+                    batch_size=256,
+                    ubatch_size=64,
                 )
                 self.assertEqual(rewritten["reasoning_effort"], effort)
                 self.assertEqual(rewritten["thinking_budget_tokens"], budget)
