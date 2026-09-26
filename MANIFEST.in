@@ -15,3 +15,12 @@ exclude api-keys
 recursive-exclude .git *
 recursive-exclude __pycache__ *
 recursive-exclude tests *.pyc
+
+# Ship the portable source verification inputs alongside the package.
+include brokerctl.py llama_broker.py benchmark.py sync-models.py
+include download-models.sh manage-services.sh profiles.example.json
+include docs/RELEASING.md docs/retrospective-tags.json
+recursive-include docs/examples *.in *.example
+recursive-include tools *.py
+recursive-include tests *.py *.json
+recursive-include .github/workflows *.yml

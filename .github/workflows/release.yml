@@ -1,10 +1,83 @@
-name: Retrospective checkpoint (notes only)
+name: Verified package release
+
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable tag at the selected main commit
+        required: true
+        type: string
+      publish:
+        description: Publish a new package version (retrospective tags are excluded)
+        type: boolean
+        default: false
+
 permissions:
   contents: read
+
+concurrency:
+  group: package-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
-  notes-only:
+  build-and-test:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      PUBLISH_REQUESTED: ${{ inputs.publish }}
     steps:
-      - run: echo 'Retrospective source checkpoint; no package publication workflow.'
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate explicit tag and publication policy
+        run: |
+          python tools/check_release.py --tag "$RELEASE_TAG" --require-head-tag
+          if [ "$PUBLISH_REQUESTED" = true ]; then
+            python tools/check_release.py --tag "$RELEASE_TAG" --publish
+          fi
+      - name: Check sanitized tree
+        run: python tools/check_public_tree.py
+      - name: Install test and build tools
+        run: python -m pip install build pytest
+      - name: Compile and test
+        run: |
+          python -m compileall -q src tests
+          python -m pytest -q --ignore=tests/test_local_production_manifest.py
+      - name: Build wheel and source distribution
+        run: |
+          python -m build --outdir dist
+          python tools/check_release.py --tag "$RELEASE_TAG" --dist dist
+      - name: Smoke installed wheel outside the checkout
+        run: |
+          python -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          brokerctl --help
+          python -c "from importlib.metadata import version; print(version('llama-broker'))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-pypi:
+    needs: build-and-test
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish == true && vars.PYPI_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-distributions
+          path: dist/
+      - name: Publish with explicitly configured trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

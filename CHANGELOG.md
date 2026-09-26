@@ -1,10 +1,17 @@
 # Retrospective changelog
 
-Current assigned version: **0.7.0**.
+Current assigned version: **0.7.1**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
+
+## [0.7.1] - 2026-09-26 — Current workflow documentation
+
+Original checkpoint: `7e72f29b40b5c3d487f2f80b378c9e6725fe9caa`.
+
+- Rewrite README around installation, setup/integration, model loading, client connection, service troubleshooting, and key rotation using the current singular profile command surface.
+- Document canonical model/runtime/catalog defaults and overrides, one-backend request slots, active-profile routing, API routes, and supported versus experimental runtimes. The original commit changes README only.
 
 ## [0.7.0] - 2026-09-26 — Development integration
 
