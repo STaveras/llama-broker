@@ -6,7 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed (0.1.0 roadmap, not yet cut)
+## [0.1.0] - 2026-09-26
+
+### Changed
 
 - Packaging: `pyproject.toml` + `src/` layout, console entry points.
 - Deep rename: environment-variable prefixes, config directory name, and
