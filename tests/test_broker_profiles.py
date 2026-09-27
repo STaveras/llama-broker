@@ -97,6 +97,29 @@ class ProfileRegistryTests(unittest.TestCase):
             record["safety"] = safety
         return record
 
+    def test_profile_snapshot_identity_is_revision_bound_and_excludes_secrets(self) -> None:
+        original = self._profile(
+            "main",
+            "main-27b",
+            self.main_model,
+            environment={"GGML_CUDA_PDL": "0", "TOKEN": "do-not-persist"},
+        )
+        registry = ProfileRegistry.from_path(self._write([original]))
+        snapshot = registry.profile_snapshot_identity("main")
+
+        self.assertEqual(snapshot["profile_id"], "main")
+        self.assertEqual(snapshot["artifact_sha256"]["model"], "2" * 64)  # type: ignore[index]
+        self.assertNotIn("environment", snapshot)
+        self.assertNotIn("do-not-persist", json.dumps(snapshot))
+
+        changed = dict(original)
+        changed["display_name"] = "Changed display name"
+        changed_registry = ProfileRegistry.from_path(self._write([changed]))
+        self.assertNotEqual(
+            changed_registry.profile_snapshot_identity("main")["fingerprint"],
+            snapshot["fingerprint"],
+        )
+
     def test_profile_exposes_declarative_service_and_admission_budgets(self) -> None:
         profile = ProfileRegistry.from_path(
             self._write([self._profile("main", "main-27b", self.main_model)])

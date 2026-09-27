@@ -25,6 +25,8 @@ from llama_broker.backend_controller import (
     systemd_service_state_probe,
 )
 from llama_broker.broker_profiles import AdmissionSafetyBudget, SafetyBudget, ServiceSafetyBudget
+from llama_broker.daemon import _prepare_durable_state
+from llama_broker.transition_operations import PersistentTransitionQueue
 
 
 def fake_safety() -> SafetyBudget:
@@ -205,6 +207,44 @@ class BackendControllerTest(unittest.TestCase):
     def read_state(self) -> dict:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
+    def test_recovery_from_corrupt_state_uses_actual_active_unit(self) -> None:
+        main_unit = self.controller.unit_name("main-27b")
+        self.harness.service_inventory_units.add(main_unit)
+        self.harness.service_states[main_unit] = ServiceStateSnapshot(
+            active_state="active",
+            sub_state="running",
+            main_pid=4242,
+            control_pid=0,
+        )
+        self.harness.probe_results[self.main.alias] = True
+        self.state_path.write_text("{corrupt state", encoding="utf-8")
+
+        recovered = self.controller.reconcile_from_runtime()
+
+        self.assertEqual(recovered["phase"], "active")
+        self.assertEqual(recovered["profile"], "main-27b")
+        self.assertEqual(recovered["generation"], 0)
+        self.assertEqual(self.harness.commands, [])
+
+    def test_recovery_from_ambiguous_active_units_fails_stale_without_stopping(self) -> None:
+        main_unit = self.controller.unit_name("main-27b")
+        vision_unit = self.controller.unit_name("qwen-vision")
+        self.harness.service_inventory_units.update({main_unit, vision_unit})
+        for unit in (main_unit, vision_unit):
+            self.harness.service_states[unit] = ServiceStateSnapshot(
+                active_state="active",
+                sub_state="running",
+                main_pid=4242,
+                control_pid=0,
+            )
+        self.state_path.write_text("{corrupt state", encoding="utf-8")
+
+        recovered = self.controller.reconcile_from_runtime()
+
+        self.assertEqual(recovered["phase"], "stale")
+        self.assertIsNone(recovered["profile"])
+        self.assertEqual(self.harness.commands, [])
+
     def test_failed_unit_without_process_is_quiescent(self) -> None:
         state = ServiceStateSnapshot(
             active_state="failed",
@@ -214,6 +254,59 @@ class BackendControllerTest(unittest.TestCase):
         )
 
         self.assertTrue(state.is_quiescent)
+
+    def test_startup_recovery_backs_up_corrupt_state_and_reconciles_runtime(self) -> None:
+        main_unit = self.controller.unit_name("main-27b")
+        self.harness.service_inventory_units.add(main_unit)
+        self.harness.service_states[main_unit] = ServiceStateSnapshot(
+            active_state="active",
+            sub_state="running",
+            main_pid=4242,
+            control_pid=0,
+        )
+        self.harness.probe_results[self.main.alias] = True
+        corrupt = b'{"phase":"broken"\n'
+        self.state_path.write_bytes(corrupt)
+
+        repaired = _prepare_durable_state(self.controller)
+
+        self.assertTrue(repaired)
+        backups = list(self.root.glob("state.json.corrupt.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), corrupt)
+        state = self.read_state()
+        self.assertEqual((state["phase"], state["profile"]), ("active", "main-27b"))
+        self.assertTrue(state["operations"]["reconciliation_required"])
+        self.assertIn("resubmitted", state["recovery"]["warning"])
+        self.assertEqual(self.harness.commands, [])
+
+    def test_startup_recovery_discards_unsupported_operation_schema(self) -> None:
+        self.controller._write_state(
+            {"generation": 9, "profile": "main-27b", "phase": "active"}
+        )
+        state = self.read_state()
+        state["operations"] = {"schema_version": 999, "queue": ["old"]}
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        main_unit = self.controller.unit_name("main-27b")
+        self.harness.service_inventory_units.add(main_unit)
+        self.harness.service_states[main_unit] = ServiceStateSnapshot(
+            active_state="active",
+            sub_state="running",
+            main_pid=4242,
+            control_pid=0,
+        )
+        self.harness.probe_results[self.main.alias] = True
+
+        repaired = _prepare_durable_state(self.controller)
+
+        self.assertTrue(repaired)
+        backups = list(self.root.glob("state.json.corrupt.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text())["operations"]["schema_version"], 999)
+        state = self.read_state()
+        self.assertEqual(state["profile"], "main-27b")
+        self.assertEqual(state["operations"]["executions"], {})
+        self.assertTrue(PersistentTransitionQueue(self.controller.state_store).needs_reconciliation)
 
     def test_raw_subprocess_timeout_is_wrapped_as_controller_error(self) -> None:
         def time_out(command: tuple[str, ...]) -> None:
@@ -581,6 +674,78 @@ class BackendControllerTest(unittest.TestCase):
         )
         self.assertEqual(self.harness.probes[-1], ("qwen3.5-9b-vision", 45.0))
         self.assertEqual(state, {"generation": 2, "profile": "qwen-vision", "phase": "active"})
+
+    def test_backend_lifecycle_write_preserves_namespaced_operations_state(self) -> None:
+        operations = {
+            "schema_version": 1,
+            "queue": ["execution-1"],
+            "requests": {"request-1": {"execution_id": "execution-1"}},
+        }
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "generation": 0,
+                    "profile": None,
+                    "phase": "inactive",
+                    "operations": operations,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.controller.switch("main-27b")
+
+        self.assertEqual(self.read_state()["operations"], operations)
+
+    def test_commit_callback_runs_immediately_before_prior_backend_stop(self) -> None:
+        self.controller.switch("main-27b")
+        committed = False
+        original_runner = self.controller.command_runner
+
+        def run(command: tuple[str, ...]) -> object:
+            if command[:3] == ("systemctl", "--user", "stop"):
+                self.assertTrue(committed)
+            return original_runner(command)
+
+        self.controller.command_runner = run
+
+        def commit() -> None:
+            nonlocal committed
+            committed = True
+
+        self.controller.switch("qwen-vision", commit_callback=commit)
+
+        self.assertTrue(committed)
+        self.assertEqual(self.controller.state()["profile"], "qwen-vision")
+
+    def test_cancelled_commit_leaves_prior_backend_and_state_untouched(self) -> None:
+        self.controller.switch("main-27b")
+        commands_before = list(self.harness.commands)
+
+        def cancel() -> None:
+            raise LifecycleCancelledError("request cancelled before commit")
+
+        with self.assertRaises(LifecycleCancelledError):
+            self.controller.switch("qwen-vision", commit_callback=cancel)
+
+        self.assertEqual(self.controller.state()["profile"], "main-27b")
+        self.assertEqual(self.controller.state()["phase"], "active")
+        self.assertEqual(self.harness.commands, commands_before)
+
+    def test_target_artifact_failure_is_proven_before_stopping_prior_backend(self) -> None:
+        self.controller.switch("main-27b")
+        commands_before = list(self.harness.commands)
+
+        def reject(_profile: FakeProfile) -> None:
+            raise ConfigurationError("artifact digest mismatch")
+
+        self.controller.artifact_verifier = reject  # type: ignore[attr-defined]
+        with self.assertRaises(SwitchError):
+            self.controller.switch("qwen-vision")
+
+        self.assertEqual(self.controller.state()["profile"], "main-27b")
+        self.assertEqual(self.controller.state()["phase"], "active")
+        self.assertEqual(self.harness.commands, commands_before)
 
     def test_switch_verifies_artifacts_before_starting_unit(self) -> None:
         def reject(_profile: FakeProfile) -> None:

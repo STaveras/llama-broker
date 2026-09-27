@@ -9,16 +9,151 @@ from unittest.mock import Mock, patch
 
 from llama_broker.broker_tui import (
     EDITOR_FIELDS,
+    OperationsTUIModel,
     TUIModel,
     _curses_prompt,
     _curses_select,
     _read_curses_key,
     run_guided_wizard,
+    run_operations_tui,
 )
 from llama_broker.profile_config import load_manifest_source, merge_manifest_drafts, validate_manifest
 
 
 class BrokerTUIModelTests(unittest.TestCase):
+    def test_operations_tui_tracks_request_and_execution_ids(self) -> None:
+        list_operations = Mock(
+            return_value={
+                "operations": [
+                    {
+                        "execution": {
+                            "execution_id": "execution-1",
+                            "type": "switch",
+                            "target": "vision",
+                            "status": "queued",
+                        },
+                        "requests": [
+                            {
+                                "request_id": "request-1",
+                                "execution_id": "execution-1",
+                                "status": "queued",
+                                "waiting": True,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        submit = Mock(
+            return_value={
+                "operation": {
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
+                }
+            }
+        )
+        cancel = Mock(
+            return_value={"operation": {"request_id": "request-1", "status": "cancelled"}}
+        )
+        wait = Mock(
+            return_value={"operation": {"request_id": "request-1", "status": "succeeded"}}
+        )
+        model = OperationsTUIModel(
+            profiles=("vision",),
+            list_operations=list_operations,
+            submit_load=submit,
+            submit_restart=Mock(return_value={}),
+            submit_stop=Mock(return_value={}),
+            submit_reload=Mock(return_value={"operation": {}}),
+            status_operation=Mock(return_value={}),
+            cancel_operation=cancel,
+            wait_operation=wait,
+        )
+
+        model.submit_profile_load("vision")
+        self.assertEqual(model.selected_request_id, "request-1")
+        self.assertIn("execution-1", model.status_message)
+        self.assertEqual(model.refresh()[0]["execution_id"], "execution-1")
+        model.cancel_selected()
+        cancel.assert_called_once_with("request-1")
+        model.wait_selected()
+        wait.assert_called_once_with("request-1")
+
+    def test_operations_tui_keyboard_load_returns_through_async_submission(self) -> None:
+        import curses
+
+        class FakeWindow:
+            def erase(self) -> None:
+                pass
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (20, 100)
+
+            def addnstr(self, *_args: object) -> None:
+                pass
+
+            def refresh(self) -> None:
+                pass
+
+            def keypad(self, _enabled: bool) -> None:
+                pass
+
+        submit = Mock(
+            return_value={
+                "operation": {
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
+                }
+            }
+        )
+        model = OperationsTUIModel(
+            profiles=("vision",),
+            list_operations=Mock(return_value={"operations": []}),
+            submit_load=submit,
+            submit_restart=Mock(return_value={"operation": {}}),
+            submit_stop=Mock(return_value={"operation": {}}),
+            submit_reload=Mock(return_value={"operation": {}}),
+            status_operation=Mock(return_value={}),
+            cancel_operation=Mock(return_value={}),
+            wait_operation=Mock(return_value={}),
+        )
+        fake_window = FakeWindow()
+        with (
+            patch.object(curses, "wrapper", side_effect=lambda callback: callback(fake_window)),
+            patch("llama_broker.broker_tui._read_curses_key", side_effect=[ord("l"), ord("q")]),
+            patch("llama_broker.broker_tui._curses_select", return_value=("vision", False)),
+        ):
+            result = run_operations_tui(model)
+
+        self.assertEqual(result, 0)
+        submit.assert_called_once_with("vision")
+        self.assertEqual(model.selected_request_id, "request-1")
+
+    def test_operations_tui_refreshes_profile_choices_after_catalog_reload(self) -> None:
+        profile_provider = Mock(side_effect=(
+            ("vision",),
+            ("vision", "new-profile"),
+        ))
+        model = OperationsTUIModel(
+            profiles=("vision",),
+            list_operations=Mock(return_value={"operations": []}),
+            refresh_profiles=profile_provider,
+            submit_load=Mock(return_value={"operation": {}}),
+            submit_restart=Mock(return_value={"operation": {}}),
+            submit_stop=Mock(return_value={"operation": {}}),
+            submit_reload=Mock(return_value={"operation": {}}),
+            status_operation=Mock(return_value={}),
+            cancel_operation=Mock(return_value={}),
+            wait_operation=Mock(return_value={}),
+        )
+
+        model.refresh()
+
+        self.assertEqual(model.profiles, ("vision", "new-profile"))
+        self.assertEqual(profile_provider.call_count, 2)
+
     def test_runtime_family_reveals_backend_build_and_applies_catalog_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             binary = Path(tempdir) / "llama-server"

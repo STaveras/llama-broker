@@ -3205,6 +3205,21 @@ def build_parser() -> argparse.ArgumentParser:
     unload = subparsers.add_parser("unload", help="unload the active model (stop the backend)")
     unload.add_argument("--raw", action="store_true", help="output raw JSON")
 
+    operation = subparsers.add_parser(
+        "operation", aliases=["operations"], help="inspect, wait for, or cancel a transition request"
+    )
+    operation_sub = operation.add_subparsers(dest="operation_command", required=True)
+    operation_status = operation_sub.add_parser("status", help="show one transition request")
+    operation_status.add_argument("request_id")
+    operation_sub.add_parser("list", help="list pending and recently completed operations")
+    operation_sub.add_parser("tui", help="open the interactive operation monitor")
+    operation_wait = operation_sub.add_parser("wait", help="wait for one transition request to finish")
+    operation_wait.add_argument("request_id")
+    operation_wait.add_argument("--timeout", type=float, default=3600.0)
+    operation_wait.add_argument("--interval", type=float, default=0.5)
+    operation_cancel = operation_sub.add_parser("cancel", help="cancel one transition request")
+    operation_cancel.add_argument("request_id")
+
     verify = subparsers.add_parser("verify", help="verify pinned runtime/model/projector SHA-256")
     verify.add_argument("model", nargs="?")
     verify.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
@@ -3469,7 +3484,13 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
     operation = state.get("operation")
     if isinstance(operation, dict):
         print(f"Request:   {operation.get('status', 'unknown')}")
-        if "target" in operation:
+        request_id = operation.get("request_id")
+        execution_id = operation.get("execution_id")
+        if isinstance(request_id, str):
+            print(f"Request ID: {request_id}")
+        if isinstance(execution_id, str):
+            print(f"Execution ID: {execution_id}")
+        if operation.get("target") is not None:
             print(f"Target:    {operation['target']}")
     print(f"Broker:    {state.get('status', 'unknown')}")
     backend = state.get("backend")
@@ -3479,7 +3500,12 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
 
     profile = backend.get("profile")
     phase = backend.get("phase", "unknown")
-    accepted = isinstance(operation, dict) and operation.get("status") == "accepted"
+    accepted = isinstance(operation, dict) and operation.get("status") in {
+        "accepted",
+        "queued",
+        "preflight",
+        "committed",
+    }
     if accepted:
         print(
             f"Backend:   transition pending (current: {profile if profile else 'none'})"
@@ -3494,6 +3520,92 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
         print(f"Generation: {backend['generation']}")
     if "host" in backend and "port" in backend:
         print(f"Endpoint:  {backend['host']}:{backend['port']}")
+
+
+def _cmd_operation(args: argparse.Namespace) -> int:
+    """Inspect, cancel, or explicitly wait for broker operation requests."""
+    if args.operation_command == "list":
+        result = _broker_admin_get("/admin/operations")
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.operation_command == "tui":
+        from .broker_tui import OperationsTUIModel, run_operations_tui
+
+        registry = ProfileRegistry.from_path(args.profiles, allow_missing_artifacts=True)
+
+        def wait_for_tui_operation(request_id: str) -> Mapping[str, Any]:
+            deadline = time.monotonic() + 3600.0
+            while True:
+                result = _broker_admin_get(f"/admin/operations/{request_id}")
+                operation = result.get("operation")
+                if not isinstance(operation, Mapping):
+                    return result
+                if operation.get("status") in {"succeeded", "failed", "cancelled"}:
+                    return result
+                if not operation.get("waiting", True):
+                    return result
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return result
+                time.sleep(min(0.5, remaining))
+
+        model = OperationsTUIModel(
+            profiles=(profile.id for profile in registry.profiles),
+            list_operations=lambda: _broker_admin_get("/admin/operations"),
+            refresh_profiles=lambda: (
+                profile.id
+                for profile in ProfileRegistry.from_path(
+                    args.profiles, allow_missing_artifacts=True
+                ).profiles
+            ),
+            submit_load=lambda profile_id: _broker_admin(
+                "/admin/switch", {"model": profile_id, "wait": False}
+            ),
+            submit_restart=lambda: _broker_admin("/admin/restart", {"wait": False}),
+            submit_stop=lambda: _broker_admin("/admin/stop", {"wait": False}),
+            submit_reload=lambda: _broker_admin(
+                "/admin/autotune/reload", {"wait": False}
+            ),
+            status_operation=lambda request_id: _broker_admin_get(
+                f"/admin/operations/{request_id}"
+            ),
+            cancel_operation=lambda request_id: _broker_admin(
+                f"/admin/operations/{request_id}/cancel", {}
+            ),
+            wait_operation=wait_for_tui_operation,
+        )
+        return run_operations_tui(model)
+    request_id = args.request_id
+    endpoint = f"/admin/operations/{request_id}"
+    if args.operation_command == "status":
+        result = _broker_admin_get(endpoint)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.operation_command == "cancel":
+        result = _broker_admin(f"{endpoint}/cancel", {})
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.operation_command != "wait":
+        raise BackendControllerError("unknown operation command")
+    if args.timeout <= 0 or args.interval <= 0:
+        print("operation wait timeout and interval must be positive", file=sys.stderr)
+        return 2
+
+    deadline = time.monotonic() + args.timeout
+    while True:
+        result = _broker_admin_get(endpoint)
+        operation = result.get("operation")
+        if not isinstance(operation, dict):
+            raise BackendControllerError("broker returned malformed operation status")
+        status = operation.get("status")
+        if status in {"succeeded", "failed", "cancelled"} or not operation.get("waiting", True):
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if status == "succeeded" else (1 if status in {"failed", "cancelled"} else 0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 124
+        time.sleep(min(args.interval, remaining))
 
 
 def _normalise_cli_argv(argv: list[str] | None) -> list[str] | None:
@@ -3565,6 +3677,9 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_profiles_args(args)
             if args.profiles_command == "template":
                 return _cmd_profiles_template(args)
+
+        if args.command in {"operation", "operations"}:
+            return _cmd_operation(args)
 
         # Original commands
         registry = ProfileRegistry.from_path(
@@ -3688,13 +3803,11 @@ def main(argv: list[str] | None = None) -> int:
             profile = registry.resolve(args.model)
             print(controller.render_unit(profile.id), end="")
             return 0
-        if args.command in ("load", "start", "restart"):
+        if args.command in {"load", "start", "restart"}:
             if args.command == "restart":
-                payload = (
-                    {}
-                    if args.model is None
-                    else {"model": registry.resolve(args.model).id}
-                )
+                payload: dict[str, object] = {"wait": False}
+                if args.model is not None:
+                    payload["model"] = registry.resolve(args.model).id
                 state = _broker_admin("/admin/restart", payload)
                 print(json.dumps(state, indent=2, sort_keys=True))
                 return 0
@@ -3706,7 +3819,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_admin_state(state, raw=args.raw)
             return 0
         if args.command == "unload":
-            state = _broker_admin("/admin/stop", {})
+            state = _broker_admin("/admin/stop", {"wait": False})
             _print_admin_state(state, raw=args.raw)
             return 0
         if args.command == "verify":

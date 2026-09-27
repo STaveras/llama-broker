@@ -7,13 +7,15 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 
 from llama_broker.broker_profiles import ProfileRegistry
-from llama_broker.backend_controller import BackendControllerError
+from llama_broker.backend_controller import BackendControllerError, LifecycleCancelledError
 import llama_broker.daemon as llama_broker
 from llama_broker.broker_security import SecurityConfig, write_api_keys
 from llama_broker.profile_config import sha256_file
@@ -236,9 +238,9 @@ class BrokerHttpTests(unittest.TestCase):
                 },
             ],
         }
-        manifest_path = root / "profiles.json"
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        self.registry = ProfileRegistry.from_path(manifest_path)
+        self.profiles_path = root / "profiles.json"
+        self.profiles_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.registry = ProfileRegistry.from_path(self.profiles_path)
         self.auth_key = "native-key"
         self.auth_key_path = root / "api-keys"
         write_api_keys(self.auth_key_path, [self.auth_key])
@@ -264,6 +266,7 @@ class BrokerHttpTests(unittest.TestCase):
             max_body_bytes=1_000_000,
             security=SecurityConfig(api_key_file=self.auth_key_path),
             backend_alias_ready=self._active_alias_ready,
+            profiles_path=self.profiles_path,
         )
         self.broker = BrokerServer(("127.0.0.1", 0), application=app, max_workers=4)
         self.broker_thread = threading.Thread(target=self.broker.serve_forever, daemon=True)
@@ -596,6 +599,7 @@ class BrokerHttpTests(unittest.TestCase):
         drain_timeout: float,
         transition_timeout: float,
         stop_timeout: float,
+        start_operation_worker: bool = True,
     ) -> None:
         self.broker.shutdown()
         self.broker.server_close()
@@ -611,9 +615,11 @@ class BrokerHttpTests(unittest.TestCase):
             security=SecurityConfig(api_key_file=self.auth_key_path),
             backend_ready=lambda: True,
             backend_alias_ready=self._active_alias_ready,
+            profiles_path=self.profiles_path,
             drain_timeout=drain_timeout,
             transition_timeout=transition_timeout,
             stop_timeout=stop_timeout,
+            start_operation_worker=start_operation_worker,
         )
         self.broker = BrokerServer(
             ("127.0.0.1", 0),
@@ -886,6 +892,127 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertEqual(payload["leases"]["profile"], "vision")  # type: ignore[index]
         self.assertEqual(self.controller.transitions, ["vision"])
 
+    def test_http_async_operation_can_be_inspected_and_cancelled(self) -> None:
+        self._replace_broker(
+            max_workers=4,
+            control_workers=2,
+            drain_timeout=1,
+            transition_timeout=1,
+            stop_timeout=1,
+            start_operation_worker=False,
+        )
+
+        status, submitted = self._post(
+            {"model": "qwen3.5-9b-vision", "wait": False},
+            "/admin/switch",
+        )
+        self.assertEqual(status, 202)
+        raw_operation = submitted.get("operation")
+        if not isinstance(raw_operation, dict):
+            self.fail("async response omitted its operation")
+        request_id = raw_operation.get("request_id")
+        execution_id = raw_operation.get("execution_id")
+        self.assertIsInstance(request_id, str)
+        self.assertIsInstance(execution_id, str)
+        if not isinstance(request_id, str) or not isinstance(execution_id, str):
+            self.fail("async response omitted request/execution identities")
+
+        status, observed = self._get(f"/admin/operations/{request_id}")
+        self.assertEqual(status, 200)
+        observed_operation = observed.get("operation")
+        if not isinstance(observed_operation, dict):
+            self.fail("operation status omitted its operation record")
+        self.assertEqual(observed_operation.get("request_id"), request_id)
+        self.assertEqual(observed_operation.get("execution_id"), execution_id)
+        self.assertEqual(observed_operation.get("status"), "queued")
+
+        status, recent = self._get("/admin/operations")
+        self.assertEqual(status, 200)
+        operations = recent.get("operations")
+        self.assertIsInstance(operations, list)
+        if not isinstance(operations, list):
+            self.fail("operation listing omitted the operations array")
+        self.assertTrue(
+            any(
+                isinstance(entry, dict)
+                and isinstance(entry.get("execution"), dict)
+                and entry["execution"].get("execution_id") == execution_id
+                for entry in operations
+            )
+        )
+
+        status, cancelled = self._post(
+            {},
+            f"/admin/operations/{request_id}/cancel",
+        )
+        self.assertEqual(status, 200)
+        cancelled_operation = cancelled.get("operation")
+        if not isinstance(cancelled_operation, dict):
+            self.fail("cancel response omitted its operation record")
+        self.assertEqual(cancelled_operation.get("status"), "cancelled")
+        self.assertEqual(self.broker.application.operation_queue.queue_depth, 0)  # type: ignore[attr-defined]
+
+    def test_changed_profile_snapshot_fails_before_controller_transition(self) -> None:
+        self._replace_broker(
+            max_workers=4,
+            control_workers=2,
+            drain_timeout=1,
+            transition_timeout=1,
+            stop_timeout=1,
+            start_operation_worker=False,
+        )
+        application = self.broker.application  # type: ignore[attr-defined]
+        request = application.submit_switch_operation("vision")
+        application.registry = ProfileRegistry(
+            tuple(
+                replace(profile, display_name=f"changed-{profile.id}")
+                for profile in application.registry.profiles
+            )
+        )
+        application.start_operation_worker()
+
+        deadline = time.monotonic() + 2
+        while application.operation_status(request.request_id)["status"] not in {
+            "failed",
+            "succeeded",
+        }:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+
+        operation = application.operation_status(request.request_id)
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["error_type"], "StaleOperationSnapshotError")
+        self.assertEqual(self.controller.transitions, [])
+        self.assertEqual(application.coordinator.active_profile, "main")
+
+    def test_changed_snapshot_fails_even_when_target_is_already_active(self) -> None:
+        self._replace_broker(
+            max_workers=4,
+            control_workers=2,
+            drain_timeout=1,
+            transition_timeout=1,
+            stop_timeout=1,
+            start_operation_worker=False,
+        )
+        application = self.broker.application  # type: ignore[attr-defined]
+        request = application.submit_switch_operation("main")
+        application.registry = ProfileRegistry(
+            tuple(
+                replace(profile, display_name=f"new-{profile.id}")
+                for profile in application.registry.profiles
+            )
+        )
+        application.start_operation_worker()
+
+        deadline = time.monotonic() + 2
+        while application.operation_status(request.request_id)["status"] not in {"failed", "succeeded"}:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+
+        self.assertEqual(application.operation_status(request.request_id)["error_type"], "StaleOperationSnapshotError")
+        self.assertEqual(self.controller.transitions, [])
+        self.assertEqual(application.coordinator.active_profile, "main")
+
     def test_async_admin_switch_accepts_before_backend_transition_finishes(self) -> None:
         transition_started = threading.Event()
         release_transition = threading.Event()
@@ -907,10 +1034,16 @@ class BrokerHttpTests(unittest.TestCase):
 
             self.assertLess(elapsed, 0.5)
             self.assertEqual(status, 202)
-            self.assertEqual(
-                payload["operation"],
-                {"status": "accepted", "target": "vision", "type": "switch"},
-            )
+            operation = payload["operation"]
+            self.assertIsInstance(operation, dict)
+            if not isinstance(operation, dict):
+                self.fail("async response omitted its operation record")
+            request_id = operation.get("request_id")
+            execution_id = operation.get("execution_id")
+            if not isinstance(request_id, str) or not isinstance(execution_id, str):
+                self.fail("async response omitted request/execution identities")
+            self.assertEqual(operation.get("target"), "vision")
+            self.assertEqual(operation.get("type"), "switch")
             self.assertTrue(transition_started.wait(timeout=1))
         finally:
             release_transition.set()
@@ -919,6 +1052,181 @@ class BrokerHttpTests(unittest.TestCase):
         while self.controller.transitions != ["vision"]:
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.005)
+
+        status, observed = self._get(f"/admin/operations/{request_id}")
+        self.assertEqual(status, 200)
+        final_operation = observed.get("operation")
+        if not isinstance(final_operation, dict):
+            self.fail("operation status omitted its operation record")
+        self.assertEqual(final_operation.get("execution_id"), execution_id)
+        self.assertEqual(final_operation.get("status"), "succeeded")
+
+    def test_async_restart_and_stop_use_priority_operations(self) -> None:
+        self._replace_broker(
+            max_workers=4,
+            control_workers=2,
+            drain_timeout=1,
+            transition_timeout=1,
+            stop_timeout=1,
+            start_operation_worker=False,
+        )
+
+        status, restart_response = self._post(
+            {"wait": False},
+            "/admin/restart",
+        )
+        self.assertEqual(status, 202)
+        restart_operation = restart_response.get("operation")
+        if not isinstance(restart_operation, dict):
+            self.fail("restart response omitted its operation record")
+        restart_request_id = restart_operation.get("request_id")
+        self.assertIsInstance(restart_request_id, str)
+        self.assertEqual(restart_operation.get("type"), "restart")
+
+        status, stop_response = self._post(
+            {"wait": False},
+            "/admin/stop",
+        )
+        self.assertEqual(status, 202)
+        stop_operation = stop_response.get("operation")
+        if not isinstance(stop_operation, dict):
+            self.fail("stop response omitted its operation record")
+        stop_request_id = stop_operation.get("request_id")
+        self.assertIsInstance(stop_request_id, str)
+        self.assertEqual(stop_operation.get("type"), "stop")
+        self.assertEqual(
+            self.broker.application.operation_status(restart_request_id)["status"],  # type: ignore[attr-defined,arg-type]
+            "cancelled",
+        )
+
+        status, stopped = self._post(
+            {},
+            f"/admin/operations/{stop_request_id}/cancel",
+        )
+        self.assertEqual(status, 200)
+        stopped_operation = stopped.get("operation")
+        if not isinstance(stopped_operation, dict):
+            self.fail("stop cancellation omitted operation status")
+        self.assertEqual(stopped_operation.get("status"), "cancelled")
+        self.assertEqual(
+            self.broker.application.operation_queue.pending_transition_count,  # type: ignore[attr-defined]
+            0,
+        )
+
+    def test_async_restart_executes_and_publishes_terminal_status(self) -> None:
+        status, submitted = self._post({"wait": False}, "/admin/restart")
+        self.assertEqual(status, 202)
+        operation = submitted.get("operation")
+        if not isinstance(operation, dict):
+            self.fail("async restart response omitted its operation")
+        request_id = operation.get("request_id")
+        if not isinstance(request_id, str):
+            self.fail("async restart response omitted request_id")
+
+        deadline = time.monotonic() + 2
+        while self.controller.transitions != ["restart:main"]:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        status, observed = self._get(f"/admin/operations/{request_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(observed["operation"]["status"], "succeeded")  # type: ignore[index]
+
+    def test_async_stop_executes_and_publishes_terminal_status(self) -> None:
+        status, submitted = self._post({"wait": False}, "/admin/stop")
+        self.assertEqual(status, 202)
+        operation = submitted.get("operation")
+        if not isinstance(operation, dict):
+            self.fail("async stop response omitted its operation")
+        request_id = operation.get("request_id")
+        if not isinstance(request_id, str):
+            self.fail("async stop response omitted request_id")
+
+        deadline = time.monotonic() + 2
+        while self.controller.stops != 1:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        status, observed = self._get(f"/admin/operations/{request_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(observed["operation"]["status"], "succeeded")  # type: ignore[index]
+
+    def test_profile_catalog_reload_is_ordered_with_load_operations(self) -> None:
+        self._replace_broker(
+            max_workers=4,
+            control_workers=2,
+            drain_timeout=1,
+            transition_timeout=1,
+            stop_timeout=1,
+            start_operation_worker=False,
+        )
+        manifest = json.loads(self.profiles_path.read_text(encoding="utf-8"))
+        manifest["profiles"][1]["display_name"] = "Vision revision two"  # type: ignore[index]
+        self.profiles_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        status, reload_response = self._post(
+            {"wait": False},
+            "/admin/autotune/reload",
+        )
+        self.assertEqual(status, 202)
+        reload_operation = reload_response.get("operation")
+        if not isinstance(reload_operation, dict):
+            self.fail("profile reload did not return an operation")
+        self.assertEqual(reload_operation.get("type"), "reload")
+        reload_execution_id = reload_operation.get("execution_id")
+        if not isinstance(reload_execution_id, str):
+            self.fail("reload response omitted execution_id")
+        captured_catalog = self.broker.application.operation_queue.get_profile_snapshot(  # type: ignore[attr-defined]
+            reload_execution_id
+        )
+        self.assertEqual(
+            captured_catalog,
+            ProfileRegistry.from_path(self.profiles_path).snapshot_revision_identity(),
+        )
+
+        status, load_response = self._post(
+            {"model": "qwen3.5-9b-vision", "wait": False},
+            "/admin/switch",
+        )
+        self.assertEqual(status, 202)
+        executions = self.broker.application.operation_queue.list_executions()  # type: ignore[attr-defined]
+        self.assertEqual([execution.operation_type for execution in executions[:2]], ["reload", "switch"])
+        load_snapshot = self.broker.application.operation_queue.get_profile_snapshot(  # type: ignore[attr-defined]
+            executions[1].execution_id
+        )
+        expected_snapshot = ProfileRegistry.from_path(self.profiles_path).profile_snapshot_identity(
+            "vision"
+        )
+        self.assertEqual(load_snapshot, expected_snapshot)
+
+    def test_profile_catalog_reload_executes_in_operation_worker(self) -> None:
+        manifest = json.loads(self.profiles_path.read_text(encoding="utf-8"))
+        manifest["profiles"][1]["display_name"] = "Vision revision two"  # type: ignore[index]
+        self.profiles_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        status, response = self._post(
+            {"wait": False},
+            "/admin/autotune/reload",
+        )
+        self.assertEqual(status, 202)
+        operation = response.get("operation")
+        if not isinstance(operation, dict):
+            self.fail("reload response omitted its operation record")
+        request_id = operation.get("request_id")
+        if not isinstance(request_id, str):
+            self.fail("reload response omitted request_id")
+
+        deadline = time.monotonic() + 2
+        while self.broker.application.operation_status(request_id)["status"] not in {  # type: ignore[attr-defined]
+            "succeeded",
+            "failed",
+        }:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+        final_operation = self.broker.application.operation_status(request_id)  # type: ignore[attr-defined]
+        self.assertEqual(final_operation["status"], "succeeded")
+        self.assertEqual(
+            self.broker.application.registry.get("vision").display_name,  # type: ignore[attr-defined]
+            "Vision revision two",
+        )
 
     def test_admin_restart_recovers_last_failed_target_without_model(self) -> None:
         application = self.broker.application  # type: ignore[attr-defined]
@@ -1240,6 +1548,74 @@ class BrokerHttpTests(unittest.TestCase):
 
 
 class CoordinatorTests(unittest.TestCase):
+    def test_external_queue_blocks_leases_until_reserved_transition_runs(self) -> None:
+        transitions: list[str] = []
+        coordinator = ProfileCoordinator("main", transitions.append)
+
+        coordinator.set_external_queued_transitions(1)
+        self.assertTrue(coordinator.quiescing)
+        with self.assertRaises(BrokerQuiescingError):
+            with coordinator.lease("main"):
+                self.fail("an inference lease entered while a durable transition was queued")
+
+        coordinator.begin_external_transition()
+        self.assertEqual(coordinator.snapshot()["queued_transitions"], 1)
+        coordinator.run_reserved_switch("vision")
+
+        self.assertEqual(transitions, ["vision"])
+        self.assertEqual(coordinator.active_profile, "vision")
+        self.assertFalse(coordinator.quiescing)
+
+    def test_external_queue_cancellation_before_commit_preserves_active_profile(self) -> None:
+        calls: list[str] = []
+
+        def switch_with_commit(
+            target: str,
+            commit_callback: Callable[[], None],
+        ) -> None:
+            calls.append(f"start:{target}")
+            commit_callback()
+            calls.append(f"commit:{target}")
+
+        coordinator = ProfileCoordinator(
+            "main",
+            calls.append,
+            switch_profile_with_commit=switch_with_commit,
+        )
+        coordinator.set_external_queued_transitions(1)
+        coordinator.begin_external_transition()
+
+        def cancel() -> None:
+            raise LifecycleCancelledError("cancelled before destructive work")
+
+        with self.assertRaises(LifecycleCancelledError):
+            coordinator.run_reserved_switch("vision", commit_callback=cancel)
+
+        self.assertEqual(coordinator.active_profile, "main")
+        self.assertFalse(coordinator.quiescing)
+        self.assertEqual(calls, ["start:vision"])
+
+    def test_reserved_profile_reload_commits_inside_fifo_transition_slot(self) -> None:
+        events: list[str] = []
+        coordinator = ProfileCoordinator("main", lambda _profile: None)
+        coordinator.set_external_queued_transitions(1)
+        coordinator.begin_external_transition()
+
+        def reload(commit: Callable[[], None]) -> str:
+            events.append("preflight")
+            commit()
+            events.append("apply")
+            return "reloaded"
+
+        result = coordinator.run_reserved_reload(
+            reload,
+            commit_callback=lambda: events.append("commit"),
+        )
+
+        self.assertEqual(result, "reloaded")
+        self.assertEqual(events, ["preflight", "commit", "apply"])
+        self.assertFalse(coordinator.quiescing)
+
     def test_transient_lease_restores_profile_active_before_switch(self) -> None:
         transitions: list[str] = []
         coordinator = ProfileCoordinator("gemma", transitions.append)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -741,6 +741,63 @@ class ProfileRegistry:
         except KeyError as exc:
             raise ProfileError(f"unknown profile: {profile_id}") from exc
 
+    def profile_snapshot_identity(self, profile_id: str) -> dict[str, Any]:
+        """Return a secret-safe fingerprint and pinned facts for one profile.
+
+        The full resolved profile is hashed in memory; the durable operation
+        record keeps only the digest, artifact pins, safety budget, and catalog
+        revision. A worker must compare this identity before executing rather
+        than silently resolving changed profile data.
+        """
+        profile = self.get(profile_id)
+        canonical_profile = _profile_snapshot_value(profile)
+        encoded = json.dumps(
+            canonical_profile,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return {
+            "schema_version": 1,
+            "profile_id": profile.id,
+            "fingerprint": hashlib.sha256(encoded).hexdigest(),
+            "catalog_revision": self.deployment_revision,
+            "runtime_build": profile.runtime_build,
+            "alias": profile.alias,
+            "role": profile.role,
+            "capabilities": sorted(profile.capabilities),
+            "artifact_sha256": {
+                "server": profile.server_sha256,
+                "model": profile.model_sha256,
+                "mmproj": profile.mmproj_sha256,
+                "draft": profile.model_draft_sha256,
+            },
+            "safety": _profile_snapshot_value(profile.safety),
+        }
+
+    def snapshot_revision_identity(self) -> dict[str, Any]:
+        """Fingerprint the complete resolved profile/catalog revision without secrets."""
+        profiles = [
+            self.profile_snapshot_identity(profile.id)
+            for profile in sorted(self._profiles, key=lambda item: item.id)
+        ]
+        canonical = {
+            "deployment_revision": self.deployment_revision,
+            "profiles": profiles,
+        }
+        encoded = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return {
+            "schema_version": 1,
+            "deployment_revision": self.deployment_revision,
+            "fingerprint": hashlib.sha256(encoded).hexdigest(),
+            "profile_count": len(profiles),
+        }
+
     def try_resolve(self, alias: object) -> Profile | None:
         value = str(alias or "").strip()
         if not value:
@@ -752,6 +809,30 @@ class ProfileRegistry:
         if profile is None:
             raise ProfileError(f"unknown model alias: {alias}")
         return profile
+
+
+def _profile_snapshot_value(value: Any) -> Any:
+    """Convert resolved profile facts to deterministic secret-safe JSON data."""
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _profile_snapshot_value(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _profile_snapshot_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (set, frozenset)):
+        converted = [_profile_snapshot_value(item) for item in value]
+        return sorted(converted, key=lambda item: json.dumps(item, sort_keys=True))
+    if isinstance(value, (tuple, list)):
+        return [_profile_snapshot_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"unsupported profile snapshot value: {type(value).__name__}")
 
 
 def _optional_file_sha256(path: Path) -> str:

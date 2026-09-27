@@ -33,6 +33,8 @@ from urllib.parse import unquote, urlsplit
 from .backend_controller import (
     BackendController,
     BackendControllerError,
+    LifecycleCancelledError,
+    SwitchError,
     subprocess_command_runner,
     systemd_service_inventory_probe,
     systemd_service_state_probe,
@@ -45,6 +47,18 @@ from .broker_security import (
     revoke_api_key,
     rotate_api_keys,
     write_api_keys,
+)
+from .state_store import StateFileError, StateFileStore
+from .transition_operations import (
+    ExecutionView,
+    OperationCancelledError,
+    OperationStateError,
+    OperationSupersededError,
+    PersistentTransitionQueue,
+    QueueCapacityError,
+    ReconciliationRequiredError,
+    RequestView,
+    TransitionQueue,
 )
 from .tools.broker_backend import BackendClient
 from .tools.broker_backend import make_connection
@@ -357,6 +371,10 @@ class BrokerStateUnknownError(BrokerCoordinationError):
     error_type = "broker_state_unknown"
 
 
+class StaleOperationSnapshotError(LifecycleCancelledError):
+    """A queued operation no longer matches the profile facts it captured."""
+
+
 class BrokerAlreadyRunningError(RuntimeError):
     pass
 
@@ -375,7 +393,7 @@ class Controller(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _verify_profile_artifacts(profile: Any) -> None:
+def _verify_profile_artifacts(profile: Any, *, force: bool = False) -> None:
     """Verify every immutable artifact immediately before a backend start."""
 
     checks: list[tuple[Path, object, str]] = [
@@ -398,7 +416,7 @@ def _verify_profile_artifacts(profile: Any) -> None:
                 f"{profile.id} {kind} has no configured SHA-256 digest"
             )
         key = _artifact_verification_key(path, str(expected))
-        if _artifact_verification_cached(key):
+        if not force and _artifact_verification_cached(key):
             continue
         try:
             actual = sha256_file(path)
@@ -698,6 +716,9 @@ class ProfileCoordinator:
         drain_timeout: float = DRAIN_TIMEOUT,
         transition_timeout: float = TRANSITION_TIMEOUT,
         stop_timeout: float = STOP_TIMEOUT,
+        switch_profile_with_commit: Callable[[str, Callable[[], None]], Any] | None = None,
+        restart_profile_with_commit: Callable[[str, Callable[[], None]], Any] | None = None,
+        stop_backend_with_commit: Callable[[Callable[[], None]], Any] | None = None,
     ):
         for name, value in (
             ("drain_timeout", drain_timeout),
@@ -710,11 +731,15 @@ class ProfileCoordinator:
         self._switch_profile = switch_profile
         self._stop_backend = stop_backend
         self._restart_profile = restart_profile or switch_profile
+        self._switch_profile_with_commit = switch_profile_with_commit
+        self._restart_profile_with_commit = restart_profile_with_commit
+        self._stop_backend_with_commit = stop_backend_with_commit
         self._drain_timeout = drain_timeout
         self._transition_timeout = transition_timeout
         self._stop_timeout = stop_timeout
         self._active_requests = 0
         self._queued_transitions = 0
+        self._external_queued_transitions = 0
         self._transitioning = False
         self._transition_name: str | None = None
         self._transition_target: str | None = None
@@ -729,6 +754,7 @@ class ProfileCoordinator:
             self._shutdown_requested
             or self._transitioning
             or self._queued_transitions > 0
+            or self._external_queued_transitions > 0
         )
 
     @property
@@ -742,6 +768,11 @@ class ProfileCoordinator:
             return self._active_requests
 
     @property
+    def shutting_down(self) -> bool:
+        with self._condition:
+            return self._shutdown_requested
+
+    @property
     def quiescing(self) -> bool:
         with self._condition:
             return self._quiescing_unlocked()
@@ -753,7 +784,8 @@ class ProfileCoordinator:
                 "active_requests": self._active_requests,
                 "quiescing": self._quiescing_unlocked(),
                 "transitioning": self._transitioning,
-                "queued_transitions": self._queued_transitions,
+                "queued_transitions": self._queued_transitions + self._external_queued_transitions,
+                "external_queued_transitions": self._external_queued_transitions,
                 "transition": self._transition_name,
                 "transition_target": self._transition_target,
                 "pending_restore": self._pending_restore,
@@ -769,6 +801,56 @@ class ProfileCoordinator:
     def _queue_transition(self) -> None:
         with self._condition:
             self._queue_transition_unlocked()
+
+    def set_external_queued_transitions(self, count: int) -> None:
+        """Reflect the durable queue in lease admission without losing reservations."""
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("external queued transition count must be a non-negative integer")
+        with self._condition:
+            if self._shutdown_requested and count:
+                raise BrokerQuiescingError("Llama-Broker is shutting down")
+            self._external_queued_transitions = count
+            self._condition.notify_all()
+
+    @contextmanager
+    def transition_admission_guard(self) -> Iterator[None]:
+        """Serialize durable acceptance with inference leases and transient restore."""
+        with self._condition:
+            if self._shutdown_requested:
+                raise BrokerQuiescingError("Llama-Broker is shutting down")
+            yield
+
+    def begin_external_transition(self) -> None:
+        """Atomically promote one durable queue entry to an active coordinator reservation."""
+        with self._condition:
+            if self._shutdown_requested:
+                raise BrokerQuiescingError("Llama-Broker is shutting down")
+            if self._external_queued_transitions <= 0:
+                raise RuntimeError("no externally queued transition is available")
+            self._external_queued_transitions -= 1
+            self._queued_transitions += 1
+            self._condition.notify_all()
+
+    def cancel_temporary_restore_for_queued_operation(self) -> None:
+        """An explicit queued operation supersedes any pending automatic restore."""
+        with self._condition:
+            self._cancel_temporary_restore_unlocked()
+            self._condition.notify_all()
+
+    def run_reserved_switch(
+        self,
+        target_profile: str,
+        *,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> Any:
+        """Execute a switch for a reservation obtained via begin_external_transition."""
+        with self._condition:
+            if self._queued_transitions <= 0:
+                raise RuntimeError("no transition reservation is available")
+        return self._run_switch_transition(
+            target_profile,
+            commit_callback=commit_callback,
+        )
 
     def _wait_for_transition_slot(
         self,
@@ -882,9 +964,12 @@ class ProfileCoordinator:
                             )
                         else:
                             self._active_requests += 1
-                if outcome["error"] is not None:
+                if outcome["error"] is not None and not isinstance(
+                    outcome["error"], LifecycleCancelledError
+                ):
                     # A failed lifecycle operation leaves backend ownership
-                    # unknown; never continue leasing the prior profile.
+                    # unknown. A pre-commit cancellation preserves the prior
+                    # backend because no destructive work has begun.
                     self._active_profile = None
                 self._transitioning = False
                 self._transition_name = None
@@ -1108,12 +1193,129 @@ class ProfileCoordinator:
         self._temporary_restore = None
         self._restore_generation = object()
 
-    def _run_switch_transition(self, target_profile: str) -> Any:
-        operation_name = f"admin switch to {target_profile!r}"
+    def run_reserved_restart(
+        self,
+        profile_id: str,
+        *,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> Any:
+        """Execute a priority restart for a previously reserved operation."""
+        with self._condition:
+            if self._queued_transitions <= 0:
+                raise RuntimeError("no transition reservation is available")
+            if self._active_profile != profile_id:
+                raise BrokerCoordinationError(
+                    f"cannot restart inactive profile {profile_id!r}"
+                )
+            self._cancel_temporary_restore_unlocked()
+        operation_name = f"restart active profile {profile_id!r}"
+        forced = self._wait_for_transition_slot(
+            operation_name,
+            force_immediately=True,
+        )
+        if forced:
+            with self._condition:
+                active_requests = self._active_requests
+            _log(
+                f"[broker] {operation_name} interrupting "
+                f"{active_requests} active request(s); restarting immediately"
+            )
+        restart_with_commit = self._restart_profile_with_commit
+        if commit_callback is None:
+            operation = lambda: self._restart_profile(profile_id)
+        elif restart_with_commit is None:
+            operation = lambda: (commit_callback(), self._restart_profile(profile_id))[1]
+        else:
+            operation = lambda: restart_with_commit(profile_id, commit_callback)
+        return self._run_transition(
+            operation_name,
+            operation,
+            target_profile=profile_id,
+            timeout=self._transition_timeout,
+        )
+
+    def run_reserved_reload(
+        self,
+        action: Callable[[Callable[[], None]], Any],
+        *,
+        commit_callback: Callable[[], None],
+    ) -> Any:
+        """Run a profile/catalog reload in the shared normal FIFO lane."""
+        with self._condition:
+            if self._queued_transitions <= 0:
+                raise RuntimeError("no transition reservation is available")
+            self._cancel_temporary_restore_unlocked()
+            target_profile = self._active_profile
+            self._condition.notify_all()
+        operation_name = "profile/catalog reload"
         self._wait_for_transition_slot(operation_name)
         return self._run_transition(
             operation_name,
-            lambda: self._switch_profile(target_profile),
+            lambda: action(commit_callback),
+            target_profile=target_profile,
+            timeout=self._transition_timeout,
+        )
+
+    def run_reserved_stop(
+        self,
+        *,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> Any:
+        """Execute a priority unload/stop for a previously reserved operation."""
+        if self._stop_backend is None:
+            raise RuntimeError("backend stop is not configured")
+        if self._queued_transitions <= 0:
+            raise RuntimeError("no transition reservation is available")
+        with self._condition:
+            self._cancel_temporary_restore_unlocked()
+            self._condition.notify_all()
+        operation_name = "admin stop"
+        forced = self._wait_for_transition_slot(
+            operation_name,
+            force_after_drain_timeout=True,
+        )
+        if forced:
+            with self._condition:
+                active_requests = self._active_requests
+            _log(
+                f"[broker] admin stop drain deadline expired with "
+                f"{active_requests} active request(s); invoking the configured stop"
+            )
+        stop_with_commit = self._stop_backend_with_commit
+        if commit_callback is None:
+            operation = self._stop_backend
+        elif stop_with_commit is None:
+            operation = lambda: (commit_callback(), self._stop_backend())[1]
+        else:
+            operation = lambda: stop_with_commit(commit_callback)
+        return self._run_transition(
+            operation_name,
+            operation,
+            target_profile=None,
+            timeout=self._stop_timeout,
+        )
+
+    def _run_switch_transition(
+        self,
+        target_profile: str,
+        *,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> Any:
+        operation_name = f"admin switch to {target_profile!r}"
+        self._wait_for_transition_slot(operation_name)
+        switch_with_commit = self._switch_profile_with_commit
+        if commit_callback is None:
+            operation = lambda: self._switch_profile(target_profile)
+        elif switch_with_commit is None:
+            operation = lambda: (
+                commit_callback(),
+                self._switch_profile(target_profile),
+            )[1]
+        else:
+            operation = lambda: switch_with_commit(target_profile, commit_callback)
+        return self._run_transition(
+            operation_name,
+            operation,
             target_profile=target_profile,
             timeout=self._transition_timeout,
         )
@@ -1330,16 +1532,20 @@ class BrokerApplication:
         drain_timeout: float = DRAIN_TIMEOUT,
         transition_timeout: float = TRANSITION_TIMEOUT,
         stop_timeout: float = STOP_TIMEOUT,
+        start_operation_worker: bool = True,
+        profiles_path: Path | str | None = None,
     ) -> None:
         if max_output_tokens is not None and max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
         self.registry = registry
+        self._profiles_path = Path(profiles_path) if profiles_path is not None else None
         self.controller = controller
         self.backend_host = backend_host
         self.backend_port = backend_port
         self.backend_timeout = backend_timeout
         self.max_body_bytes = max_body_bytes
         self.max_output_tokens = max_output_tokens
+        self.admin_operation_timeout = drain_timeout + transition_timeout + 1.0
         self.security = security or SecurityConfig()
         self._artifact_verification_cache: dict[str, tuple[tuple[Any, ...], bool]] = {}
         self._state_lock = threading.Lock()
@@ -1393,7 +1599,409 @@ class BrokerApplication:
             drain_timeout=drain_timeout,
             transition_timeout=transition_timeout,
             stop_timeout=stop_timeout,
+            switch_profile_with_commit=self._switch_profile_with_commit,
+            restart_profile_with_commit=self._restart_profile_with_commit,
+            stop_backend_with_commit=self._stop_backend_with_commit,
         )
+        self._operation_admission_lock = threading.RLock()
+        self._operation_condition = threading.Condition()
+        self._operation_worker_stop = threading.Event()
+        self._operation_worker_wake = threading.Event()
+        self._operation_worker_thread: threading.Thread | None = None
+        state_store = getattr(controller, "state_store", None)
+        if state_store is None:
+            self.operation_queue: TransitionQueue | PersistentTransitionQueue = TransitionQueue()
+        else:
+            self.operation_queue = PersistentTransitionQueue(state_store)
+        self.coordinator.set_external_queued_transitions(
+            self.operation_queue.pending_transition_count
+        )
+        if self.operation_queue.needs_reconciliation:
+            reconcile = getattr(controller, "reconcile", None)
+            if not callable(reconcile):
+                raise BrokerStateUnknownError(
+                    "operation recovery requires backend reconciliation"
+                )
+            recovered_state = dict(reconcile(active_probe_timeout=0.5))
+            self._remember_controller_state(recovered_state)
+            recovered_profile = (
+                recovered_state.get("profile")
+                if recovered_state.get("phase") == "active"
+                else None
+            )
+            self.coordinator.synchronize_after_controller_failure(
+                recovered_profile if isinstance(recovered_profile, str) else None
+            )
+            self.operation_queue.acknowledge_reconciliation()
+        if start_operation_worker:
+            self.start_operation_worker()
+
+    def start_operation_worker(self) -> None:
+        """Start the single durable transition worker, if not already running."""
+        thread = self._operation_worker_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._operation_worker_stop.clear()
+        thread = threading.Thread(
+            target=self._operation_worker_loop,
+            name="llama-broker-operation-worker",
+            daemon=True,
+        )
+        self._operation_worker_thread = thread
+        thread.start()
+        if self.operation_queue.pending_transition_count:
+            self._operation_worker_wake.set()
+
+    def _validate_execution_snapshot(self, execution: ExecutionView) -> None:
+        captured = self.operation_queue.get_profile_snapshot(execution.execution_id)
+        if execution.operation_type == "reload":
+            if captured is None or self._profiles_path is None:
+                raise StaleOperationSnapshotError(
+                    "profile reload has no captured catalog revision; resubmit it"
+                )
+            try:
+                current_registry = ProfileRegistry.from_path(self._profiles_path)
+                current_revision = current_registry.snapshot_revision_identity()
+            except ProfileError as error:
+                raise StaleOperationSnapshotError(
+                    f"profile/catalog revision is no longer valid: {error}"
+                ) from error
+            if current_revision != captured:
+                raise StaleOperationSnapshotError(
+                    "profile/catalog files changed after reload submission; resubmit"
+                )
+            return
+        if execution.operation_type not in {"switch", "restart"}:
+            return
+        target = execution.target_profile_id
+        if not isinstance(target, str):
+            raise StaleOperationSnapshotError("transition snapshot has no target profile")
+        if captured is None:
+            raise StaleOperationSnapshotError(
+                "operation has no immutable profile snapshot; resubmit it"
+            )
+        try:
+            current = self.registry.profile_snapshot_identity(target)
+        except ProfileError as error:
+            raise StaleOperationSnapshotError(
+                f"captured profile {target!r} is no longer available; resubmit"
+            ) from error
+        if current != captured:
+            raise StaleOperationSnapshotError(
+                f"profile/catalog facts changed after request submission for {target!r}; resubmit"
+            )
+        if getattr(self.controller, "state_store", None) is not None:
+            profile = self.registry.get(target)
+            if not self._profile_artifacts_verified(profile):
+                raise StaleOperationSnapshotError(
+                    f"pinned artifacts changed or failed verification for {target!r}"
+                )
+
+    def _operation_worker_loop(self) -> None:
+        while not self._operation_worker_stop.is_set():
+            self._operation_worker_wake.wait()
+            self._operation_worker_wake.clear()
+            if self._operation_worker_stop.is_set():
+                return
+            while not self._operation_worker_stop.is_set():
+                with self._operation_admission_lock:
+                    if self.coordinator.shutting_down:
+                        return
+                    execution = self.operation_queue.next_execution()
+                    if execution is None:
+                        self.coordinator.set_external_queued_transitions(
+                            self.operation_queue.pending_transition_count
+                        )
+                        break
+                    try:
+                        if execution.operation_type in {"switch", "restart"}:
+                            self._validate_execution_snapshot(execution)
+                    except StaleOperationSnapshotError as snapshot_error:
+                        self.operation_queue.finish(
+                            execution.execution_id,
+                            error=str(snapshot_error),
+                            error_type=type(snapshot_error).__name__,
+                        )
+                        self.coordinator.set_external_queued_transitions(
+                            self.operation_queue.pending_transition_count
+                        )
+                        self._notify_operation_waiters()
+                        continue
+                    try:
+                        self.coordinator.begin_external_transition()
+                        self.coordinator.set_external_queued_transitions(
+                            self.operation_queue.pending_transition_count
+                        )
+                    except BaseException as error:
+                        _log(f"[broker] could not reserve queued operation: {error}")
+                        return
+                    current_execution = execution
+                self._notify_operation_waiters()
+
+                def mark_committed(
+                    execution_id: str = current_execution.execution_id,
+                ) -> None:
+                    self._validate_execution_snapshot(current_execution)
+                    self.operation_queue.mark_committed(execution_id)
+
+                try:
+                    if execution.operation_type == "switch":
+                        if execution.target_profile_id is None:
+                            raise OperationStateError("switch execution has no target profile")
+                        self.coordinator.run_reserved_switch(
+                            execution.target_profile_id,
+                            commit_callback=mark_committed,
+                        )
+                    elif execution.operation_type == "restart":
+                        if execution.target_profile_id is None:
+                            raise OperationStateError("restart execution has no target profile")
+                        self.coordinator.run_reserved_restart(
+                            execution.target_profile_id,
+                            commit_callback=mark_committed,
+                        )
+                    elif execution.operation_type == "stop":
+                        self.coordinator.run_reserved_stop(commit_callback=mark_committed)
+                    elif execution.operation_type == "reload":
+                        self.coordinator.run_reserved_reload(
+                            self.reload_profiles_for_operation,
+                            commit_callback=mark_committed,
+                        )
+                    else:
+                        raise OperationStateError(
+                            f"unsupported operation type: {execution.operation_type}"
+                        )
+                except BaseException as caught_error:
+                    error: BaseException = caught_error
+                    if execution.operation_type in {"switch", "restart"}:
+                        try:
+                            self._validate_execution_snapshot(current_execution)
+                        except StaleOperationSnapshotError as snapshot_error:
+                            error = snapshot_error
+                            self._refresh_after_lifecycle(raise_on_error=False)
+                    try:
+                        self.operation_queue.finish(
+                            execution.execution_id,
+                            error=str(error),
+                            error_type=type(error).__name__,
+                        )
+                    except BaseException as persistence_error:
+                        _log(
+                            f"[broker] failed to persist operation failure "
+                            f"{execution.execution_id}: {persistence_error}"
+                        )
+                        with self._operation_admission_lock:
+                            self.coordinator.set_external_queued_transitions(
+                                max(1, self.operation_queue.pending_transition_count)
+                            )
+                        self._notify_operation_waiters()
+                        return
+                else:
+                    try:
+                        self.operation_queue.finish(execution.execution_id)
+                    except BaseException as persistence_error:
+                        _log(
+                            f"[broker] failed to persist operation completion "
+                            f"{execution.execution_id}: {persistence_error}"
+                        )
+                        with self._operation_admission_lock:
+                            self.coordinator.set_external_queued_transitions(
+                                max(1, self.operation_queue.pending_transition_count)
+                            )
+                        self._notify_operation_waiters()
+                        return
+                with self._operation_admission_lock:
+                    self.coordinator.set_external_queued_transitions(
+                        self.operation_queue.pending_transition_count
+                    )
+                self._notify_operation_waiters()
+
+    def _notify_operation_waiters(self) -> None:
+        with self._operation_condition:
+            self._operation_condition.notify_all()
+
+    def _registry_for_submission_unlocked(self) -> ProfileRegistry:
+        pending_reload = any(
+            execution.operation_type == "reload"
+            and execution.status in {"queued", "preflight", "committed"}
+            for execution in self.operation_queue.list_executions()
+        )
+        if pending_reload and self._profiles_path is not None:
+            return ProfileRegistry.from_path(self._profiles_path)
+        return self.registry
+
+    def submit_switch_operation(self, profile_id: str) -> RequestView:
+        """Persist a request against the registry revision at its FIFO position."""
+        with self._operation_admission_lock, self.coordinator.transition_admission_guard():
+            submission_registry = self._registry_for_submission_unlocked()
+            profile = submission_registry.resolve(profile_id)
+            profile_snapshot = submission_registry.profile_snapshot_identity(profile.id)
+            previous_depth = self.operation_queue.pending_transition_count
+            self.coordinator.set_external_queued_transitions(previous_depth + 1)
+            try:
+                request = self.operation_queue.submit_load(
+                    profile.id,
+                    profile_snapshot=profile_snapshot,
+                )
+            except BaseException:
+                self.coordinator.set_external_queued_transitions(previous_depth)
+                raise
+            self.coordinator.cancel_temporary_restore_for_queued_operation()
+            self.coordinator.set_external_queued_transitions(
+                self.operation_queue.pending_transition_count
+            )
+            self._operation_worker_wake.set()
+        self._notify_operation_waiters()
+        return request
+
+    def submit_restart_operation(self, profile_id: str) -> RequestView:
+        """Queue a priority restart, or a normal load if target is inactive."""
+        with self._operation_admission_lock, self.coordinator.transition_admission_guard():
+            submission_registry = self._registry_for_submission_unlocked()
+            profile = submission_registry.resolve(profile_id)
+            profile_snapshot = submission_registry.profile_snapshot_identity(profile.id)
+            previous = self.operation_queue.pending_transition_count
+            self.coordinator.set_external_queued_transitions(previous + 1)
+            try:
+                if self.coordinator.active_profile != profile.id:
+                    request = self.operation_queue.submit_load(
+                        profile.id,
+                        profile_snapshot=profile_snapshot,
+                    )
+                else:
+                    request = self.operation_queue.submit_restart(
+                        profile.id,
+                        profile_snapshot=profile_snapshot,
+                    )
+            except BaseException:
+                self.coordinator.set_external_queued_transitions(previous)
+                raise
+            self.coordinator.cancel_temporary_restore_for_queued_operation()
+            self.coordinator.set_external_queued_transitions(
+                self.operation_queue.pending_transition_count
+            )
+            self._operation_worker_wake.set()
+        self._notify_operation_waiters()
+        return request
+
+    def submit_stop_operation(self) -> RequestView:
+        with self._operation_admission_lock, self.coordinator.transition_admission_guard():
+            previous = self.operation_queue.pending_transition_count
+            self.coordinator.set_external_queued_transitions(previous + 1)
+            try:
+                request = self.operation_queue.submit_stop()
+            except BaseException:
+                self.coordinator.set_external_queued_transitions(previous)
+                raise
+            self.coordinator.cancel_temporary_restore_for_queued_operation()
+            self.coordinator.set_external_queued_transitions(
+                self.operation_queue.pending_transition_count
+            )
+            self._operation_worker_wake.set()
+        self._notify_operation_waiters()
+        return request
+
+    def submit_profile_reload_operation(self) -> RequestView:
+        if self._profiles_path is None:
+            raise BrokerLifecycleError("profile reload source path is not configured")
+        with self._operation_admission_lock, self.coordinator.transition_admission_guard():
+            reload_registry = ProfileRegistry.from_path(self._profiles_path)
+            profile_snapshot = reload_registry.snapshot_revision_identity()
+            previous = self.operation_queue.pending_transition_count
+            self.coordinator.set_external_queued_transitions(previous + 1)
+            try:
+                request = self.operation_queue.submit_reload(
+                    profile_snapshot=profile_snapshot
+                )
+            except BaseException:
+                self.coordinator.set_external_queued_transitions(previous)
+                raise
+            self.coordinator.cancel_temporary_restore_for_queued_operation()
+            self.coordinator.set_external_queued_transitions(
+                self.operation_queue.pending_transition_count
+            )
+            self._operation_worker_wake.set()
+        self._notify_operation_waiters()
+        return request
+
+    def operation_list(self) -> dict[str, Any]:
+        """Return live work and retained completion records for the TUI/CLI."""
+        entries: list[dict[str, Any]] = []
+        for execution in self.operation_queue.list_executions():
+            entries.append(
+                {
+                    "execution": {
+                        "execution_id": execution.execution_id,
+                        "type": execution.operation_type,
+                        "target": execution.target_profile_id,
+                        "status": execution.status,
+                        "cancel_requested": execution.cancel_requested,
+                        "error": execution.error,
+                        "error_type": execution.error_type,
+                    },
+                    "requests": [
+                        self.operation_status(request_id)
+                        for request_id in execution.request_ids
+                    ],
+                }
+            )
+        return {"operations": entries}
+
+    def operation_status(self, request_id: str) -> dict[str, Any]:
+        request = self.operation_queue.get_request(request_id)
+        execution = self.operation_queue.get_execution(request.execution_id)
+        return {
+            "request_id": request.request_id,
+            "execution_id": request.execution_id,
+            "type": execution.operation_type,
+            "target": execution.target_profile_id,
+            "status": request.status,
+            "waiting": request.waiting,
+            "error": request.error,
+            "error_type": request.error_type,
+            "execution": {
+                "status": execution.status,
+                "cancel_requested": execution.cancel_requested,
+                "error": execution.error,
+                "error_type": execution.error_type,
+            },
+        }
+
+    def cancel_operation(self, request_id: str) -> dict[str, Any]:
+        with self._operation_admission_lock:
+            cancelled = self.operation_queue.cancel_request(request_id)
+            self.coordinator.set_external_queued_transitions(
+                self.operation_queue.pending_transition_count
+            )
+            self._operation_worker_wake.set()
+        self._notify_operation_waiters()
+        return {
+            "cancelled": cancelled,
+            "operation": self.operation_status(request_id),
+        }
+
+    def wait_for_operation(self, request_id: str, timeout: float) -> dict[str, Any]:
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        deadline = time.monotonic() + timeout
+        with self._operation_condition:
+            while True:
+                operation = self.operation_status(request_id)
+                if operation["status"] in {"succeeded", "failed", "cancelled"}:
+                    return operation
+                if not operation["waiting"]:
+                    return operation
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"operation {request_id} is still running")
+                self._operation_condition.wait(timeout=remaining)
+
+    def _stop_operation_worker(self) -> None:
+        self._operation_worker_stop.set()
+        self._operation_worker_wake.set()
+        thread = self._operation_worker_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self.coordinator._drain_timeout + self.coordinator._transition_timeout + 1)
+        self._operation_worker_thread = None
 
     def start_recovery_watchdog(self) -> None:
         """Start the internal watchdog for the currently active backend only."""
@@ -1541,9 +2149,21 @@ class BrokerApplication:
             active_profile = None
         self.coordinator.synchronize_after_controller_failure(active_profile)
 
+    @contextmanager
+    def _controller_lifecycle(self) -> Iterator[Any]:
+        """Own one cross-process lifecycle lock around an adapter transition."""
+        lifecycle = getattr(self.controller, "lifecycle", None)
+        if callable(lifecycle):
+            lifecycle_context: Any = lifecycle()
+            with lifecycle_context as controller:
+                yield controller
+            return
+        yield self.controller
+
     def _switch_profile(self, profile_id: str) -> Any:
         try:
-            result = self.controller.switch(profile_id)
+            with self._controller_lifecycle() as controller:
+                result = controller.switch(profile_id)
         except Exception as error:
             self._refresh_after_lifecycle(raise_on_error=False)
             if isinstance(error, (BackendControllerError, BrokerCoordinationError)):
@@ -1551,6 +2171,47 @@ class BrokerApplication:
             raise BrokerLifecycleError(
                 f"controller switch failed: {error}"
             ) from error
+        self._refresh_after_lifecycle(raise_on_error=True)
+        return result
+
+    def _switch_profile_with_commit(
+        self,
+        profile_id: str,
+        commit_callback: Callable[[], None],
+    ) -> Any:
+        """Delegate commit-marker timing to the backend adapter."""
+        commit_crossed = False
+
+        def mark_committed() -> None:
+            nonlocal commit_crossed
+            try:
+                commit_callback()
+            except OperationCancelledError as error:
+                raise LifecycleCancelledError(str(error)) from error
+            commit_crossed = True
+
+        try:
+            with self._controller_lifecycle() as controller:
+                if isinstance(controller, BackendController):
+                    result = controller.switch(
+                        profile_id,
+                        commit_callback=mark_committed,
+                    )
+                else:
+                    mark_committed()
+                    result = controller.switch(profile_id)
+        except SwitchError as error:
+            self._refresh_after_lifecycle(raise_on_error=False)
+            if not commit_crossed:
+                raise LifecycleCancelledError(
+                    f"target preflight failed before commit: {error}"
+                ) from error
+            raise
+        except Exception as error:
+            self._refresh_after_lifecycle(raise_on_error=False)
+            if isinstance(error, (BackendControllerError, BrokerCoordinationError)):
+                raise
+            raise BrokerLifecycleError(f"controller switch failed: {error}") from error
         self._refresh_after_lifecycle(raise_on_error=True)
         return result
 
@@ -1562,7 +2223,8 @@ class BrokerApplication:
         self._recovery_attempts = 0
         self._recovery_next_at = 0.0
         try:
-            result = self.controller.stop_all()
+            with self._controller_lifecycle() as controller:
+                result = controller.stop_all()
         except Exception as error:
             self._refresh_after_lifecycle(raise_on_error=False)
             if isinstance(error, (BackendControllerError, BrokerCoordinationError)):
@@ -1575,7 +2237,8 @@ class BrokerApplication:
 
     def _restart_profile(self, profile_id: str) -> Any:
         try:
-            result = self.controller.restart(profile_id)
+            with self._controller_lifecycle() as controller:
+                result = controller.restart(profile_id)
         except Exception as error:
             self._refresh_after_lifecycle(raise_on_error=False)
             if isinstance(error, (BackendControllerError, BrokerCoordinationError)):
@@ -1583,6 +2246,74 @@ class BrokerApplication:
             raise BrokerLifecycleError(
                 f"controller restart failed: {error}"
             ) from error
+        self._refresh_after_lifecycle(raise_on_error=True)
+        return result
+
+    def _restart_profile_with_commit(
+        self,
+        profile_id: str,
+        commit_callback: Callable[[], None],
+    ) -> Any:
+        commit_crossed = False
+
+        def mark_committed() -> None:
+            nonlocal commit_crossed
+            try:
+                commit_callback()
+            except OperationCancelledError as error:
+                raise LifecycleCancelledError(str(error)) from error
+            commit_crossed = True
+
+        try:
+            with self._controller_lifecycle() as controller:
+                if isinstance(controller, BackendController):
+                    result = controller.restart(
+                        profile_id,
+                        commit_callback=mark_committed,
+                    )
+                else:
+                    mark_committed()
+                    result = controller.restart(profile_id)
+        except SwitchError as error:
+            self._refresh_after_lifecycle(raise_on_error=False)
+            if not commit_crossed:
+                raise LifecycleCancelledError(
+                    f"restart preflight failed before commit: {error}"
+                ) from error
+            raise
+        except Exception as error:
+            self._refresh_after_lifecycle(raise_on_error=False)
+            if isinstance(error, (BackendControllerError, BrokerCoordinationError)):
+                raise
+            raise BrokerLifecycleError(f"controller restart failed: {error}") from error
+        self._refresh_after_lifecycle(raise_on_error=True)
+        return result
+
+    def _stop_backend_with_commit(
+        self,
+        commit_callback: Callable[[], None],
+    ) -> Any:
+        def mark_committed() -> None:
+            try:
+                commit_callback()
+            except OperationCancelledError as error:
+                raise LifecycleCancelledError(str(error)) from error
+
+        self._recovery_profile = None
+        self._recovery_attempts = 0
+        self._recovery_next_at = 0.0
+        try:
+            with self._controller_lifecycle() as controller:
+                if isinstance(controller, BackendController):
+                    result = controller.stop_all(commit_callback=mark_committed)
+                else:
+                    mark_committed()
+                    result = controller.stop_all()
+        except Exception as error:
+            self._refresh_after_lifecycle(raise_on_error=False)
+            if isinstance(error, (BackendControllerError, BrokerCoordinationError)):
+                raise
+            raise BrokerLifecycleError(f"controller stop failed: {error}") from error
         self._refresh_after_lifecycle(raise_on_error=True)
         return result
 
@@ -1855,6 +2586,69 @@ class BrokerApplication:
         self._remember_controller_state(dict(self.controller.state()))
         return self.health()
 
+    def reload_profiles_for_operation(
+        self,
+        commit_callback: Callable[[], None],
+    ) -> dict[str, Any]:
+        """Apply the latest profile/catalog revision inside the ordered queue."""
+        if self._profiles_path is None:
+            raise LifecycleCancelledError("profile/catalog reload source path is unavailable")
+        try:
+            new_registry = ProfileRegistry.from_path(self._profiles_path)
+            active = self.coordinator.active_profile
+            if active is not None and new_registry.try_resolve(active) is None:
+                raise ProfileError(
+                    f"profile/catalog reload would remove the active profile {active!r}"
+                )
+        except Exception as error:
+            raise LifecycleCancelledError(
+                f"profile/catalog reload preflight failed: {error}"
+            ) from error
+
+        try:
+            commit_callback()
+        except OperationCancelledError as error:
+            raise LifecycleCancelledError(str(error)) from error
+
+        previous_registry = self.registry
+        previous_profiles = {
+            profile.id: profile for profile in previous_registry.profiles
+        }
+        next_profiles = {profile.id: profile for profile in new_registry.profiles}
+        try:
+            with self._controller_lifecycle() as controller:
+                replace_profiles = getattr(controller, "replace_profiles", None)
+                install_units = getattr(controller, "install_units", None)
+                if callable(replace_profiles):
+                    replace_profiles(next_profiles)
+                if callable(install_units):
+                    install_units()
+        except Exception as error:
+            try:
+                with self._controller_lifecycle() as controller:
+                    replace_profiles = getattr(controller, "replace_profiles", None)
+                    install_units = getattr(controller, "install_units", None)
+                    if callable(replace_profiles):
+                        replace_profiles(previous_profiles)
+                    if callable(install_units):
+                        install_units()
+            except Exception as rollback_error:
+                self._autotune_degraded_reason = (
+                    f"profile/catalog reload compensation failed: {rollback_error}"
+                )
+                raise BrokerLifecycleError(
+                    f"profile/catalog reload failed and compensation failed: {rollback_error}"
+                ) from error
+            raise LifecycleCancelledError(
+                f"profile/catalog reload failed; prior configuration restored: {error}"
+            ) from error
+
+        self.registry = new_registry
+        self._artifact_verification_cache.clear()
+        self._autotune_degraded_reason = None
+        self._remember_controller_state(dict(self.controller.state()))
+        return self.health()
+
     def mark_autotune_degraded(self, reason: str) -> None:
         """Fail closed after autotune compensation cannot restore the registry."""
 
@@ -1873,6 +2667,7 @@ class BrokerApplication:
                     raise self._shutdown_error
                 return
             try:
+                self._stop_operation_worker()
                 self._stop_recovery_watchdog()
                 self.coordinator.handoff_for_process_shutdown()
             except BaseException as error:
@@ -1949,6 +2744,25 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/v1/") and not self._require_api_auth():
             return
+        if path == "/admin/operations":
+            if not self._require_loopback():
+                return
+            self._send_json(HTTPStatus.OK, self.application.operation_list())
+            return
+        if path.startswith("/admin/operations/"):
+            if not self._require_loopback():
+                return
+            request_id = unquote(path.rsplit("/", 1)[-1])
+            try:
+                operation = self.application.operation_status(request_id)
+            except KeyError:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": {"message": "operation not found or expired", "type": "not_found"}},
+                )
+                return
+            self._send_json(HTTPStatus.OK, {"operation": operation})
+            return
         if path in {"/health", "/healthz", "/admin/status"}:
             self._send_json(HTTPStatus.OK, self.application.health())
             return
@@ -2020,6 +2834,34 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         if not self._admit_control_reserve(path):
+            return
+        if path.startswith("/admin/operations/") and path.endswith("/cancel"):
+            if not self._require_loopback():
+                return
+            segments = path.strip("/").split("/")
+            if len(segments) != 4 or segments[:2] != ["admin", "operations"]:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": {"message": "unknown operation endpoint", "type": "not_found"}},
+                )
+                return
+            request_id = unquote(segments[2])
+            try:
+                self._read_payload()
+                result = self.application.cancel_operation(request_id)
+            except KeyError:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": {"message": "operation not found or expired", "type": "not_found"}},
+                )
+                return
+            except ValueError as error:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": {"message": str(error), "type": "invalid_request"}},
+                )
+                return
+            self._send_json(HTTPStatus.OK, result)
             return
         if path in {
             "/admin/switch",
@@ -2172,43 +3014,120 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 pass
             return
 
+    def _respond_admin_operation(self, request: RequestView, *, wait: bool) -> None:
+        if not wait:
+            state = self.application.health()
+            state["operation"] = self.application.operation_status(request.request_id)
+            self._send_json(HTTPStatus.ACCEPTED, state)
+            return
+        try:
+            operation = self.application.wait_for_operation(
+                request.request_id,
+                self.application.admin_operation_timeout,
+            )
+        except TimeoutError:
+            self._send_json(
+                HTTPStatus.GATEWAY_TIMEOUT,
+                {
+                    "error": {
+                        "message": "profile transition is still running",
+                        "type": "broker_transition_timeout",
+                    },
+                    "operation": self.application.operation_status(request.request_id),
+                },
+            )
+            return
+        if operation["status"] == "failed":
+            error_type = operation.get("error_type")
+            if error_type == "BrokerDrainTimeoutError":
+                response_status = HTTPStatus.GATEWAY_TIMEOUT
+                response_type = "broker_drain_timeout"
+            elif error_type == "BrokerTransitionTimeoutError":
+                response_status = HTTPStatus.GATEWAY_TIMEOUT
+                response_type = "broker_transition_timeout"
+            elif error_type == "StaleOperationSnapshotError":
+                response_status = HTTPStatus.CONFLICT
+                response_type = "operation_snapshot_stale"
+            elif error_type == "BrokerStateUnknownError":
+                response_status = HTTPStatus.SERVICE_UNAVAILABLE
+                response_type = "broker_state_unknown"
+            else:
+                response_status = HTTPStatus.SERVICE_UNAVAILABLE
+                response_type = "broker_switch_error"
+            self._send_json(
+                response_status,
+                {
+                    "error": {
+                        "message": operation.get("error") or "profile transition failed",
+                        "type": response_type,
+                    },
+                    "operation": operation,
+                },
+            )
+            return
+        if operation["status"] == "cancelled":
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": {"message": "transition request was cancelled", "type": "operation_cancelled"},
+                    "operation": operation,
+                },
+            )
+            return
+        state = self.application.health()
+        state["operation"] = operation
+        self._send_json(HTTPStatus.OK, state)
+
     def _handle_admin(self, path: str) -> None:
         try:
             payload = self._read_payload()
             if path == "/admin/switch":
-                profile = self.application.registry.resolve(payload.get("model"))
+                model = payload.get("model")
+                if not isinstance(model, str) or not model:
+                    raise ValueError("model must be a non-empty profile ID or alias")
                 wait = payload.get("wait", True)
                 if not isinstance(wait, bool):
                     raise ValueError("wait must be boolean")
-                if wait:
-                    self.application.coordinator.switch_when_idle(profile.id)
-                else:
-                    self.application.coordinator.switch_when_idle_async(profile.id)
-                    state = self.application.health()
-                    state["operation"] = {
-                        "status": "accepted",
-                        "target": profile.id,
-                        "type": "switch",
-                    }
-                    self._send_json(HTTPStatus.ACCEPTED, state)
-                    return
+                request = self.application.submit_switch_operation(model)
+                self._respond_admin_operation(request, wait=wait)
+                return
             elif path == "/admin/restart":
+                wait = payload.get("wait", True)
+                if not isinstance(wait, bool):
+                    raise ValueError("wait must be boolean")
                 model = payload.get("model")
-                if model is None:
-                    self.application.restart_when_idle()
+                if model is not None:
+                    if not isinstance(model, str) or not model:
+                        raise ValueError("model must be a non-empty profile ID or alias")
+                    request = self.application.submit_restart_operation(model)
                 else:
-                    profile = self.application.registry.resolve(model)
-                    if self.application.coordinator.active_profile == profile.id:
-                        self.application.coordinator.restart_when_idle(profile.id)
+                    active_profile = self.application.coordinator.active_profile
+                    if active_profile is None:
+                        failed_target = self.application._controller_state_snapshot().get(
+                            "target_profile"
+                        )
+                        if not isinstance(failed_target, str):
+                            raise BrokerCoordinationError(
+                                "there is no active or recoverable profile to restart"
+                            )
+                        request = self.application.submit_switch_operation(failed_target)
                     else:
-                        self.application.coordinator.switch_when_idle(profile.id)
+                        request = self.application.submit_restart_operation(active_profile)
+                self._respond_admin_operation(request, wait=wait)
+                return
             elif path == "/admin/stop":
-                self.application.coordinator.stop_when_idle()
+                wait = payload.get("wait", True)
+                if not isinstance(wait, bool):
+                    raise ValueError("wait must be boolean")
+                request = self.application.submit_stop_operation()
+                self._respond_admin_operation(request, wait=wait)
+                return
             elif path == "/admin/autotune/reload":
-                self._send_json(
-                    HTTPStatus.OK,
-                    self.application.reload_manifest_for_autotune(),
-                )
+                wait = payload.get("wait", True)
+                if not isinstance(wait, bool):
+                    raise ValueError("wait must be boolean")
+                request = self.application.submit_profile_reload_operation()
+                self._respond_admin_operation(request, wait=wait)
                 return
             elif path == "/admin/autotune/degraded":
                 reason = payload.get("reason")
@@ -2241,6 +3160,21 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 {"error": {"message": str(error), "type": "invalid_request_error"}},
             )
+        except QueueCapacityError as error:
+            self._send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": {"message": str(error), "type": "operation_queue_full"}},
+            )
+        except OperationSupersededError as error:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {"error": {"message": str(error), "type": "operation_superseded"}},
+            )
+        except ReconciliationRequiredError as error:
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": {"message": str(error), "type": "broker_reconciliation_required"}},
+            )
         except BackendControllerError as error:
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -2257,6 +3191,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             "/health",
             "/healthz",
             "/admin/status",
+            "/admin/operations",
             "/admin/switch",
             "/admin/restart",
             "/admin/stop",
@@ -2266,7 +3201,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             "/admin/credentials/revoke",
             "/v1/models",
             "/api/tags",
-        }
+        } or path.startswith("/admin/operations/")
         if using_reserve and not control_path:
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -2611,34 +3546,49 @@ class LockedController:
         self.controller = controller
         self.lock_path = lock_path
 
+    @property
+    def state_store(self) -> StateFileStore:
+        """Expose the backend's shared state adapter to the orchestrator."""
+        return self.controller.state_store
+
+    @contextmanager
+    def lifecycle(self) -> Iterator[BackendController]:
+        """Give the orchestration core one cross-process lifecycle lock lease."""
+        with _operation_lock(self.lock_path):
+            yield self.controller
+
     def state(self) -> dict[str, Any]:
         return self.controller.state()
 
     def replace_profiles(self, profiles: Mapping[str, Profile]) -> None:
-        with _operation_lock(self.lock_path):
-            self.controller.replace_profiles(profiles)
+        with self.lifecycle() as controller:
+            controller.replace_profiles(profiles)
 
     def install_units(self) -> dict[str, Path]:
-        with _operation_lock(self.lock_path):
-            return self.controller.install_units()
+        with self.lifecycle() as controller:
+            return controller.install_units()
 
     def switch(self, profile_id: str) -> dict[str, Any]:
-        with _operation_lock(self.lock_path):
-            return self.controller.switch(profile_id)
+        with self.lifecycle() as controller:
+            return controller.switch(profile_id)
 
     def restart(self, profile_id: str) -> dict[str, Any]:
-        with _operation_lock(self.lock_path):
-            return self.controller.restart(profile_id)
+        with self.lifecycle() as controller:
+            return controller.restart(profile_id)
 
     def stop_all(self) -> dict[str, Any]:
-        with _operation_lock(self.lock_path):
-            return self.controller.stop_all()
+        with self.lifecycle() as controller:
+            return controller.stop_all()
+
+    def reconcile(self, *, active_probe_timeout: float | None = None) -> dict[str, Any]:
+        with self.lifecycle() as controller:
+            return controller.reconcile(active_probe_timeout=active_probe_timeout)
 
     def record_recovery_failure(
         self, profile_id: str, *, attempts: int, error: str
     ) -> dict[str, Any]:
-        with _operation_lock(self.lock_path):
-            return self.controller.record_recovery_failure(
+        with self.lifecycle() as controller:
+            return controller.record_recovery_failure(
                 profile_id, attempts=attempts, error=error
             )
 
@@ -2731,7 +3681,7 @@ def create_production_controller(
         backend_listen_host=backend_listen_host,
         backend_listen_port=BACKEND_LISTEN_PORT,
         managed_args=managed_args,
-        artifact_verifier=_verify_profile_artifacts,
+        artifact_verifier=lambda profile: _verify_profile_artifacts(profile, force=True),
         verify_command=lambda profile: (
             sys.executable,
             str(ROOT / "brokerctl.py"),
@@ -2741,6 +3691,74 @@ def create_production_controller(
             profile.id,
         ),
     )
+
+
+def _fresh_recovery_operations() -> dict[str, Any]:
+    operations = TransitionQueue().to_operations_state()
+    operations["reconciliation_required"] = True
+    return operations
+
+
+def _prepare_durable_state(controller: BackendController) -> bool:
+    """Back up unsupported/corrupt state and reconstruct ownership from runtime facts."""
+    state_store = controller.state_store
+    try:
+        state = state_store.read()
+    except StateFileError:
+        recovered = controller.reconcile_from_runtime()
+        if recovered.get("phase") == "stale":
+            raise BrokerStateUnknownError(
+                "corrupt broker state could not be reconciled to one proven backend"
+            )
+        recovery = recovered.setdefault("recovery", {})
+        if isinstance(recovery, dict):
+            recovery["warning"] = (
+                "durable state was corrupt; queued requests were discarded and must be resubmitted"
+            )
+        controller._write_state(recovered)
+        return True
+
+    operations_error: OperationStateError | None = None
+    try:
+        TransitionQueue.from_operations_state(state.get("operations"))
+    except OperationStateError as error:
+        operations_error = error
+
+    backend_error: BaseException | None = None
+    try:
+        controller.state()
+    except (BackendControllerError, StateFileError) as error:
+        backend_error = error
+
+    if operations_error is None and backend_error is None:
+        return False
+
+    warning = (
+        f"unsupported operation state: {operations_error}"
+        if operations_error is not None
+        else f"invalid backend state: {backend_error}"
+    )
+    backend_state = {key: value for key, value in state.items() if key != "operations"}
+    if backend_error is not None:
+        backend_state = {
+            "generation": 0,
+            "profile": None,
+            "phase": "stale",
+            "recovery": {"action": "state_file_reconstruction", "warning": warning},
+        }
+    state_store.backup_and_replace(backend_state, _fresh_recovery_operations())
+    recovered = controller.reconcile_from_runtime()
+    if recovered.get("phase") == "stale":
+        raise BrokerStateUnknownError(
+            "recovered broker state is ambiguous; preserving services and refusing startup"
+        )
+    recovery = recovered.setdefault("recovery", {})
+    if isinstance(recovery, dict):
+        recovery["warning"] = (
+            warning + "; queued requests were discarded and must be resubmitted"
+        )
+    controller._write_state(recovered)
+    return True
 
 
 def create_production_application(
@@ -2753,6 +3771,7 @@ def create_production_application(
     backend_url = effective_backend_url(security)
     controller = create_production_controller(registry, shutdown_requested, security)
     with _operation_lock():
+        _prepare_durable_state(controller)
         controller.install_units()
         if shutdown_requested is not None and shutdown_requested.is_set():
             raise BrokerQuiescingError("Llama-Broker startup was interrupted")
@@ -2760,8 +3779,8 @@ def create_production_application(
         if reconciled.get("phase") == "stale":
             stale_profile = reconciled.get("stale_profile")
             if not isinstance(stale_profile, str):
-                raise BackendControllerError(
-                    "stale backend state has no recoverable profile"
+                raise BrokerStateUnknownError(
+                    "stale backend state has no recoverable profile; preserving discovered services"
                 )
             controller.switch(stale_profile)
     if shutdown_requested is not None and shutdown_requested.is_set():
@@ -2781,6 +3800,7 @@ def create_production_application(
         drain_timeout=DRAIN_TIMEOUT,
         transition_timeout=TRANSITION_TIMEOUT,
         stop_timeout=STOP_TIMEOUT,
+        profiles_path=PROFILES_PATH,
     )
     application.start_recovery_watchdog()
     return application, controller
@@ -2910,7 +3930,13 @@ def main() -> int:
             elif application is not None:
                 application.shutdown()
             elif startup_error is not None and process_lock is not None:
-                stop_production_units_after_startup_failure()
+                if isinstance(startup_error, BrokerStateUnknownError):
+                    _log(
+                        "[broker] startup state is ambiguous; preserving all discovered "
+                        "backend services and refusing to guess"
+                    )
+                else:
+                    stop_production_units_after_startup_failure()
         except BaseException as error:
             shutdown_error = error
             _log(f"[broker] shutdown failed closed: {error}")

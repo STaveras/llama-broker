@@ -134,7 +134,9 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
                     "ready": True,
                 },
                 "operation": {
-                    "status": "accepted",
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
                     "target": "vision",
                     "type": "switch",
                 },
@@ -156,7 +158,9 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
         admin.assert_called_once_with("/admin/switch", {"model": "vision", "wait": False})
         self.assertEqual(
             output.getvalue(),
-            "Request:   accepted\n"
+            "Request:   queued\n"
+            "Request ID: request-1\n"
+            "Execution ID: execution-1\n"
             "Target:    vision\n"
             "Broker:    ok\n"
             "Backend:   transition pending (current: main)\n"
@@ -216,7 +220,7 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
             result = brokerctl.main(["unload"])
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/stop", {})
+        admin.assert_called_once_with("/admin/stop", {"wait": False})
         self.assertEqual(
             output.getvalue(),
             "Broker:    ok\n"
@@ -258,7 +262,7 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
             result = brokerctl.main(["restart"])
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/restart", {})
+        admin.assert_called_once_with("/admin/restart", {"wait": False})
 
     def test_restart_with_model_requests_admin_restart_for_target(self) -> None:
         admin = Mock(return_value={"status": "ok"})
@@ -273,7 +277,118 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
             result = brokerctl.main(["restart", "vision"])
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/restart", {"model": "vision"})
+        admin.assert_called_once_with("/admin/restart", {"model": "vision", "wait": False})
+
+    def test_operation_status_reads_one_request_from_admin_api(self) -> None:
+        state = {
+            "operation": {
+                "request_id": "request-1",
+                "execution_id": "execution-1",
+                "status": "queued",
+                "waiting": True,
+            }
+        }
+        read = Mock(return_value=state)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin_get", read),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["operation", "status", "request-1"])
+
+        self.assertEqual(result, 0)
+        read.assert_called_once_with("/admin/operations/request-1")
+        self.assertEqual(json.loads(output.getvalue()), state)
+
+    def test_operation_cancel_posts_to_request_cancel_route(self) -> None:
+        response = {
+            "cancelled": True,
+            "operation": {"request_id": "request-1", "status": "cancelled"},
+        }
+        post = Mock(return_value=response)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin", post),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["operation", "cancel", "request-1"])
+
+        self.assertEqual(result, 0)
+        post.assert_called_once_with("/admin/operations/request-1/cancel", {})
+        self.assertEqual(json.loads(output.getvalue()), response)
+
+    def test_operation_list_queries_admin_operations_endpoint(self) -> None:
+        state = {"operations": []}
+        read = Mock(return_value=state)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl, "_broker_admin_get", read),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["operation", "list"])
+
+        self.assertEqual(result, 0)
+        read.assert_called_once_with("/admin/operations")
+        self.assertEqual(json.loads(output.getvalue()), state)
+
+    def test_operation_tui_submits_async_load_with_ids(self) -> None:
+        registry = Mock()
+        registry.profiles = [SimpleNamespace(id="vision")]
+        post = Mock(
+            return_value={
+                "operation": {
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
+                }
+            }
+        )
+        list_read = Mock(return_value={"operations": []})
+        tui_result: list[int] = []
+
+        def run_tui(model: object) -> int:
+            self.assertEqual(model.profiles, ("vision",))  # type: ignore[attr-defined]
+            model.submit_profile_load("vision")  # type: ignore[attr-defined]
+            tui_result.append(0)
+            return 0
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=registry),
+            patch.object(brokerctl, "_broker_admin", post),
+            patch.object(brokerctl, "_broker_admin_get", list_read),
+            patch("llama_broker.broker_tui.run_operations_tui", side_effect=run_tui),
+        ):
+            result = brokerctl.main(["operation", "tui"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(tui_result, [0])
+        post.assert_called_once_with("/admin/switch", {"model": "vision", "wait": False})
+
+    def test_operation_wait_polls_until_terminal_status(self) -> None:
+        read = Mock(side_effect=(
+            {"operation": {"request_id": "request-1", "status": "queued", "waiting": True}},
+            {"operation": {"request_id": "request-1", "status": "succeeded", "waiting": True}},
+        ))
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin_get", read),
+            patch.object(brokerctl.time, "sleep"),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(
+                ["operation", "wait", "request-1", "--timeout", "2", "--interval", "0.01"]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(json.loads(output.getvalue())["operation"]["status"], "succeeded")
 
     def test_admin_connection_failure_never_falls_back_to_direct_controller(self) -> None:
         connection = Mock()

@@ -11,7 +11,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .broker_profiles import launch_environment
+from .state_store import StateFileError, StateFileStore, atomic_write_text
 
 
 class Profile(Protocol):
@@ -373,32 +373,9 @@ def _unit_quote(value: str, *, escape_dollar: bool = False) -> str:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """Durably replace *path* using a temporary file in the same directory."""
+    """Durably replace *path* using the shared same-directory writer."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o644)
-        os.replace(temporary_path, path)
-
-        # Persist the directory entry where the platform supports directory fsync.
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_write_text(path, text)
 
 
 def _replace_option(args: list[str], option: str, value: str) -> list[str]:
@@ -461,6 +438,7 @@ class BackendController:
 
         self.profiles = dict(profiles)
         self.state_path = Path(state_path)
+        self.state_store = StateFileStore(self.state_path)
         self.systemd_dir = Path(systemd_dir)
         self.service_prefix = service_prefix
         self.command_runner = command_runner
@@ -883,6 +861,7 @@ class BackendController:
         profile_id: str,
         *,
         force_restart: bool = False,
+        commit_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Switch to *profile_id*, restoring the prior profile on any failure."""
 
@@ -932,14 +911,24 @@ class BackendController:
             self._write_state(switching_state)
 
             target_start_attempted = False
+            commit_called = False
             try:
-                if prior_id is not None and (
+                target_requires_activation = (
                     prior_id != profile_id
                     or prior_state["phase"] != "active"
                     or restart_current
-                ):
+                )
+                if target_requires_activation and self.artifact_verifier is not None:
+                    self.artifact_verifier(target)
+                if prior_id is not None and target_requires_activation:
+                    if commit_callback is not None:
+                        commit_callback()
+                    commit_called = True
                     self._stop(prior_id)
                 pre_start_snapshot = self._admit_pre_start(target)
+                if not commit_called and commit_callback is not None:
+                    commit_callback()
+                    commit_called = True
                 self._emit(
                     "profile_transition",
                     decision="target_starting",
@@ -958,6 +947,28 @@ class BackendController:
                     target_profile=profile_id,
                     generation=generation,
                 )
+            except LifecycleCancelledError as cancellation_error:
+                if commit_called:
+                    # Once the old backend was stopped (or target start began),
+                    # cancellation cannot restore the prior state as if nothing happened.
+                    self._handle_failed_switch(
+                        profile_id=profile_id,
+                        prior_id=prior_id,
+                        generation=generation,
+                        target_error=cancellation_error,
+                        cleanup_target=target_start_attempted,
+                    )
+                    raise AssertionError("failed switch handler must raise")
+                self._write_state(prior_state)
+                self._update_alias(prior_id)
+                self._emit(
+                    "profile_transition",
+                    decision="cancelled_before_commit",
+                    prior_profile=prior_id,
+                    target_profile=profile_id,
+                    generation=generation,
+                )
+                raise
             except Exception as target_error:
                 self._emit(
                     "profile_transition",
@@ -968,6 +979,19 @@ class BackendController:
                     error_type=type(target_error).__name__,
                     error=str(target_error),
                 )
+                if not commit_called and prior_id is not None and prior_state["phase"] == "active":
+                    try:
+                        self._write_state(prior_state)
+                    except Exception:
+                        self._handle_failed_switch(
+                            profile_id=profile_id,
+                            prior_id=prior_id,
+                            generation=generation,
+                            target_error=target_error,
+                            cleanup_target=target_start_attempted,
+                        )
+                        raise AssertionError("failed switch handler must raise")
+                    raise SwitchError(profile_id, target_error) from target_error
                 self._handle_failed_switch(
                     profile_id=profile_id,
                     prior_id=prior_id,
@@ -998,10 +1022,19 @@ class BackendController:
             )
             return active_state
 
-    def restart(self, profile_id: str) -> dict[str, Any]:
+    def restart(
+        self,
+        profile_id: str,
+        *,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         """Restart a profile even when its alias is currently healthy."""
 
-        return self.switch(profile_id, force_restart=True)
+        return self.switch(
+            profile_id,
+            force_restart=True,
+            commit_callback=commit_callback,
+        )
 
     def state(self) -> dict[str, Any]:
         """Return a validated snapshot of the durable controller state."""
@@ -1039,7 +1072,9 @@ class BackendController:
             )
             return failure_state
 
-    def stop_all(self) -> dict[str, Any]:
+    def stop_all(
+        self, *, commit_callback: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
         """Cooperatively stop every broker unit without ever starting a model."""
 
         with self._lock:
@@ -1056,6 +1091,8 @@ class BackendController:
             profile_units = {
                 self.unit_name(profile_id) for profile_id in self.profiles
             }
+            if commit_callback is not None:
+                commit_callback()
             for unit_name in sorted(profile_units | discovered_units):
                 try:
                     self._stop_unit(unit_name)
@@ -1220,6 +1257,138 @@ class BackendController:
                 restore="not_attempted",
             )
             return failed_state
+
+    def reconcile_from_runtime(
+        self,
+        *,
+        active_probe_timeout: float = 0.5,
+    ) -> dict[str, Any]:
+        """Rebuild corrupt durable state from observed units without starting/stopping."""
+        if active_probe_timeout <= 0:
+            raise ValueError("active_probe_timeout must be positive")
+        with self._lock:
+            if self.service_state_probe is None:
+                raise ConfigurationError(
+                    "runtime-state reconstruction requires a service-state probe"
+                )
+            unit_to_profile = {
+                self.unit_name(profile_id): profile_id for profile_id in self.profiles
+            }
+            errors: list[str] = []
+            try:
+                discovered = self._inventory_unit_names()
+            except Exception as error:
+                discovered = set()
+                errors.append(f"service inventory failed: {error}")
+            units = set(unit_to_profile) | discovered | {_LEGACY_SERVICE_UNIT}
+            observed: dict[str, ServiceStateSnapshot] = {}
+            for unit_name in sorted(units):
+                try:
+                    snapshot = self.service_state_probe(unit_name)
+                    if not isinstance(snapshot, ServiceStateSnapshot):
+                        raise TypeError("service state probe returned an invalid snapshot")
+                    observed[unit_name] = snapshot
+                except Exception as error:
+                    errors.append(f"{unit_name}: {error}")
+
+            active_profiles: list[str] = []
+            unknown_active_units: list[str] = []
+            for unit_name, snapshot in observed.items():
+                if snapshot.is_quiescent:
+                    continue
+                profile_id = unit_to_profile.get(unit_name)
+                if (
+                    profile_id is not None
+                    and snapshot.active_state == "active"
+                    and snapshot.sub_state == "running"
+                    and snapshot.main_pid > 0
+                    and snapshot.control_pid == 0
+                ):
+                    active_profiles.append(profile_id)
+                else:
+                    unknown_active_units.append(unit_name)
+
+            profile_id: str | None = None
+            phase = "stale"
+            recovery: dict[str, Any] = {
+                "action": "state_file_reconstruction",
+                "errors": errors,
+                "unknown_active_units": sorted(unknown_active_units),
+                "observed_active_profiles": sorted(active_profiles),
+            }
+            if not errors and not unknown_active_units and len(active_profiles) == 1:
+                candidate = active_profiles[0]
+                profile = self._profile(candidate)
+                try:
+                    ready = bool(
+                        self.readiness_probe(profile.alias, active_probe_timeout)
+                    )
+                except Exception as error:
+                    ready = False
+                    recovery["readiness_error"] = str(error)
+                if ready:
+                    profile_id = candidate
+                    phase = "active"
+                else:
+                    recovery["readiness_error"] = "exact alias readiness probe failed"
+            elif not errors and not unknown_active_units and not active_profiles:
+                if self.endpoint_probe is not None:
+                    try:
+                        endpoint_active = bool(self.endpoint_probe())
+                    except Exception as error:
+                        endpoint_active = True
+                        recovery["endpoint_probe_error"] = str(error)
+                    if not endpoint_active:
+                        phase = "inactive"
+                    else:
+                        recovery["error"] = "private endpoint active without an owned unit"
+                else:
+                    recovery["error"] = "endpoint absence could not be proven"
+            elif len(active_profiles) > 1:
+                recovery["error"] = "multiple managed backend units are active"
+            elif unknown_active_units:
+                recovery["error"] = "an active unit could not be mapped to a profile"
+
+            state: dict[str, Any] = {
+                "generation": 0,
+                "profile": profile_id,
+                "phase": phase,
+                "recovery": recovery,
+            }
+            if phase == "active" and profile_id is not None:
+                active_profile = self._profile(profile_id)
+                runtime_build = getattr(active_profile, "runtime_build", None)
+                server_sha256 = getattr(active_profile, "server_sha256", None)
+                if isinstance(runtime_build, str) and runtime_build:
+                    state["runtime_build"] = runtime_build
+                if isinstance(server_sha256, str) and server_sha256:
+                    state["server_sha256"] = server_sha256
+            try:
+                self._write_state(state)
+            except (ConfigurationError, StateFileError):
+                state.setdefault("recovery", {})
+                if isinstance(state["recovery"], dict):
+                    state["recovery"]["warning"] = (
+                        "durable state was corrupt; queued requests were discarded and must be resubmitted"
+                    )
+                self.state_store.backup_and_replace(
+                    state,
+                    {
+                        "schema_version": 1,
+                        "queue": [],
+                        "restart_queue": [],
+                        "stop_queue": [],
+                        "running_execution_id": None,
+                        "restart_coalesced_id": None,
+                        "reconciliation_required": True,
+                        "executions": {},
+                        "requests": {},
+                        "history": [],
+                    },
+                )
+            if phase in {"active", "inactive"}:
+                self._update_alias(profile_id)
+            return state
 
     def _handle_failed_switch(
         self,
@@ -1729,15 +1898,9 @@ class BackendController:
 
     def _read_state(self) -> dict[str, Any]:
         try:
-            raw = self.state_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return {"generation": 0, "profile": None, "phase": "inactive"}
-        try:
-            state = json.loads(raw)
-        except (json.JSONDecodeError, TypeError) as error:
-            raise ConfigurationError(f"invalid controller state: {error}") from error
-        if not isinstance(state, dict):
-            raise ConfigurationError("controller state must be a JSON object")
+            state = self.state_store.read()
+        except StateFileError as error:
+            raise ConfigurationError(str(error)) from error
         generation = state.get("generation")
         profile_id = state.get("profile")
         phase = state.get("phase")
@@ -1750,8 +1913,7 @@ class BackendController:
         return state
 
     def _write_state(self, state: Mapping[str, Any]) -> None:
-        payload = json.dumps(dict(state), indent=2, sort_keys=True) + "\n"
-        _atomic_write(self.state_path, payload)
+        self.state_store.replace_backend_state(state)
 
 
 def subprocess_command_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
