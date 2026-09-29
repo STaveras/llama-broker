@@ -68,6 +68,9 @@ shown there.
   (`runtimes/`) owns each backend's complete command shape, so vLLM profiles
   emit `vllm serve MODEL` and llama.cpp profiles emit llama-server flags —
   with cross-runtime field validation.
+- **External chat templates.** Advanced profile editing accepts a template
+  file path for either runtime. llama.cpp profiles launch with `--jinja` and
+  `--chat-template-file`; vLLM profiles pass the path as `--chat-template`.
 - **Vision-capable profiles.** A transient vision profile can drain the text
   profile, serve a vision request, and restore the prior profile when leases
   finish.
@@ -102,6 +105,8 @@ It never downloads runtimes, copies models, or loads a backend implicitly. Use
 a profile from a verified runtime executable, it also registers that executable
 in the manifest's `runtime_builds` catalog using a stable SHA-256-derived ID, so
 later profile edits can select the discovered build without manual catalog work.
+External template files are supplied by the operator and must be readable by
+the selected serving runtime.
 
 The current release keeps one backing runtime active at a time because of the
 local hardware budget. The planned residency manager will allow multiple

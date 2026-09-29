@@ -167,7 +167,6 @@ LLAMACPP_VLLM_ONLY_FIELDS = frozenset(
         "kv_cache_dtype",
         "tool_call_parser",
         "tool_parser_plugin",
-        "chat_template",
         "limit_mm_per_prompt",
         "allowed_local_media_path",
     }
@@ -1101,6 +1100,14 @@ def _parse_profile(
         status = autotune.get("status", "never")
         if status not in {"never", "complete", "failed", "interrupted", "conflicted"}:
             raise ProfileError(f"invalid autotune status for {profile_id!r}: {status!r}")
+    chat_template = None
+    raw_chat_template = record.get("chat_template")
+    if raw_chat_template is not None:
+        raw_template_path = str(raw_chat_template).strip()
+        if not raw_template_path:
+            raise ProfileError(f"chat_template must not be empty for {profile_id!r}")
+        chat_template = str(Path(raw_template_path).expanduser())
+
     if runtime == "llamacpp":
         batch_size = _positive_int(record, "batch_size")
         ubatch_size = _positive_int(record, "ubatch_size")
@@ -1181,7 +1188,6 @@ def _parse_profile(
         kv_cache_dtype = None
         tool_call_parser = None
         tool_parser_plugin = None
-        chat_template = None
         limit_mm_per_prompt = None
         allowed_local_media_path = None
     else:
@@ -1236,7 +1242,6 @@ def _parse_profile(
 
         tool_call_parser = optional_text("tool_call_parser")
         tool_parser_plugin = optional_text("tool_parser_plugin")
-        chat_template = optional_text("chat_template")
         if "tools" in capabilities and not tool_call_parser:
             raise ProfileError(
                 f"vllm tools profile {profile_id!r} requires tool_call_parser"

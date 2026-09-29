@@ -83,7 +83,18 @@ class LlamaCppRuntime:
         if effective_draft is not None:
             args.extend(["-md", str(effective_draft)])
 
-        effective_extra_args = getattr(profile, "effective_extra_args", profile.extra_args)
+        effective_extra_args = list(
+            getattr(profile, "effective_extra_args", profile.extra_args)
+        )
+        if profile.chat_template:
+            # llama.cpp needs Jinja enabled before the external template is
+            # selected. Treat --jinja as broker-managed in this case so a
+            # profile that already declares it does not add the flag twice.
+            args.append("--jinja")
+            args.extend(["--chat-template-file", str(profile.chat_template)])
+            effective_extra_args = [
+                arg for arg in effective_extra_args if arg != "--jinja"
+            ]
         args.extend(effective_extra_args)
         if "tools" in profile.capabilities:
             args.extend(["--tools", "all"])

@@ -103,6 +103,7 @@ _LLAMACPP_FIELDS = _BASE_FIELDS | frozenset(
         "cache_ram_mib",
         "model_draft",
         "model_draft_sha256",
+        "chat_template",
         "moe_cache_slots_limit",
     }
 )

@@ -84,7 +84,7 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("kv_cache_dtype", "vLLM KV cache dtype", "text", advanced=True),
     EditorField("tool_call_parser", "vLLM tool-call parser", "text", advanced=True),
     EditorField("tool_parser_plugin", "vLLM tool parser plugin", "path", advanced=True),
-    EditorField("chat_template", "vLLM chat template", "path", advanced=True),
+    EditorField("chat_template", "External chat template", "path", advanced=True),
     EditorField("limit_mm_per_prompt", "vLLM media limits (JSON)", "json", advanced=True),
     EditorField("allowed_local_media_path", "vLLM local media path", "path", advanced=True),
     EditorField("server_binary", "Runtime binary", "path", advanced=True),
@@ -452,7 +452,13 @@ class TUIModel:
     }
     _OPTIONAL_INTEGER_FIELDS = {"ctx_checkpoints", "cache_ram_mib"}
     _BOOLEAN_FIELDS = {"native_vision", "fit"}
-    _PATH_FIELDS = {"server_binary", "model_path", "mmproj_path", "model_draft"}
+    _PATH_FIELDS = {
+        "server_binary",
+        "model_path",
+        "mmproj_path",
+        "model_draft",
+        "chat_template",
+    }
 
     def __init__(self, manifest: Mapping[str, Any]):
         self.manifest = copy.deepcopy(dict(manifest))
