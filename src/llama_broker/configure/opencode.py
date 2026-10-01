@@ -69,6 +69,12 @@ class OpenCodeProvider(ToolProvider):
         if "models" not in provider:
             provider["models"] = {}
 
+        available_aliases = {profile.alias for profile in registry.profiles}
+        for alias in list(provider["models"]):
+            if alias not in available_aliases:
+                del provider["models"][alias]
+                changes.append(f"Removed unavailable model: {alias}")
+
         for profile in registry.profiles:
             alias = profile.alias
             slot_ctx = profile.context_size // profile.parallel

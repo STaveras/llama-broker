@@ -387,6 +387,41 @@ class ConfigureSafetyTests(unittest.TestCase):
             data = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(data["model"], "llamacpp/fixture-text-7b")
 
+    def test_opencode_removes_model_aliases_not_in_broker_registry(self) -> None:
+        registry = ToolRegistry(
+            broker_url="https://127.0.0.1:11434/v1",
+            profiles_path=str(Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "profiles.fixture.json"),
+            api_key="[REDACTED]",
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            config_path = Path(tempdir) / "opencode.json"
+            config_path.write_text(
+                json.dumps({
+                    "provider": {
+                        "llamacpp": {
+                            "name": "llama.cpp",
+                            "npm": "@ai-sdk/openai-compatible",
+                            "options": {
+                                "baseURL": registry.broker_url,
+                                "apiKey": registry.api_key,
+                            },
+                            "models": {
+                                "obsolete-alias": {"name": "Removed model", "options": {}},
+                                "fixture-text-7b": {"name": "Current model", "options": {}},
+                            },
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
+            with patch("llama_broker.configure.opencode.OPENCODE_CONFIG", config_path):
+                result = OpenCodeProvider().configure(registry)
+
+            models = json.loads(config_path.read_text(encoding="utf-8"))["provider"]["llamacpp"]["models"]
+            self.assertNotIn("obsolete-alias", models)
+            self.assertIn("fixture-text-7b", models)
+            self.assertIn("Removed unavailable model: obsolete-alias", result.details)
+
     def test_codex_set_default_selects_broker_model(self) -> None:
         root = Path(__file__).resolve().parents[1]
         registry = ToolRegistry(
