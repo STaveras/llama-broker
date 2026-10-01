@@ -273,6 +273,29 @@ class StrataProfileTests(unittest.TestCase):
         self.assertEqual(profile.strata_launch_config_path, self.launch_path)
         self.assertEqual(profile.bundle_root, self.bundle)
 
+    def test_strata_profile_accepts_kv_resident_pinned_to_service_budget(self) -> None:
+        args = list(self.launch_config["engine_args"])
+        max_context = args.index("--max-context")
+        args[max_context + 2:max_context + 2] = ["--kv-resident", "20480"]
+        self.launch_config["engine_args"] = args
+        self.launch_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+
+        profile = ProfileRegistry.from_path(
+            self._write_profiles(self._profile())
+        ).get(self.profile_id)
+
+        self.assertEqual(profile.safety.service.memory_max_mib, 20_480)
+
+    def test_strata_profile_rejects_kv_resident_above_service_budget(self) -> None:
+        args = list(self.launch_config["engine_args"])
+        max_context = args.index("--max-context")
+        args[max_context + 2:max_context + 2] = ["--kv-resident", "20481"]
+        self.launch_config["engine_args"] = args
+        self.launch_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+
+        with self.assertRaisesRegex(ProfileError, "does not match pinned profile data.*--kv-resident"):
+            ProfileRegistry.from_path(self._write_profiles(self._profile()))
+
     def test_tui_runtime_switch_drops_fields_unsupported_by_target_runtime(self) -> None:
         record = self._profile(
             batch_size=256,

@@ -1121,6 +1121,7 @@ def _parse_strata_artifacts(
     model_path: Path,
     model_sha256: str,
     context_size: int,
+    memory_max_mib: int,
     runtime_build: RuntimeBuild | None,
     allow_missing_artifacts: bool,
 ) -> dict[str, Any]:
@@ -1335,6 +1336,7 @@ def _parse_strata_artifacts(
         "--expert-cache": "auto",
         "--prefill": "auto",
         "--max-context": str(context_size),
+        "--kv-resident": str(memory_max_mib),
         "--spec": "4",
         "--spec-min-p": "0.5",
         "--mtp": str(mtp_runtime_path),
@@ -1371,8 +1373,10 @@ def _parse_strata_artifacts(
             expert_profile_path = expert_profile
         seen.add(flag)
         index += 2
-    required_flags = {*allowed_values, "--expert-profile"}
-    if not required_flags.issubset(seen) or seen - required_flags - boolean_flags or expert_profile_path is None:
+    optional_value_flags = {"--kv-resident"}
+    required_flags = (set(allowed_values) - optional_value_flags) | {"--expert-profile"}
+    permitted_flags = set(allowed_values) | {"--expert-profile"} | boolean_flags
+    if not required_flags.issubset(seen) or seen - permitted_flags or expert_profile_path is None:
         raise ProfileError(f"Strata engine_args are missing required controls for {profile_id!r}")
     if uses_mmap_experts and f"{pack.get('path')}/experts.bin" not in observed_pack_files:
         raise ProfileError(f"Strata mmap-experts mode requires the pack's experts.bin for {profile_id!r}")
@@ -1897,6 +1901,7 @@ def _parse_profile(
         runtime=runtime,
         moe_cache_slots_limit=moe_cache_slots_limit,
     )
+    safety = _parse_safety(record, profile_id, runtime=runtime)
     strata_metadata: dict[str, Any] = {}
     if runtime == "strata":
         if role != "persistent":
@@ -1908,6 +1913,7 @@ def _parse_profile(
             model_path=model_path,
             model_sha256=model_sha256,
             context_size=context_size,
+            memory_max_mib=safety.service.memory_max_mib,
             runtime_build=build,
             allow_missing_artifacts=allow_missing_artifacts,
         )
@@ -1923,7 +1929,6 @@ def _parse_profile(
             "MTP heads"
         )
 
-    safety = _parse_safety(record, profile_id, runtime=runtime)
     max_cache_ram_mib = safety.service.memory_max_mib // MAX_CACHE_RAM_SHARE_DIVISOR
     if cache_ram_mib is not None and cache_ram_mib > max_cache_ram_mib:
         raise ProfileError(
