@@ -65,7 +65,7 @@ class StrataBridgeTests(unittest.TestCase):
                 "--ple-gguf", str(self.root / "model" / "model-00002.gguf"),
                 "--expert-profile", str(self.expert_profile),
                 "--expert-cache", "auto", "--prefill", "auto",
-                "--max-context", "8192", "--spec", "4",
+                "--max-context", "8192", "--kv-resident", "20480", "--spec", "4",
                 "--spec-min-p", "0.5", "--mtp", str(self.mtp_path),
                 "--mmap-experts",
             ],
@@ -111,6 +111,18 @@ class StrataBridgeTests(unittest.TestCase):
         (self.serve_dir / "server.py").write_text("# pinned server module\n", encoding="utf-8")
         self.engine.write_bytes(b"tampered engine")
         with self.assertRaisesRegex(StrataBridgeError, "engine binary SHA"):
+            _load_launch_config(
+                self.config_path,
+                hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
+            )
+
+    def test_kv_resident_cell_floor_is_enforced(self) -> None:
+        args = list(self.launch_config["engine_args"])
+        args[args.index("--kv-resident") + 1] = "20479"
+        self.launch_config["engine_args"] = args
+        self.config_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+
+        with self.assertRaisesRegex(StrataBridgeError, "resident cells"):
             _load_launch_config(
                 self.config_path,
                 hashlib.sha256(self.config_path.read_bytes()).hexdigest(),

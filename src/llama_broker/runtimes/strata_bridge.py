@@ -36,6 +36,7 @@ STRATA_LOW_RAM_HOST_HEADROOM_GIB = 6.0
 STRATA_LOW_RAM_VRAM_RESERVE_GIB = 5.0
 STRATA_TOTAL_VRAM_MIN_MIB = 12_000
 STRATA_FREE_VRAM_MIN_MIB = 8_192
+STRATA_MIN_KV_RESIDENT_CELLS = 20_480
 
 def _is_loopback(host: str) -> bool:
     value = str(host).strip().lower()
@@ -411,7 +412,7 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
     args = config.get("engine_args")
     value_flags = {
         "--pack", "--native", "--ple-gguf", "--expert-profile",
-        "--expert-cache", "--prefill", "--max-context", "--spec",
+        "--expert-cache", "--prefill", "--max-context", "--kv-resident", "--spec",
         "--spec-min-p", "--mtp",
     }
     boolean_flags = {"--mmap-experts"}
@@ -446,6 +447,12 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
             raise StrataBridgeError("Strata profile must pin the supported four-token MTP window")
         elif flag == "--spec-min-p" and value != "0.5":
             raise StrataBridgeError("Strata profile must pin the supported MTP acceptance threshold")
+        elif flag == "--kv-resident" and (
+            not value.isdecimal() or int(value) < STRATA_MIN_KV_RESIDENT_CELLS
+        ):
+            raise StrataBridgeError(
+                f"Strata KV streaming requires at least {STRATA_MIN_KV_RESIDENT_CELLS} resident cells"
+            )
         index += 2
     required_flags = value_flags
     if not required_flags.issubset(seen) or seen - required_flags - boolean_flags:
