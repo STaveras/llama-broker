@@ -89,10 +89,60 @@ class RuntimeDispatchTests(unittest.TestCase):
         return path
 
     def test_registry_lists_only_supported_runtimes(self) -> None:
-        self.assertEqual(runtime_names(), ("llamacpp", "vllm"))
-        self.assertEqual({runtime.name for runtime in list_runtimes()}, {"llamacpp", "vllm"})
-        self.assertIn("llama-server", list_runtimes()[0].binaries)
-        self.assertIn("vllm", list_runtimes()[1].binaries)
+        self.assertEqual(runtime_names(), ("llamacpp", "vllm", "strata"))
+        runtimes = {runtime.name: runtime for runtime in list_runtimes()}
+        self.assertEqual(set(runtimes), {"llamacpp", "vllm", "strata"})
+        self.assertIn("llama-server", runtimes["llamacpp"].binaries)
+        self.assertIn("vllm", runtimes["vllm"].binaries)
+        self.assertEqual(runtimes["strata"].capabilities, ("text",))
+        self.assertIn("strata-server", runtimes["strata"].binaries)
+
+    def test_strata_command_is_loopback_only_and_filters_managed_endpoint_args(self) -> None:
+        profile = SimpleNamespace(
+            server_binary=self.binary,
+            strata_launch_config_path=self.root / "strata-launch.json",
+            strata_launch_config_sha256="c" * 64,
+            safety=SimpleNamespace(
+                service=SimpleNamespace(
+                    memory_max_mib=20480,
+                    memory_swap_max_mib=1024,
+                ),
+                admission=SimpleNamespace(
+                    min_ram_available_mib=6144,
+                    max_swap_used_mib=1024,
+                    min_total_vram_mib=12000,
+                    min_free_vram_before_start_mib=8192,
+                ),
+            ),
+        )
+        adapter = next(runtime.adapter for runtime in list_runtimes() if runtime.name == "strata")
+
+        command = adapter.build_command(
+            profile,
+            host="0.0.0.0",
+            port=10000,
+            managed_args=(
+                "--host", "0.0.0.0", "--port", "10000",
+                "--broker-api-key-file", "/tmp/api-keys",
+            ),
+        )
+
+        self.assertEqual(
+            command,
+            (
+                str(self.binary),
+                "--config", str(self.root / "strata-launch.json"),
+                "--config-sha256", "c" * 64,
+                "--host", "127.0.0.1", "--port", "10000",
+                "--min-available-ram-mib", "6144",
+                "--max-swap-used-mib", "1024",
+                "--memory-max-mib", "20480",
+                "--memory-swap-max-mib", "1024",
+                "--min-total-vram-mib", "12000",
+                "--min-free-vram-mib", "8192",
+                "--broker-api-key-file", "/tmp/api-keys",
+            ),
+        )
 
     def test_runtime_field_defaults_to_llamacpp_and_preserves_command_shape(self) -> None:
         llama = self._vllm_profile(

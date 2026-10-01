@@ -1464,8 +1464,18 @@ class BackendController:
             self.profiles = dict(profiles)
             try:
                 self._validate_profiles()
+                refresh_readiness_profiles = getattr(
+                    self.readiness_probe, "replace_profiles", None
+                )
+                if callable(refresh_readiness_profiles):
+                    refresh_readiness_profiles(self.profiles)
             except BaseException:
                 self.profiles = old_profiles
+                refresh_readiness_profiles = getattr(
+                    self.readiness_probe, "replace_profiles", None
+                )
+                if callable(refresh_readiness_profiles):
+                    refresh_readiness_profiles(old_profiles)
                 raise
 
     def _emit(self, event: str, **fields: object) -> None:

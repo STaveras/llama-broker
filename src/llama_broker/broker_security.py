@@ -248,6 +248,14 @@ class SecurityConfig:
                     ]
                 )
             return tuple(args)
+        if runtime == "strata":
+            if self.api_key_file is None:
+                raise SecurityError("Strata backend requires API-key file")
+            # The Strata bridge reads the key from its private file and binds
+            # only to loopback.  It does not support llama.cpp TLS flags.
+            args = ["--host", "127.0.0.1", "--port", str(listen_port)]
+            args.extend(["--broker-api-key-file", str(self.api_key_file)])
+            return tuple(args)
         if runtime == "vllm":
             if self.api_key_file is not None:
                 keys = read_api_keys(self.api_key_file)

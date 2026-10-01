@@ -88,6 +88,8 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("limit_mm_per_prompt", "vLLM media limits (JSON)", "json", advanced=True),
     EditorField("allowed_local_media_path", "vLLM local media path", "path", advanced=True),
     EditorField("server_binary", "Runtime binary", "path", advanced=True),
+    EditorField("strata_artifacts_manifest_path", "Strata artifact manifest", "path", advanced=True),
+    EditorField("strata_launch_config_path", "Strata launch config", "path", advanced=True),
     EditorField("model_path", "Model file", "path", advanced=True),
     EditorField("model_draft", "Draft model file", "path", advanced=True),
     EditorField(
@@ -458,6 +460,8 @@ class TUIModel:
         "mmproj_path",
         "model_draft",
         "chat_template",
+        "strata_artifacts_manifest_path",
+        "strata_launch_config_path",
     }
 
     def __init__(self, manifest: Mapping[str, Any]):
@@ -574,13 +578,19 @@ class TUIModel:
         )
 
     def _apply_build(self, draft: dict[str, Any], build: Any) -> dict[str, Any]:
-        updated = clone_record(draft)
+        allowed_fields = get_runtime_info(build.runtime).editable_fields
+        updated = {
+            key: value
+            for key, value in clone_record(draft).items()
+            if key in allowed_fields
+        }
         updated.update(
             {
                 "runtime": build.runtime,
                 "runtime_build": build.id,
                 "server_binary": str(build.server_binary),
                 "server_sha256": build.server_sha256,
+                "environment": dict(build.environment),
             }
         )
         return updated
@@ -594,6 +604,8 @@ class TUIModel:
         family = inferred.runtime if inferred is not None else "(custom/manual)"
         fields = []
         for field in EDITOR_FIELDS:
+            if runtime == "strata" and field.key == "environment":
+                continue
             if field.key == "runtime_family":
                 field = replace(field, options=self._family_options())
             elif field.key == "runtime_build":
@@ -777,10 +789,14 @@ class TUIModel:
                     draft = apply_simple_fields(draft, {key: ""})
                 else:
                     draft.pop(key, None)
-                    if key == "model_path":
-                        draft.pop("model_sha256", None)
-                    if key == "server_binary":
-                        draft.pop("server_sha256", None)
+                    hash_key = {
+                        "model_path": "model_sha256",
+                        "server_binary": "server_sha256",
+                        "strata_artifacts_manifest_path": "strata_artifacts_manifest_sha256",
+                        "strata_launch_config_path": "strata_launch_config_sha256",
+                    }.get(key)
+                    if hash_key:
+                        draft.pop(hash_key, None)
                 self._publish(draft)
                 return draft
             path = Path(raw).expanduser()
@@ -794,7 +810,12 @@ class TUIModel:
                 draft = apply_simple_fields(draft, {key: str(path)})
             else:
                 draft[key] = str(path)
-                hash_key = "model_sha256" if key == "model_path" else "server_sha256" if key == "server_binary" else None
+                hash_key = {
+                    "model_path": "model_sha256",
+                    "server_binary": "server_sha256",
+                    "strata_artifacts_manifest_path": "strata_artifacts_manifest_sha256",
+                    "strata_launch_config_path": "strata_launch_config_sha256",
+                }.get(key)
                 if hash_key:
                     draft[hash_key] = sha256_file(path)
         elif key in SIMPLE_FIELDS:

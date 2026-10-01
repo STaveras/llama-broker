@@ -31,6 +31,34 @@ class BrokerSecurityTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_strata_backend_args_pin_loopback_and_pass_only_api_key_file_path(self) -> None:
+        config = SecurityConfig(
+            api_key_file=self.root / "api-keys",
+            backend_tls_cert_file=self.root / "backend.crt",
+            backend_tls_key_file=self.root / "backend.key",
+        )
+
+        args = config.backend_server_args(
+            listen_host="0.0.0.0", listen_port=10000, runtime="strata"
+        )
+
+        self.assertEqual(
+            args,
+            (
+                "--host", "127.0.0.1",
+                "--port", "10000",
+                "--broker-api-key-file", str(self.root / "api-keys"),
+            ),
+        )
+        self.assertNotIn("--ssl-cert-file", args)
+        self.assertNotIn("--api-key", args)
+
+    def test_strata_backend_requires_a_broker_api_key_file(self) -> None:
+        with self.assertRaisesRegex(SecurityError, "requires API-key file"):
+            SecurityConfig().backend_server_args(
+                listen_host="127.0.0.1", listen_port=10000, runtime="strata"
+            )
+
     def test_native_server_args_include_key_and_tls_without_broker_auth_authority(self) -> None:
         config = SecurityConfig(
             api_key_file=self.root / "api-keys",

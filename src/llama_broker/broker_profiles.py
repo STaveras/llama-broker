@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -44,6 +47,12 @@ MAX_UBATCH_SIZE = 128
 MAX_FIT_TARGET_MIB = 8_192
 MAX_TASKS_MAX = 512
 MAX_MEMORY_MAX_MIB = 20_480
+MAX_STRATA_MEMORY_MAX_MIB = 57_344
+MIN_STRATA_MEMORY_MAX_MIB = 8_192
+MIN_STRATA_RAM_AVAILABLE_MIB = 6_144
+STRATA_RUNTIME_ENVIRONMENT_FIELDS = frozenset(
+    {"LD_LIBRARY_PATH", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OMP_NUM_THREADS"}
+)
 MAX_MEMORY_SWAP_MAX_MIB = 1_024
 MAX_TIMEOUT_STOP_SEC = 20
 MAX_SPECULATIVE_DRAFT_TOKENS = 64
@@ -246,6 +255,10 @@ def _parse_extra_args(
         raise ProfileError(f"extra_args must be a string list for {profile_id!r}")
 
     args = tuple(raw)
+    if runtime == "strata":
+        if args:
+            raise ProfileError(f"Strata profiles do not accept extra_args for {profile_id!r}")
+        return (), frozenset()
     if runtime == "vllm":
         return _parse_vllm_extra_args(args, profile_id)
 
@@ -388,7 +401,7 @@ class SafetyBudget:
     admission: AdmissionSafetyBudget
 
 
-def _parse_safety(record: Mapping[str, Any], profile_id: str) -> SafetyBudget:
+def _parse_safety(record: Mapping[str, Any], profile_id: str, *, runtime: str) -> SafetyBudget:
     raw_safety = _required(record, "safety")
     if not isinstance(raw_safety, dict):
         raise ProfileError(f"safety must be an object for {profile_id!r}")
@@ -419,10 +432,18 @@ def _parse_safety(record: Mapping[str, Any], profile_id: str) -> SafetyBudget:
             f"safety.service.memory_swap_max_mib cannot exceed memory_max_mib "
             f"for {profile_id!r}"
         )
-    if service.memory_max_mib > MAX_MEMORY_MAX_MIB:
+    memory_max_limit = (
+        MAX_STRATA_MEMORY_MAX_MIB if runtime == "strata" else MAX_MEMORY_MAX_MIB
+    )
+    if runtime == "strata" and service.memory_max_mib < MIN_STRATA_MEMORY_MAX_MIB:
+        raise ProfileError(
+            f"safety.service.memory_max_mib for Strata profile {profile_id!r} "
+            f"must be at least {MIN_STRATA_MEMORY_MAX_MIB} MiB"
+        )
+    if service.memory_max_mib > memory_max_limit:
         raise ProfileError(
             f"safety.service.memory_max_mib for {profile_id!r} exceeds "
-            f"fail-closed limit {MAX_MEMORY_MAX_MIB}"
+            f"fail-closed limit {memory_max_limit}"
         )
     if service.memory_swap_max_mib > MAX_MEMORY_SWAP_MAX_MIB:
         raise ProfileError(
@@ -462,8 +483,19 @@ def _parse_safety(record: Mapping[str, Any], profile_id: str) -> SafetyBudget:
             raw_admission, "safety_vram_reserve_mib"
         ),
     )
+    if runtime == "strata" and admission.min_ram_available_mib < MIN_STRATA_RAM_AVAILABLE_MIB:
+        raise ProfileError(
+            f"safety.admission.min_ram_available_mib for Strata profile {profile_id!r} "
+            f"must be at least {MIN_STRATA_RAM_AVAILABLE_MIB} MiB"
+        )
+    if runtime == "strata" and admission.min_ram_available_mib > service.memory_max_mib:
+        raise ProfileError(
+            f"Strata min_ram_available_mib cannot exceed service memory_max_mib for {profile_id!r}"
+        )
     admission_lower_bounds = {
-        "min_ram_available_mib": MIN_ADMISSION_RAM_AVAILABLE_MIB,
+        "min_ram_available_mib": (
+            MIN_STRATA_RAM_AVAILABLE_MIB if runtime == "strata" else MIN_ADMISSION_RAM_AVAILABLE_MIB
+        ),
         "min_total_vram_mib": MIN_ADMISSION_TOTAL_VRAM_MIB,
         "min_free_vram_before_start_mib": MIN_ADMISSION_FREE_VRAM_MIB,
     }
@@ -553,6 +585,13 @@ class Profile:
     effective_model_draft: Path | None = None
     model_draft_sha256: str | None = None
     deployment_revision: str | None = None
+    strata_artifacts_manifest_path: Path | None = None
+    strata_artifacts_manifest_sha256: str | None = None
+    strata_launch_config_path: Path | None = None
+    strata_launch_config_sha256: str | None = None
+    strata_artifact_files: tuple[tuple[Path, str], ...] = ()
+    strata_engine_binary: Path | None = None
+    strata_engine_sha256: str | None = None
 
     @property
     def is_transient(self) -> bool:
@@ -770,6 +809,9 @@ class ProfileRegistry:
                 "model": profile.model_sha256,
                 "mmproj": profile.mmproj_sha256,
                 "draft": profile.model_draft_sha256,
+                "strata_manifest": profile.strata_artifacts_manifest_sha256,
+                "strata_launch_config": profile.strata_launch_config_sha256,
+                "strata_engine": profile.strata_engine_sha256,
             },
             "safety": _profile_snapshot_value(profile.safety),
         }
@@ -840,6 +882,511 @@ def _optional_file_sha256(path: Path) -> str:
         while chunk := handle.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _strata_relative_artifact(
+    root: Path,
+    raw_path: object,
+    *,
+    profile_id: str,
+    label: str,
+    directory: bool = False,
+    allow_missing: bool = False,
+) -> Path:
+    if not isinstance(raw_path, str) or not raw_path or chr(92) in raw_path:
+        raise ProfileError(f"{label} must be a safe relative path for {profile_id!r}")
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ProfileError(f"{label} path escapes its artifact root for {profile_id!r}")
+    candidate = root.joinpath(relative)
+    root_resolved = root.resolve()
+    for parent in (candidate, *candidate.parents):
+        if parent == root:
+            break
+        if parent.is_symlink():
+            raise ProfileError(f"{label} must not use symlinks for {profile_id!r}")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root_resolved):
+        raise ProfileError(f"{label} path escapes its artifact root for {profile_id!r}")
+    if not allow_missing and not (
+        resolved.is_dir() if directory else resolved.is_file()
+    ):
+        raise ProfileError(f"{label} does not exist for {profile_id!r}: {resolved}")
+    return resolved
+
+
+def _parse_strata_runtime_sources(
+    root: Path,
+    entries: object,
+    *,
+    profile_id: str,
+    allow_missing: bool,
+) -> tuple[tuple[Path, str], ...]:
+    if not root.is_dir() or root.is_symlink():
+        raise ProfileError(f"Strata working directory is missing or symlinked for {profile_id!r}")
+    expected_paths: set[str] = set()
+    for path in root.rglob("*"):
+        if path.is_symlink() or "__pycache__" in path.parts or path.suffix == ".pyc":
+            raise ProfileError(f"Strata working directory contains a symlink or bytecode file for {profile_id!r}")
+        if path.is_file() and path.suffix == ".py":
+            expected_paths.add(path.relative_to(root).as_posix())
+    if not isinstance(entries, list) or not entries:
+        raise ProfileError(f"Strata launch config must pin its Python source inventory for {profile_id!r}")
+    observed: dict[str, tuple[Path, str]] = {}
+    for item in entries:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
+            raise ProfileError(f"invalid Strata runtime source entry for {profile_id!r}")
+        raw_path = item.get("path")
+        digest = item.get("sha256")
+        if not isinstance(raw_path, str) or Path(raw_path).suffix != ".py":
+            raise ProfileError(f"Strata runtime source path must name a Python file for {profile_id!r}")
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ProfileError(f"invalid Strata runtime source hash for {profile_id!r}")
+        if raw_path in observed:
+            raise ProfileError(f"duplicate Strata runtime source path for {profile_id!r}: {raw_path}")
+        path = _strata_relative_artifact(
+            root, raw_path, profile_id=profile_id, label="runtime Python source",
+            allow_missing=allow_missing,
+        )
+        if path.exists() and _optional_file_sha256(path) != digest:
+            raise ProfileError(f"Strata runtime source SHA mismatch for {profile_id!r}: {path}")
+        observed[raw_path] = (path, digest)
+    if set(observed) != expected_paths:
+        raise ProfileError(f"Strata runtime source inventory is incomplete or contains extras for {profile_id!r}")
+    return tuple(observed[key] for key in sorted(observed))
+
+
+def _verify_strata_source_checkout(
+    source_repository: Path,
+    expected_commit: str,
+    profile_id: str,
+) -> set[str]:
+    git = shutil.which("git", path=os.defpath)
+    if git is None:
+        raise ProfileError(f"cannot verify Strata source provenance for {profile_id!r}: git is unavailable")
+    env = {
+        "PATH": os.defpath,
+        "HOME": str(Path.home()),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+    }
+
+    def git_read(*arguments: str) -> str:
+        try:
+            result = subprocess.run(
+                [
+                    git,
+                    "-C",
+                    str(source_repository),
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.untrackedCache=false",
+                    *arguments,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ProfileError(f"cannot verify Strata source provenance for {profile_id!r}: {error}") from error
+        if result.returncode != 0:
+            raise ProfileError(f"Strata source provenance check failed for {profile_id!r}")
+        return result.stdout
+
+    if Path(git_read("rev-parse", "--show-toplevel").strip()).resolve() != source_repository.resolve():
+        raise ProfileError(f"Strata source_repository is not a Git worktree root for {profile_id!r}")
+    if git_read("rev-parse", "--verify", "HEAD").strip() != expected_commit:
+        raise ProfileError(f"Strata source checkout HEAD does not match the pinned commit for {profile_id!r}")
+    if git_read("status", "--porcelain=v1", "--untracked-files=all").strip():
+        raise ProfileError(f"Strata source checkout is dirty for {profile_id!r}")
+    tracked_paths = git_read("ls-files", "-z").split("\0")
+    return {path for path in tracked_paths if path.endswith(".py")}
+
+
+def _strata_hash_entry(item: object, profile_id: str, label: str) -> tuple[str, int]:
+    if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+        raise ProfileError(f"invalid {label} entry for {profile_id!r}")
+    digest = item.get("sha256")
+    size = item.get("size")
+    if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+        raise ProfileError(f"invalid {label} sha256 for {profile_id!r}")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ProfileError(f"invalid {label} size for {profile_id!r}")
+    return digest, size
+
+
+def _parse_strata_mtp_artifacts(
+    raw: object,
+    *,
+    model_root: Path,
+    profile_id: str,
+    allow_missing_artifacts: bool,
+) -> tuple[Path, tuple[tuple[Path, str], ...]]:
+    required = {"repository", "revision", "path", "runtime_path", "files"}
+    if not isinstance(raw, dict) or set(raw) != required:
+        raise ProfileError(f"Strata profile {profile_id!r} requires a pinned MTP runtime")
+    repository = raw.get("repository")
+    revision = raw.get("revision")
+    if repository != "Qwen/Qwen3.8-Flash-Next" or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ProfileError(f"Strata MTP source repository/revision is not pinned for {profile_id!r}")
+    mtp_root = _strata_relative_artifact(
+        model_root, raw.get("path"), profile_id=profile_id,
+        label="MTP root", directory=True, allow_missing=allow_missing_artifacts,
+    )
+    runtime_root = _strata_relative_artifact(
+        model_root, raw.get("runtime_path"), profile_id=profile_id,
+        label="MTP runtime directory", directory=True, allow_missing=allow_missing_artifacts,
+    )
+    if not runtime_root.is_relative_to(mtp_root):
+        raise ProfileError(f"Strata MTP runtime directory must be inside its pinned root for {profile_id!r}")
+    raw_files = raw.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ProfileError(f"Strata MTP file inventory is empty for {profile_id!r}")
+    artifacts: list[tuple[Path, str]] = []
+    file_records: dict[str, tuple[Path, str, int]] = {}
+    for item in raw_files:
+        digest, size = _strata_hash_entry(item, profile_id, "MTP artifact")
+        relative = item.get("path")
+        path = _strata_relative_artifact(
+            model_root, relative, profile_id=profile_id,
+            label="MTP artifact", allow_missing=allow_missing_artifacts,
+        )
+        if not isinstance(relative, str) or not relative.startswith(str(raw["path"]) + "/"):
+            raise ProfileError(f"Strata MTP artifact is outside its root for {profile_id!r}")
+        if relative in file_records:
+            raise ProfileError(f"duplicate Strata MTP artifact for {profile_id!r}: {relative}")
+        if path.exists() and path.stat().st_size != size:
+            raise ProfileError(f"Strata MTP artifact size mismatch for {profile_id!r}: {path}")
+        file_records[relative] = (path, digest, size)
+        artifacts.append((path, digest))
+    required_files = {
+        f"{raw['path']}/mtp-inventory.json",
+        f"{raw['path']}/mtp-manifest.json",
+        f"{raw['path']}/mtp-q2_0.gguf",
+        f"{raw['runtime_path']}/experts.bin",
+        f"{raw['runtime_path']}/dense.bin",
+        f"{raw['runtime_path']}/dense.txt",
+    }
+    if not required_files <= file_records.keys():
+        missing = sorted(required_files - file_records.keys())
+        raise ProfileError(f"Strata MTP artifact set is incomplete for {profile_id!r}: {', '.join(missing)}")
+    if not allow_missing_artifacts:
+        inventory_path = file_records[f"{raw['path']}/mtp-inventory.json"][0]
+        manifest_path = file_records[f"{raw['path']}/mtp-manifest.json"][0]
+        try:
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+            tensor_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ProfileError(f"cannot read pinned Strata MTP metadata for {profile_id!r}: {error}") from error
+        expected_repo = f"https://huggingface.co/{repository}/resolve/{revision}/"
+        if not isinstance(inventory, dict) or inventory.get("repo") != expected_repo:
+            raise ProfileError(f"Strata MTP inventory is not pinned to the declared revision for {profile_id!r}")
+        inventory_tensors = inventory.get("tensors")
+        if not isinstance(inventory_tensors, list) or not isinstance(tensor_manifest, list) or not tensor_manifest:
+            raise ProfileError(f"Strata MTP tensor inventory/manifest is empty for {profile_id!r}")
+        inventory_names = {item.get("name") for item in inventory_tensors if isinstance(item, dict)}
+        manifest_names: set[str] = set()
+        for item in tensor_manifest:
+            if not isinstance(item, dict):
+                raise ProfileError(f"Strata MTP tensor manifest entry is invalid for {profile_id!r}")
+            name, relative = item.get("name"), item.get("file")
+            digest, size = item.get("sha256"), item.get("bytes")
+            if not isinstance(name, str) or not isinstance(relative, str) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ProfileError(f"Strata MTP tensor manifest entry is unpinned for {profile_id!r}")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or name in manifest_names:
+                raise ProfileError(f"Strata MTP tensor manifest entry is duplicated/invalid for {profile_id!r}")
+            manifest_names.add(name)
+            source_path = f"{raw['path']}/{relative}"
+            source = file_records.get(source_path)
+            if source is None or source[1] != digest or source[2] != size:
+                raise ProfileError(f"Strata MTP raw tensor pin mismatch for {profile_id!r}: {name}")
+        if manifest_names != inventory_names:
+            raise ProfileError(f"Strata MTP inventory and tensor manifest disagree for {profile_id!r}")
+    return runtime_root, tuple(artifacts)
+
+
+def _parse_strata_artifacts(
+    record: Mapping[str, Any],
+    *,
+    profile_id: str,
+    alias: str,
+    model_path: Path,
+    model_sha256: str,
+    context_size: int,
+    runtime_build: RuntimeBuild | None,
+    allow_missing_artifacts: bool,
+) -> dict[str, Any]:
+    if runtime_build is None or runtime_build.bundle_root is None:
+        raise ProfileError(f"Strata profile {profile_id!r} requires a runtime bundle")
+    bundle_root = runtime_build.bundle_root.resolve()
+    source_repository = runtime_build.source_repository
+    source_commit = runtime_build.source_commit
+    if source_repository is None or (not allow_missing_artifacts and not source_repository.is_dir()):
+        raise ProfileError(f"Strata runtime source repository is missing for {profile_id!r}")
+    if not isinstance(source_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ProfileError(f"Strata runtime source commit must be pinned for {profile_id!r}")
+    if runtime_build.dirty is not False:
+        raise ProfileError(f"Strata runtime bundle must be built from a clean source tree for {profile_id!r}")
+    source_python_paths = None
+    if source_repository.is_dir():
+        source_python_paths = _verify_strata_source_checkout(source_repository, source_commit, profile_id)
+    manifest_path = _absolute_existing_path(
+        record, "strata_artifacts_manifest_path", allow_missing=allow_missing_artifacts
+    )
+    manifest_sha256 = _sha256(record, "strata_artifacts_manifest_sha256")
+    launch_path = _absolute_existing_path(
+        record, "strata_launch_config_path", allow_missing=allow_missing_artifacts
+    )
+    launch_sha256 = _sha256(record, "strata_launch_config_sha256")
+    if manifest_path.is_symlink() or launch_path.is_symlink():
+        raise ProfileError(f"Strata metadata files must not be symlinks for {profile_id!r}")
+    model_root = manifest_path.parent.resolve()
+    if manifest_path.parent.is_symlink() or launch_path.parent.is_symlink():
+        raise ProfileError(f"Strata metadata directory must not be a symlink for {profile_id!r}")
+    if launch_path.parent.resolve() != model_root:
+        raise ProfileError(f"Strata launch config must sit beside its artifact manifest for {profile_id!r}")
+    if manifest_path.is_symlink() or launch_path.is_symlink() or not manifest_path.is_file() or not launch_path.is_file():
+        raise ProfileError(f"Strata metadata files must be regular files for {profile_id!r}")
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        launch_bytes = launch_path.read_bytes()
+    except OSError as error:
+        raise ProfileError(f"cannot read Strata metadata for {profile_id!r}: {error}") from error
+    if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256:
+        raise ProfileError(f"Strata artifact manifest hash mismatch for {profile_id!r}")
+    if hashlib.sha256(launch_bytes).hexdigest() != launch_sha256:
+        raise ProfileError(f"Strata launch config hash mismatch for {profile_id!r}")
+    try:
+        manifest = json.loads(manifest_bytes)
+        launch = json.loads(launch_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ProfileError(f"cannot decode Strata metadata for {profile_id!r}: {error}") from error
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version", "runtime_family", "model", "pack"
+    }:
+        raise ProfileError(f"invalid Strata artifact manifest for {profile_id!r}")
+    if manifest.get("schema_version") != 1 or manifest.get("runtime_family") != "strata":
+        raise ProfileError(f"unsupported Strata artifact manifest for {profile_id!r}")
+    model = manifest.get("model")
+    pack = manifest.get("pack")
+    if not isinstance(model, dict) or set(model) != {
+        "name", "quant", "license", "repository", "revision", "shards"
+    }:
+        raise ProfileError(f"invalid Strata model metadata for {profile_id!r}")
+    if model.get("quant") != "IQ2_XS":
+        raise ProfileError(f"Strata runtime currently requires IQ2_XS for {profile_id!r}")
+    revision = model.get("revision")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ProfileError(f"Strata model revision must be a pinned commit for {profile_id!r}")
+    shards = model.get("shards")
+    if not isinstance(shards, list) or len(shards) != 2:
+        raise ProfileError(f"Strata model must declare exactly two shards for {profile_id!r}")
+    shard_paths: list[Path] = []
+    artifact_files: list[tuple[Path, str]] = []
+    for index, shard in enumerate(shards):
+        digest, size = _strata_hash_entry(shard, profile_id, f"model shard {index + 1}")
+        path = _strata_relative_artifact(
+            model_root, shard.get("path"), profile_id=profile_id,
+            label=f"model shard {index + 1}", allow_missing=allow_missing_artifacts,
+        )
+        if path.exists() and path.stat().st_size != size:
+            raise ProfileError(f"Strata model shard size mismatch for {profile_id!r}: {path}")
+        shard_paths.append(path)
+        if index > 0:
+            artifact_files.append((path, digest))
+    if model_path.is_symlink():
+        raise ProfileError(f"Strata model shard must not be a symlink for {profile_id!r}")
+    if shard_paths[0] != model_path.resolve() or shards[0]["sha256"] != model_sha256:
+        raise ProfileError(f"Strata model_path must be the pinned first shard for {profile_id!r}")
+    if not isinstance(pack, dict) or set(pack) != {
+        "format", "path", "source_repository", "source_commit", "mtp", "files"
+    }:
+        raise ProfileError(f"invalid Strata pack metadata for {profile_id!r}")
+    if pack.get("format") != "strata-native-iq":
+        raise ProfileError(f"Strata profile {profile_id!r} requires a native IQ pack")
+    source_commit = pack.get("source_commit")
+    if not isinstance(source_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ProfileError(f"Strata pack source commit must be pinned for {profile_id!r}")
+    if source_commit != runtime_build.source_commit:
+        raise ProfileError(f"Strata pack/runtime source commit mismatch for {profile_id!r}")
+    pack_path = _strata_relative_artifact(
+        model_root, pack.get("path"), profile_id=profile_id,
+        label="pack directory", directory=True, allow_missing=allow_missing_artifacts,
+    )
+    pack_files = pack.get("files")
+    if not isinstance(pack_files, list) or not pack_files:
+        raise ProfileError(f"Strata pack file list is empty for {profile_id!r}")
+    required_pack_files = {
+        f"{pack.get('path')}/dense.bin",
+        f"{pack.get('path')}/index.txt",
+        f"{pack.get('path')}/native_experts.txt",
+        f"{pack.get('path')}/tokenizer/vocab.json",
+        f"{pack.get('path')}/tokenizer/merges.txt",
+        f"{pack.get('path')}/tokenizer/chat_template.jinja",
+    }
+    observed_pack_files: set[str] = set()
+    for item in pack_files:
+        digest, size = _strata_hash_entry(item, profile_id, "pack file")
+        relative_text = item.get("path")
+        path = _strata_relative_artifact(
+            model_root, relative_text, profile_id=profile_id,
+            label="pack file", allow_missing=allow_missing_artifacts,
+        )
+        if not isinstance(relative_text, str) or not relative_text.startswith(str(pack.get("path")) + "/"):
+            raise ProfileError(f"Strata pack file is outside the pack directory for {profile_id!r}")
+        if relative_text in observed_pack_files:
+            raise ProfileError(f"duplicate Strata pack file for {profile_id!r}: {relative_text}")
+        observed_pack_files.add(relative_text)
+        if path.exists() and path.stat().st_size != size:
+            raise ProfileError(f"Strata pack file size mismatch for {profile_id!r}: {path}")
+        artifact_files.append((path, digest))
+    if not required_pack_files <= observed_pack_files:
+        missing = sorted(required_pack_files - observed_pack_files)
+        raise ProfileError(f"Strata pack is missing required files for {profile_id!r}: {', '.join(missing)}")
+    mtp_runtime_path, mtp_files = _parse_strata_mtp_artifacts(
+        pack.get("mtp"),
+        model_root=model_root,
+        profile_id=profile_id,
+        allow_missing_artifacts=allow_missing_artifacts,
+    )
+    artifact_files.extend(mtp_files)
+    if not isinstance(launch, dict) or set(launch) != {
+        "schema_version", "model_name", "engine_binary", "engine_sha256",
+        "expert_profile_sha256", "engine_args", "working_directory", "tokenizer_path",
+        "runtime_files",
+    }:
+        forbidden = sorted(set(launch) & {"host", "api_key", "mcp", "mcp_servers", "mcp_config"}) if isinstance(launch, dict) else []
+        detail = f" (forbidden fields: {', '.join(forbidden)})" if forbidden else ""
+        raise ProfileError(f"invalid or unsafe Strata launch config for {profile_id!r}{detail}")
+    if launch.get("schema_version") != 1 or launch.get("model_name") != alias:
+        raise ProfileError(f"Strata launch config model/schema mismatch for {profile_id!r}")
+    engine_binary = Path(str(launch.get("engine_binary", ""))).expanduser()
+    if not engine_binary.is_absolute() or engine_binary.is_symlink():
+        raise ProfileError(f"Strata engine_binary must be an absolute non-symlink path for {profile_id!r}")
+    engine_binary = engine_binary.resolve()
+    if not engine_binary.is_relative_to(bundle_root):
+        raise ProfileError(f"Strata engine_binary must be inside its bundle for {profile_id!r}")
+    engine_sha256 = launch.get("engine_sha256")
+    if not isinstance(engine_sha256, str) or not SHA256_RE.fullmatch(engine_sha256):
+        raise ProfileError(f"invalid Strata engine sha256 for {profile_id!r}")
+    if not allow_missing_artifacts and (not engine_binary.is_file() or not os.access(engine_binary, os.X_OK)):
+        raise ProfileError(f"Strata engine is missing or not executable for {profile_id!r}: {engine_binary}")
+    if engine_binary.is_file():
+        artifact_files.append((engine_binary, engine_sha256))
+    expert_profile_sha256 = launch.get("expert_profile_sha256")
+    if not isinstance(expert_profile_sha256, str) or not SHA256_RE.fullmatch(expert_profile_sha256):
+        raise ProfileError(f"invalid Strata expert profile sha256 for {profile_id!r}")
+    expert_profile_path: Path | None = None
+    working_directory = Path(str(launch.get("working_directory", ""))).expanduser()
+    if (
+        not working_directory.is_absolute()
+        or working_directory.is_symlink()
+        or not working_directory.resolve().is_relative_to(bundle_root)
+    ):
+        raise ProfileError(f"Strata working_directory must be inside its bundle for {profile_id!r}")
+    if not allow_missing_artifacts and not working_directory.is_dir():
+        raise ProfileError(f"Strata working_directory is missing for {profile_id!r}")
+    runtime_source_files = _parse_strata_runtime_sources(
+        working_directory,
+        launch.get("runtime_files"),
+        profile_id=profile_id,
+        allow_missing=allow_missing_artifacts,
+    )
+    if source_python_paths is not None:
+        bundled_source_paths = {
+            path.relative_to(working_directory).as_posix()
+            for path, _expected_sha in runtime_source_files
+        }
+        if bundled_source_paths != source_python_paths:
+            raise ProfileError(f"Strata bundle Python inventory differs from its pinned checkout for {profile_id!r}")
+    if source_repository is not None and source_repository.is_dir():
+        for bundled_path, expected_source_sha in runtime_source_files:
+            relative = bundled_path.relative_to(working_directory)
+            source_path = source_repository / relative
+            if source_path.is_symlink() or not source_path.is_file():
+                raise ProfileError(f"Strata runtime source is absent from its pinned checkout for {profile_id!r}: {relative}")
+            if _optional_file_sha256(source_path) != expected_source_sha:
+                raise ProfileError(f"Strata runtime source differs from its pinned checkout for {profile_id!r}: {relative}")
+    artifact_files.extend(runtime_source_files)
+    tokenizer_path = Path(str(launch.get("tokenizer_path", ""))).expanduser()
+    if (
+        not tokenizer_path.is_absolute()
+        or tokenizer_path.is_symlink()
+        or tokenizer_path.resolve() != (pack_path / "tokenizer").resolve()
+    ):
+        raise ProfileError(f"Strata tokenizer_path must select the pinned pack tokenizer for {profile_id!r}")
+    if not allow_missing_artifacts and not tokenizer_path.is_dir():
+        raise ProfileError(f"Strata tokenizer_path is missing for {profile_id!r}")
+    raw_args = launch.get("engine_args")
+    if not isinstance(raw_args, list) or not all(isinstance(value, str) and value for value in raw_args):
+        raise ProfileError(f"Strata engine_args must be a non-empty string list for {profile_id!r}")
+    allowed_values = {
+        "--pack": str(pack_path),
+        "--native": str(shard_paths[0]),
+        "--ple-gguf": str(shard_paths[1]),
+        "--expert-cache": "auto",
+        "--prefill": "auto",
+        "--max-context": str(context_size),
+        "--spec": "4",
+        "--spec-min-p": "0.5",
+        "--mtp": str(mtp_runtime_path),
+    }
+    seen: set[str] = set()
+    boolean_flags = {"--mmap-experts"}
+    uses_mmap_experts = False
+    index = 0
+    while index < len(raw_args):
+        flag = raw_args[index]
+        if flag in boolean_flags:
+            if flag in seen:
+                raise ProfileError(f"unsupported or duplicate Strata engine argument for {profile_id!r}: {flag}")
+            seen.add(flag)
+            uses_mmap_experts = True
+            index += 1
+            continue
+        if flag not in {*allowed_values, "--expert-profile"} or flag in seen:
+            raise ProfileError(f"unsupported or duplicate Strata engine argument for {profile_id!r}: {flag}")
+        if index + 1 >= len(raw_args) or raw_args[index + 1].startswith("--"):
+            raise ProfileError(f"Strata engine argument requires a value for {profile_id!r}: {flag}")
+        value = raw_args[index + 1]
+        if flag in allowed_values and value != allowed_values[flag]:
+            raise ProfileError(f"Strata engine argument does not match pinned profile data for {profile_id!r}: {flag}")
+        if flag == "--expert-profile":
+            raw_expert_profile = Path(value).expanduser()
+            if not raw_expert_profile.is_absolute() or raw_expert_profile.is_symlink():
+                raise ProfileError(f"Strata expert profile must be an absolute regular path for {profile_id!r}")
+            expert_profile = raw_expert_profile.resolve()
+            if not expert_profile.is_relative_to(bundle_root):
+                raise ProfileError(f"Strata expert profile must be inside its bundle for {profile_id!r}")
+            if not allow_missing_artifacts and not expert_profile.is_file():
+                raise ProfileError(f"Strata expert profile is missing for {profile_id!r}")
+            expert_profile_path = expert_profile
+        seen.add(flag)
+        index += 2
+    required_flags = {*allowed_values, "--expert-profile"}
+    if not required_flags.issubset(seen) or seen - required_flags - boolean_flags or expert_profile_path is None:
+        raise ProfileError(f"Strata engine_args are missing required controls for {profile_id!r}")
+    if uses_mmap_experts and f"{pack.get('path')}/experts.bin" not in observed_pack_files:
+        raise ProfileError(f"Strata mmap-experts mode requires the pack's experts.bin for {profile_id!r}")
+    if expert_profile_path.is_file():
+        artifact_files.append((expert_profile_path, expert_profile_sha256))
+    return {
+        "manifest_path": manifest_path,
+        "manifest_sha256": manifest_sha256,
+        "launch_path": launch_path,
+        "launch_sha256": launch_sha256,
+        "artifact_files": tuple(artifact_files),
+        "engine_binary": engine_binary,
+        "engine_sha256": engine_sha256,
+    }
 
 
 def _degrade_optional_moe_args(
@@ -961,6 +1508,8 @@ def _parse_profile(
     capabilities = frozenset(str(item).strip() for item in raw_capabilities)
     if not capabilities or not capabilities <= ALLOWED_CAPABILITIES:
         raise ProfileError(f"invalid capabilities for {profile_id!r}: {sorted(capabilities)!r}")
+    if runtime == "strata" and capabilities != frozenset({"text"}):
+        raise ProfileError(f"Strata profiles currently support text capability only for {profile_id!r}")
 
     warnings: list[str] = []
     degraded_features: list[str] = []
@@ -1007,6 +1556,7 @@ def _parse_profile(
         allow_directory=runtime == "vllm",
         allow_missing=allow_missing_artifacts,
     )
+    model_sha256 = _sha256(record, "model_sha256")
     mmproj_path: Path | None = None
     mmproj_sha256: str | None = None
     if record.get("mmproj_path"):
@@ -1017,6 +1567,8 @@ def _parse_profile(
     native_vision = record.get("native_vision", False)
     if not isinstance(native_vision, bool):
         raise ProfileError(f"native_vision must be a boolean for {profile_id!r}")
+    if runtime == "strata" and native_vision:
+        raise ProfileError(f"Strata native vision is not enabled for {profile_id!r}")
     if native_vision and "vision" not in capabilities:
         raise ProfileError(f"native_vision requires the vision capability for {profile_id!r}")
     if (
@@ -1068,6 +1620,8 @@ def _parse_profile(
             f"context_size for {profile_id!r} exceeds fail-closed limit {MAX_CONTEXT_SIZE}"
         )
     parallel = _positive_int(record, "parallel")
+    if runtime == "strata" and parallel != 1:
+        raise ProfileError(f"Strata currently serves one request at a time; parallel must be 1 for {profile_id!r}")
     if runtime == "llamacpp" and parallel > MAX_PARALLEL:
         raise ProfileError(f"parallel slots for {profile_id!r} exceed safe limit {MAX_PARALLEL}")
     max_output_tokens = (
@@ -1076,6 +1630,8 @@ def _parse_profile(
         else None
     )
     autotune = record.get("autotune")
+    if runtime == "strata" and autotune is not None:
+        raise ProfileError(f"Strata autotune is not supported for {profile_id!r}")
     if autotune is not None:
         if not isinstance(autotune, dict):
             raise ProfileError(f"autotune metadata must be an object for {profile_id!r}")
@@ -1286,12 +1842,25 @@ def _parse_profile(
                 f"{profile_id!r} uses KVarN with parallel={parallel}; "
                 "set LLAMA_KVARN_MULTI_STREAM=1 explicitly"
             )
-    elif any(
+    elif runtime == "vllm" and any(
         key.startswith(("GGML_", "LLAMA_")) for key in environment
     ):
         raise ProfileError(
             f"vllm profile {profile_id!r} contains llama.cpp-only environment settings"
         )
+    elif runtime == "strata":
+        build_environment = dict(build.environment) if build is not None else {}
+        if build is None or dict(environment) != build_environment:
+            raise ProfileError(f"Strata environment must match its pinned runtime bundle for {profile_id!r}")
+        unsafe_environment = sorted(
+            key for key in build_environment
+            if key not in STRATA_RUNTIME_ENVIRONMENT_FIELDS
+        )
+        if unsafe_environment:
+            raise ProfileError(
+                f"Strata runtime bundle environment contains unsupported names for {profile_id!r}: "
+                + ", ".join(unsafe_environment)
+            )
 
     if runtime == "llamacpp":
         if "moe_cache_slots_limit" in record:
@@ -1328,6 +1897,20 @@ def _parse_profile(
         runtime=runtime,
         moe_cache_slots_limit=moe_cache_slots_limit,
     )
+    strata_metadata: dict[str, Any] = {}
+    if runtime == "strata":
+        if role != "persistent":
+            raise ProfileError(f"Strata profiles must be persistent for {profile_id!r}")
+        strata_metadata = _parse_strata_artifacts(
+            record,
+            profile_id=profile_id,
+            alias=alias,
+            model_path=model_path,
+            model_sha256=model_sha256,
+            context_size=context_size,
+            runtime_build=build,
+            allow_missing_artifacts=allow_missing_artifacts,
+        )
 
     if (
         "draft-mtp" in speculative_types
@@ -1340,7 +1923,7 @@ def _parse_profile(
             "MTP heads"
         )
 
-    safety = _parse_safety(record, profile_id)
+    safety = _parse_safety(record, profile_id, runtime=runtime)
     max_cache_ram_mib = safety.service.memory_max_mib // MAX_CACHE_RAM_SHARE_DIVISOR
     if cache_ram_mib is not None and cache_ram_mib > max_cache_ram_mib:
         raise ProfileError(
@@ -1388,7 +1971,7 @@ def _parse_profile(
         server_binary=server_binary,
         server_sha256=server_sha256,
         model_path=model_path,
-        model_sha256=_sha256(record, "model_sha256"),
+        model_sha256=model_sha256,
         mmproj_path=mmproj_path,
         mmproj_sha256=mmproj_sha256,
         context_size=context_size,
@@ -1436,4 +2019,11 @@ def _parse_profile(
         deployment_revision=(
             runtime_catalog.deployment_revision if runtime_catalog is not None else None
         ),
+        strata_artifacts_manifest_path=strata_metadata.get("manifest_path"),
+        strata_artifacts_manifest_sha256=strata_metadata.get("manifest_sha256"),
+        strata_launch_config_path=strata_metadata.get("launch_path"),
+        strata_launch_config_sha256=strata_metadata.get("launch_sha256"),
+        strata_artifact_files=strata_metadata.get("artifact_files", ()),
+        strata_engine_binary=strata_metadata.get("engine_binary"),
+        strata_engine_sha256=strata_metadata.get("engine_sha256"),
     )

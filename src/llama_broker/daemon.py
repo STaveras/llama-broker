@@ -241,6 +241,21 @@ def effective_backend_url(security: SecurityConfig | None = None) -> str:
     return BACKEND_URL
 
 
+def backend_url_for_runtime(backend_url: str, runtime: str) -> str:
+    """Use plain HTTP only for Strata's explicitly loopback-only backend listener."""
+    if str(runtime).strip().lower() != "strata":
+        return backend_url
+    parts = urlsplit(backend_url)
+    host = (parts.hostname or "").strip().lower()
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost"
+    if not loopback:
+        raise SecurityError("Strata backend transport requires a loopback endpoint")
+    return parts._replace(scheme="http").geturl()
+
+
 def effective_backend_listen_host(security: SecurityConfig | None = None) -> str:
     """Expose a TLS-protected backend on the LAN unless explicitly narrowed."""
 
@@ -409,12 +424,25 @@ def _verify_profile_artifacts(profile: Any, *, force: bool = False) -> None:
         checks.append(
             (Path(mmproj_path), getattr(profile, "mmproj_sha256", None), "mmproj")
         )
+    for path_field, hash_field, label in (
+        ("strata_artifacts_manifest_path", "strata_artifacts_manifest_sha256", "Strata manifest"),
+        ("strata_launch_config_path", "strata_launch_config_sha256", "Strata launch config"),
+    ):
+        path = getattr(profile, path_field, None)
+        if path is not None:
+            checks.append((Path(path), getattr(profile, hash_field, None), label))
+    checks.extend(
+        (Path(path), digest, "Strata artifact")
+        for path, digest in getattr(profile, "strata_artifact_files", ())
+    )
 
     for path, expected, kind in checks:
         if not isinstance(expected, str) or not expected:
             raise BackendControllerError(
                 f"{profile.id} {kind} has no configured SHA-256 digest"
             )
+        if path.is_symlink() or not path.is_file():
+            raise BackendControllerError(f"{profile.id} {kind} is not a regular file: {path}")
         key = _artifact_verification_key(path, str(expected))
         if not force and _artifact_verification_cached(key):
             continue
@@ -424,6 +452,8 @@ def _verify_profile_artifacts(profile: Any, *, force: bool = False) -> None:
             raise BackendControllerError(
                 f"{profile.id} {kind} is unavailable: {error}"
             ) from error
+        if path.is_symlink() or not path.is_file():
+            raise BackendControllerError(f"{profile.id} {kind} changed to a non-regular file during verification: {path}")
         after_key = _artifact_verification_key(path, str(expected))
         if key is not None and after_key != key:
             raise BackendControllerError(
@@ -1563,23 +1593,27 @@ class BrokerApplication:
         self._controller_state = state
 
         self._backend_url = (backend_url or f"http://{backend_host}:{backend_port}").rstrip("/")
-        backend_parts = urlsplit(self._backend_url)
         self._backend_ca_file = self.security.backend_tls_ca_file
         probe_timeout = min(max(backend_timeout, 0.05), 0.5)
         self._backend_ready = backend_ready or (
             lambda: backend_endpoint_ready(backend_host, backend_port, probe_timeout)
         )
-        self._backend_alias_ready = backend_alias_ready or (
-            lambda alias: backend_serves_alias(
+
+        def readiness_for_alias(alias: str) -> bool:
+            profile = self.registry.resolve(alias)
+            endpoint = backend_url_for_runtime(self._backend_url, profile.runtime)
+            endpoint_scheme = urlsplit(endpoint).scheme or "http"
+            return backend_serves_alias(
                 backend_host,
                 backend_port,
                 alias,
                 probe_timeout,
-                scheme=backend_parts.scheme or "http",
+                scheme=endpoint_scheme,
                 ca_file=self._backend_ca_file,
                 headers=_backend_auth_headers(self.security),
             )
-        )
+
+        self._backend_alias_ready = backend_alias_ready or readiness_for_alias
 
         initial = state.get("profile") if state.get("phase") == "active" else None
         if initial is not None and not isinstance(initial, str):
@@ -2319,11 +2353,18 @@ class BrokerApplication:
 
     @property
     def backend_url(self) -> str:
+        active_profile = getattr(getattr(self, "coordinator", None), "active_profile", None)
+        if isinstance(active_profile, str):
+            try:
+                runtime = self.registry.get(active_profile).runtime
+            except ProfileError:
+                return self._backend_url
+            return backend_url_for_runtime(self._backend_url, runtime)
         return self._backend_url
 
     def backend_client(self, *, timeout: float | None = None) -> BackendClient:
         return BackendClient(
-            self._backend_url,
+            self.backend_url,
             timeout=self.backend_timeout if timeout is None else timeout,
             ca_file=self._backend_ca_file,
             default_headers=_backend_auth_headers(self.security),
@@ -2335,7 +2376,7 @@ class BrokerApplication:
         return self.security.authentication_keys()
 
     def _profile_artifacts_verified(self, profile: Profile) -> bool:
-        checks = [
+        checks: list[tuple[Path, str]] = [
             (profile.server_binary, profile.server_sha256),
             (profile.model_path, profile.model_sha256),
         ]
@@ -2343,13 +2384,40 @@ class BrokerApplication:
             if profile.mmproj_sha256 is None:
                 return False
             checks.append((profile.mmproj_path, profile.mmproj_sha256))
+        if profile.runtime == "strata":
+            for path_field, hash_field in (
+                ("strata_artifacts_manifest_path", "strata_artifacts_manifest_sha256"),
+                ("strata_launch_config_path", "strata_launch_config_sha256"),
+            ):
+                path = getattr(profile, path_field, None)
+                digest = getattr(profile, hash_field, None)
+                if not isinstance(path, Path) or not isinstance(digest, str):
+                    return False
+                checks.append((path, digest))
+            strata_files = getattr(profile, "strata_artifact_files", ())
+            if not strata_files:
+                return False
+            for item in strata_files:
+                if (
+                    not isinstance(item, tuple)
+                    or len(item) != 2
+                    or not isinstance(item[0], Path)
+                    or not isinstance(item[1], str)
+                ):
+                    return False
+                checks.append((item[0], item[1]))
         fingerprint: list[Any] = []
         for path, expected in checks:
             try:
+                if path.is_symlink() or not path.is_file():
+                    return False
                 stat = path.stat()
             except OSError:
                 return False
-            fingerprint.extend((str(path), stat.st_size, stat.st_mtime_ns, expected))
+            fingerprint.extend(
+                (str(path), stat.st_dev, stat.st_ino, stat.st_size,
+                 stat.st_mtime_ns, stat.st_ctime_ns, expected)
+            )
         cache_key = tuple(fingerprint)
         cached = self._artifact_verification_cache.get(profile.id)
         if cached is not None and cached[0] == cache_key:
@@ -2357,7 +2425,18 @@ class BrokerApplication:
         verified = True
         for path, expected in checks:
             try:
+                before = path.stat()
                 if sha256_file(path) != expected:
+                    verified = False
+                    break
+                after = path.stat()
+                if (
+                    before.st_dev, before.st_ino, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns,
+                ) != (
+                    after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns,
+                ):
                     verified = False
                     break
             except OSError:
@@ -3655,15 +3734,33 @@ def create_production_controller(
         )
         for runtime in {profile.runtime for profile in registry.profiles}
     }
+    readiness_profiles: dict[str, Profile] = {}
+
+    def replace_readiness_profiles(profiles: Mapping[str, Profile]) -> None:
+        readiness_profiles.clear()
+        for profile in profiles.values():
+            for alias in (profile.id, profile.alias, *profile.aliases):
+                readiness_profiles[alias.casefold()] = profile
+
+    def readiness_probe(alias: str, timeout: float) -> bool:
+        profile = readiness_profiles.get(str(alias).strip().casefold())
+        if profile is None:
+            raise ProfileError(f"unknown model alias: {alias}")
+        probe_url = backend_url_for_runtime(backend_url, profile.runtime)
+        return _readiness_probe(
+            alias, timeout, shutdown_requested, security, probe_url
+        )
+
+    setattr(readiness_probe, "replace_profiles", replace_readiness_profiles)
+    replace_readiness_profiles({profile.id: profile for profile in registry.profiles})
+
     return BackendController(
         profiles={profile.id: profile for profile in registry.profiles},
         state_path=STATE_PATH,
         systemd_dir=SYSTEMD_USER_DIR,
         service_prefix=SERVICE_PREFIX,
         command_runner=subprocess_command_runner,
-        readiness_probe=lambda alias, timeout: _readiness_probe(
-            alias, timeout, shutdown_requested, security, backend_url
-        ),
+        readiness_probe=readiness_probe,
         # Production keeps resource probing advisory: the Phase 2 contract
         # forbids a mandatory nvidia-smi/NVML or fixed-free-VRAM gate.
         resource_probe=None,

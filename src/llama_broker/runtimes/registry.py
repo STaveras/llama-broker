@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
 from .llamacpp import LlamaCppRuntime
+from .strata import StrataRuntime
 from .vllm import VllmRuntime
 
 
@@ -124,8 +125,38 @@ _VLLM_FIELDS = _BASE_FIELDS | frozenset(
 )
 
 
+_STRATA_FIELDS = frozenset(
+    {
+        "runtime",
+        "id",
+        "alias",
+        "aliases",
+        "display_name",
+        "role",
+        "capabilities",
+        "native_vision",
+        "runtime_build",
+        "server_binary",
+        "server_sha256",
+        "model_path",
+        "model_sha256",
+        "startup_timeout",
+        "safety",
+        "environment",
+        "max_output_tokens",
+        "context_size",
+        "parallel",
+        "strata_artifacts_manifest_path",
+        "strata_artifacts_manifest_sha256",
+        "strata_launch_config_path",
+        "strata_launch_config_sha256",
+    }
+)
+
+
 _LLAMACPP = LlamaCppRuntime()
 _VLLM = VllmRuntime()
+_STRATA = StrataRuntime()
 
 RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
     "llamacpp": RuntimeInfo(
@@ -141,6 +172,13 @@ RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
         capabilities=("text", "vision", "tools", "tensor-parallel", "kv-cache-dtype"),
         editable_fields=_VLLM_FIELDS,
         adapter=_VLLM,
+    ),
+    "strata": RuntimeInfo(
+        name="strata",
+        binaries=("strata-server",),
+        capabilities=("text",),
+        editable_fields=_STRATA_FIELDS,
+        adapter=_STRATA,
     ),
 }
 

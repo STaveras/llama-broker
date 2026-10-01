@@ -207,6 +207,26 @@ class BackendControllerTest(unittest.TestCase):
     def read_state(self) -> dict:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
+    def test_replace_profiles_refreshes_readiness_alias_mapping(self) -> None:
+        class AliasProbe:
+            def __init__(self, aliases: set[str]) -> None:
+                self.aliases = aliases
+
+            def __call__(self, alias: str, _timeout: float) -> bool:
+                return alias in self.aliases
+
+            def replace_profiles(self, profiles) -> None:
+                self.aliases = {profile.alias for profile in profiles.values()}
+
+        old_profile = self.main
+        new_profile = replace(old_profile, alias="qwen3.8-flash-next-iq2-xs")
+        probe = AliasProbe({old_profile.alias})
+        self.controller.readiness_probe = probe
+
+        self.controller.replace_profiles({new_profile.id: new_profile})
+
+        self.assertTrue(probe(new_profile.alias, 0.1))
+
     def test_recovery_from_corrupt_state_uses_actual_active_unit(self) -> None:
         main_unit = self.controller.unit_name("main-27b")
         self.harness.service_inventory_units.add(main_unit)

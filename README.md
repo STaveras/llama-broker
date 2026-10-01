@@ -64,13 +64,18 @@ shown there.
   invariant; CUDA graph capture/optimization controls are scoped to autotune
   candidate units and are omitted from production units. Unknown or empty model
   requests are rejected, never substituted.
-- **llama.cpp + vLLM runtimes.** A small runtime registry
-  (`runtimes/`) owns each backend's complete command shape, so vLLM profiles
-  emit `vllm serve MODEL` and llama.cpp profiles emit llama-server flags —
-  with cross-runtime field validation.
+- **llama.cpp, vLLM, and Strata runtimes.** A small runtime registry
+  (`runtimes/`) owns each backend's command and transport contract. vLLM emits
+  `vllm serve MODEL`, llama.cpp emits llama-server flags, and Strata uses a
+  pinned bridge with a loopback-only HTTP backend. Runtime-specific profile
+  fields are validated fail-closed.
+- **Strata IQ2_XS packages.** Strata profiles pin both GGUF shards, the native
+  pack inventory, launch config, engine, and bridge. They are text-only,
+  single-slot, MCP-disabled, and refused unless their loopback/API-key and RAM
+  admission checks pass.
 - **External chat templates.** Advanced profile editing accepts a template
-  file path for either runtime. llama.cpp profiles launch with `--jinja` and
-  `--chat-template-file`; vLLM profiles pass the path as `--chat-template`.
+  file path for llama.cpp and vLLM profiles. llama.cpp launches with `--jinja`
+  and `--chat-template-file`; vLLM passes the path as `--chat-template`.
 - **Vision-capable profiles.** A transient vision profile can drain the text
   profile, serve a vision request, and restore the prior profile when leases
   finish.
@@ -198,7 +203,7 @@ deleted automatically.
 - `backend_controller.py` — systemd unit install/management and the switch
   coordinator.
 - `broker_security.py` — TLS material and API-key lifecycle.
-- `runtimes/` — runtime adapters (llamacpp, vllm).
+- `runtimes/` — runtime adapters (llamacpp, vllm, strata).
 - `configure/` — per-tool provider configuration (Hermes, Codex, Claude Code,
   OpenCode, OpenClaw).
 

@@ -259,6 +259,18 @@ def _verify_profile(profile: Profile) -> list[str]:
     ]
     if profile.mmproj_path is not None and profile.mmproj_sha256 is not None:
         checks.append((profile.mmproj_path, profile.mmproj_sha256, "mmproj"))
+    for path_field, hash_field, label in (
+        ("strata_artifacts_manifest_path", "strata_artifacts_manifest_sha256", "Strata manifest"),
+        ("strata_launch_config_path", "strata_launch_config_sha256", "Strata launch config"),
+    ):
+        path = getattr(profile, path_field, None)
+        digest = getattr(profile, hash_field, None)
+        if path is not None and isinstance(digest, str):
+            checks.append((Path(path), digest, label))
+    checks.extend(
+        (Path(path), digest, "Strata artifact")
+        for path, digest in getattr(profile, "strata_artifact_files", ())
+    )
     for path, expected, kind in checks:
         try:
             actual = _hash_file(path)
@@ -405,6 +417,8 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         "role": "role",
         "alias": "alias",
         "server-binary": "server_binary",
+        "strata-artifacts-manifest": "strata_artifacts_manifest_path",
+        "strata-launch-config": "strata_launch_config_path",
         "model": "model_path",
         "model-sha256": "model_sha256",
         "context": "context_size",
@@ -459,7 +473,10 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         record[key] = value
     elif field == "gpu-layers":
         record[key] = _validate_gpu_layers(raw_value)
-    elif field in {"server-binary", "model", "mmproj"}:
+    elif field in {
+        "server-binary", "model", "mmproj",
+        "strata-artifacts-manifest", "strata-launch-config",
+    }:
         value = raw_value.strip()
         if field == "mmproj" and not value:
             record.pop("mmproj_path", None)
@@ -476,6 +493,10 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
             record["server_sha256"] = sha256_file(path)
         elif field == "model":
             record["model_sha256"] = sha256_file(path)
+        elif field == "strata-artifacts-manifest":
+            record["strata_artifacts_manifest_sha256"] = sha256_file(path)
+        elif field == "strata-launch-config":
+            record["strata_launch_config_sha256"] = sha256_file(path)
         else:
             record["mmproj_sha256"] = sha256_file(path)
             capabilities = set(record.get("capabilities", ["text"]))
@@ -510,6 +531,14 @@ def _remove_optional_field(record: dict[str, object], field: str) -> None:
         return
     if field == "model-draft":
         record.pop("model_draft", None)
+        return
+    if field == "strata-artifacts-manifest":
+        record.pop("strata_artifacts_manifest_path", None)
+        record.pop("strata_artifacts_manifest_sha256", None)
+        return
+    if field == "strata-launch-config":
+        record.pop("strata_launch_config_path", None)
+        record.pop("strata_launch_config_sha256", None)
         return
     if field in {"environment", "env"}:
         environment = dict(record.get("environment", {}))
@@ -594,6 +623,68 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
     if selected_build is None:
         selected_build = template_build
 
+    strata_manifest_path: Path | None = None
+    strata_launch_path: Path | None = None
+    strata_launch_config: dict[str, Any] | None = None
+    strata_context_size: int | None = None
+    strata_default_alias: str | None = None
+    if selected_build is not None and selected_build.runtime == "strata":
+        raw_manifest_path = getattr(args, "strata_artifacts_manifest", None)
+        raw_launch_path = getattr(args, "strata_launch_config", None)
+        if not raw_manifest_path or not raw_launch_path:
+            raise ProfileError(
+                "Strata profile add requires --strata-artifacts-manifest and --strata-launch-config"
+            )
+        strata_manifest_path = _normalise_existing_path(
+            str(raw_manifest_path), "strata-artifacts-manifest"
+        )
+        strata_launch_path = _normalise_existing_path(
+            str(raw_launch_path), "strata-launch-config"
+        )
+        try:
+            strata_launch_config = json.loads(strata_launch_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ProfileError(f"cannot read Strata launch config: {error}") from error
+        if not isinstance(strata_launch_config, dict):
+            raise ProfileError("Strata launch config must be a JSON object")
+        strata_default_alias = strata_launch_config.get("model_name")
+        engine_args = strata_launch_config.get("engine_args")
+        if not isinstance(strata_default_alias, str) or not strata_default_alias.strip():
+            raise ProfileError("Strata launch config requires a non-empty model_name")
+        if not isinstance(engine_args, list) or not all(isinstance(value, str) for value in engine_args):
+            raise ProfileError("Strata launch config engine_args must be a string list")
+        try:
+            context_index = engine_args.index("--max-context")
+            strata_context_size = int(engine_args[context_index + 1])
+        except (ValueError, IndexError) as error:
+            raise ProfileError("Strata launch config requires --max-context") from error
+        if engine_args.count("--max-context") != 1 or strata_context_size <= 0:
+            raise ProfileError("Strata launch config has invalid --max-context")
+        manifest = json.loads(strata_manifest_path.read_text(encoding="utf-8"))
+        try:
+            first_shard = manifest["model"]["shards"][0]["path"]
+            expected_model = (strata_manifest_path.parent / first_shard).resolve()
+        except (KeyError, IndexError, TypeError, AttributeError) as error:
+            raise ProfileError("Strata artifact manifest has no first model shard") from error
+        selected_model = _normalise_existing_path(str(args.model), "model")
+        if selected_model != expected_model:
+            raise ProfileError("--model must be the first shard pinned by the Strata artifact manifest")
+        requested_aliases = [item.strip() for item in (args.alias or []) if item.strip()]
+        if requested_aliases and requested_aliases[0] != strata_default_alias:
+            raise ProfileError("Strata profile alias must match launch config model_name")
+        if args.context is not None and args.context != strata_context_size:
+            raise ProfileError("--context must match Strata launch config --max-context")
+        if args.parallel not in (None, 1):
+            raise ProfileError("Strata profile parallel must be 1")
+        if args.role not in (None, "persistent"):
+            raise ProfileError("Strata profiles must be persistent")
+        if any(getattr(args, field, None) is not None for field in (
+            "batch", "ubatch", "cache_k", "cache_v", "flash", "gpu_layers", "restore"
+        )):
+            raise ProfileError("Strata profiles do not accept llama.cpp-only options")
+        if args.mmproj or args.env or args.extra_args:
+            raise ProfileError("Strata profiles do not accept vision, profile environment, or extra args")
+
     if selected_build is not None:
         if requested_server_path is not None and (
             requested_server_path != selected_build.server_binary
@@ -614,9 +705,10 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
             for field in tuple(record):
                 if field not in editable_fields:
                     record.pop(field, None)
-            # Extra arguments are runtime-specific; callers can add new ones
-            # through --arg after the target runtime has been selected.
-            record["extra_args"] = []
+            if selected_build.runtime == "strata":
+                record.pop("extra_args", None)
+            else:
+                record["extra_args"] = []
         record.update(
             {
                 "runtime": selected_build.runtime,
@@ -656,7 +748,8 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
         )
 
     model_path = _normalise_existing_path(args.model, "model")
-    aliases = [item.strip() for item in (args.alias or [profile_id]) if item.strip()]
+    default_alias = strata_default_alias if strata_default_alias is not None else profile_id
+    aliases = [item.strip() for item in (args.alias or [default_alias]) if item.strip()]
     if not aliases:
         raise ProfileError("at least one non-empty alias is required")
 
@@ -674,6 +767,38 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
         record.pop(key, None)
     record["model_path"] = str(model_path)
     record["model_sha256"] = sha256_file(model_path)
+    if selected_build is not None and selected_build.runtime == "strata":
+        assert strata_manifest_path is not None and strata_launch_path is not None
+        assert strata_context_size is not None
+        record["strata_artifacts_manifest_path"] = str(strata_manifest_path)
+        record["strata_artifacts_manifest_sha256"] = sha256_file(strata_manifest_path)
+        record["strata_launch_config_path"] = str(strata_launch_path)
+        record["strata_launch_config_sha256"] = sha256_file(strata_launch_path)
+        record["context_size"] = strata_context_size
+        record["parallel"] = 1
+        record["capabilities"] = ["text"]
+        record["native_vision"] = False
+        record.pop("extra_args", None)
+        record["safety"] = {
+            "service": {
+                "type": "exec",
+                "memory_max_mib": 20_480,
+                "memory_swap_max_mib": 1_024,
+                "tasks_max": 512,
+                "kill_signal": "SIGINT",
+                "timeout_stop_sec": 20,
+            },
+            "admission": {
+                "min_ram_available_mib": 6_144,
+                "max_swap_used_mib": 1_024,
+                "max_swap_growth_mib": 128,
+                "min_total_vram_mib": 12_000,
+                "min_free_vram_before_start_mib": 8_192,
+                "driver_vram_reserve_mib": 512,
+                "vision_vram_reserve_mib": 0,
+                "safety_vram_reserve_mib": 1_024,
+            },
+        }
 
     if args.context is not None:
         record["context_size"] = args.context
@@ -718,6 +843,8 @@ EDITABLE_FIELDS = [
     ("runtime", "Serving runtime", str),
     ("context_size", "Context window size", int),
     ("parallel", "Parallel requests (slots)", int),
+    ("strata_artifacts_manifest_path", "Strata artifact manifest path", str),
+    ("strata_launch_config_path", "Strata launch config path", str),
     ("tensor_parallel_size", "vLLM tensor parallel size", int),
     ("gpu_memory_utilization", "vLLM GPU memory utilization", float),
     ("kv_cache_dtype", "vLLM KV cache dtype", str),
@@ -732,6 +859,11 @@ EDITABLE_FIELDS = [
     ("fit_target_mib", "Fit target MiB", int),
     ("fit_ctx", "Fit context size", int),
 ]
+
+STRATA_HASHED_PATH_FIELDS = {
+    "strata_artifacts_manifest_path": "strata_artifacts_manifest_sha256",
+    "strata_launch_config_path": "strata_launch_config_sha256",
+}
 
 FIT_ONLY_FIELDS = (
     "fit_target_mib",
@@ -810,6 +942,26 @@ def _interactive_edit(
         flag_value = flags.get(field_key)
 
         if flag_mode and flag_value is None:
+            continue
+
+        if field_key in STRATA_HASHED_PATH_FIELDS:
+            raw_path = flag_value
+            if raw_path is None:
+                raw_path = input(f"  {field_label} [{current or ''}]: ").strip()
+            raw_path = raw_path.strip()
+            hash_key = STRATA_HASHED_PATH_FIELDS[field_key]
+            if not raw_path:
+                profile_data.pop(field_key, None)
+                profile_data.pop(hash_key, None)
+                changed = True
+                continue
+            path = _normalise_existing_path(raw_path, field_key)
+            digest = sha256_file(path)
+            if profile_data.get(field_key) != str(path) or profile_data.get(hash_key) != digest:
+                profile_data[field_key] = str(path)
+                profile_data[hash_key] = digest
+                changed = True
+                print(f"  {field_label}: pinned {path}")
             continue
 
         if flag_value is not None:
@@ -2949,6 +3101,8 @@ def _cmd_profiles_edit(args: argparse.Namespace) -> int:
     flags = {
         "runtime": args.runtime,
         "runtime_build": args.runtime_build,
+        "strata_artifacts_manifest_path": args.strata_artifacts_manifest_path,
+        "strata_launch_config_path": args.strata_launch_config_path,
         "context_size": args.context_size,
         "parallel": args.parallel,
         "tensor_parallel_size": args.tensor_parallel_size,
@@ -3382,6 +3536,8 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("model", nargs="?", help="profile id or alias (default: first profile)")
     edit.add_argument("--runtime", choices=runtime_names(), help="set serving runtime")
     edit.add_argument("--runtime-build", help="select a concrete cataloged runtime build")
+    edit.add_argument("--strata-artifacts-manifest-path", help="set Strata artifact manifest path")
+    edit.add_argument("--strata-launch-config-path", help="set Strata launch config path")
     edit.add_argument("--context-size", help="set context_size")
     edit.add_argument("--parallel", help="set parallel requests")
     edit.add_argument("--tensor-parallel-size", help="set vLLM tensor parallel size")
@@ -3411,7 +3567,9 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--display-name", help="human-readable display name")
     add.add_argument("--role", choices=sorted(ALLOWED_ROLES), default=None)
     add.add_argument("--runtime-build", help="select a concrete cataloged runtime build")
-    add.add_argument("--server-binary", help="absolute llama-server binary path")
+    add.add_argument("--server-binary", help="absolute pinned runtime server binary path")
+    add.add_argument("--strata-artifacts-manifest", help="pinned Strata artifact manifest")
+    add.add_argument("--strata-launch-config", help="pinned Strata launch config")
     add.add_argument("--context", type=int, help="context size")
     add.add_argument("--parallel", type=int, help="parallel slots")
     add.add_argument("--batch", type=int, help="batch size")
