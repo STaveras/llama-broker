@@ -118,6 +118,56 @@ class BrokerctlStatusTests(unittest.TestCase):
         self.assertIn("Requests:  active=1 pending=2 (pending transitions=1)", rendered)
         self.assertIn("Slots:     1/2 in use (50%)", rendered)
 
+    def _render_status(self, *, parallel: int, leases: dict[str, int]) -> str:
+        controller = Mock()
+        controller.state.return_value = {"generation": 11, "profile": "main", "phase": "active"}
+        profile = SimpleNamespace(
+            id="main",
+            display_name="Main model",
+            runtime="llamacpp",
+            server_binary="llama-server",
+            context_size=65536,
+            parallel=parallel,
+        )
+        registry = Mock()
+        registry.try_resolve.return_value = profile
+        output = io.StringIO()
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=registry),
+            patch.object(brokerctl, "create_production_controller", return_value=controller),
+            patch.object(brokerctl, "_broker_admin_get", return_value={
+                "status": "ok",
+                "backend": {"profile": "main", "phase": "active", "ready": True},
+                "leases": leases,
+            }),
+            patch.object(brokerctl, "backend_endpoint_ready", return_value=True),
+            patch.object(brokerctl, "get_runtime_info", return_value=SimpleNamespace(
+                name="llamacpp", binaries=("llama-server",)
+            )),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(brokerctl.main(["status"]), 0)
+        return output.getvalue()
+
+    def test_status_never_reports_more_slots_in_use_than_parallel(self) -> None:
+        rendered = self._render_status(
+            parallel=1,
+            leases={"active_requests": 2, "inference_requests": 2, "queued_transitions": 0},
+        )
+
+        self.assertIn("Requests:  active=1 pending=1 (pending transitions=0)", rendered)
+        self.assertIn("Slots:     1/1 in use (100%)", rendered)
+        self.assertNotIn("2/1", rendered)
+
+    def test_status_excludes_slot_probes_from_slot_usage(self) -> None:
+        rendered = self._render_status(
+            parallel=1,
+            leases={"active_requests": 2, "inference_requests": 1, "queued_transitions": 0},
+        )
+
+        self.assertIn("Requests:  active=1 pending=0 (pending transitions=0)", rendered)
+        self.assertIn("Slots:     1/1 in use (100%)", rendered)
+
 
 class BrokerctlLifecycleSafetyTests(unittest.TestCase):
     def test_load_pretty_prints_admin_state_by_default(self) -> None:
