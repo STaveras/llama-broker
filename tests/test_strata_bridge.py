@@ -181,7 +181,7 @@ class StrataBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(StrataBridgeError, "empty"):
             read_api_key_file(self.key_file)
 
-    def test_resource_floor_rejects_low_memory_and_high_swap(self) -> None:
+    def test_resource_floor_keeps_ram_gate_and_makes_host_swap_advisory(self) -> None:
         enforce_resource_floor(
             available_ram_mib=8192,
             min_available_ram_mib=6144,
@@ -202,13 +202,16 @@ class StrataBridgeTests(unittest.TestCase):
                 swap_used_mib=0,
                 max_swap_used_mib=1_024,
             )
-        with self.assertRaisesRegex(StrataBridgeError, "swap"):
-            enforce_resource_floor(
-                available_ram_mib=8_192,
-                min_available_ram_mib=6_144,
-                swap_used_mib=6_144,
-                max_swap_used_mib=1_024,
-            )
+
+        warning = enforce_resource_floor(
+            available_ram_mib=8_192,
+            min_available_ram_mib=6_144,
+            swap_used_mib=6_144,
+            max_swap_used_mib=1_024,
+        )
+
+        self.assertIn("host swap usage is 6144 MiB", warning or "")
+        self.assertIn("cgroup", warning or "")
 
     def test_cgroup_gate_rejects_unbounded_or_host_exceeding_service(self) -> None:
         enforce_cgroup_budget(

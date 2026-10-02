@@ -76,21 +76,28 @@ def enforce_resource_floor(
     min_available_ram_mib: int,
     swap_used_mib: int,
     max_swap_used_mib: int,
-) -> None:
+) -> str | None:
+    """Hard-gate free RAM, but treat host-wide swap as advisory only.
+
+    The service's effective cgroup MemoryMax/MemorySwapMax are checked
+    separately and remain the hard per-process resource limits.
+    """
     if min_available_ram_mib < STRATA_MIN_AVAILABLE_RAM_MIB:
         raise StrataBridgeError("Strata minimum available-RAM gate cannot be weakened")
     if max_swap_used_mib > STRATA_MAX_SWAP_USED_MIB:
-        raise StrataBridgeError("Strata maximum swap-use gate cannot be weakened")
+        raise StrataBridgeError("Strata host-swap warning threshold cannot be weakened")
     if available_ram_mib < min_available_ram_mib:
         raise StrataBridgeError(
             f"available RAM is {available_ram_mib} MiB; Strata profile requires "
             f"at least {min_available_ram_mib} MiB"
         )
     if swap_used_mib > max_swap_used_mib:
-        raise StrataBridgeError(
-            f"swap usage is {swap_used_mib} MiB; Strata profile allows at most "
-            f"{max_swap_used_mib} MiB"
+        return (
+            f"host swap usage is {swap_used_mib} MiB, above the advisory "
+            f"threshold of {max_swap_used_mib} MiB; the systemd service cgroup "
+            "still enforces this process's MemoryMax and MemorySwapMax"
         )
+    return None
 
 
 def _system_resource_mib() -> tuple[int, int, int]:
@@ -594,12 +601,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         total_ram_mib, available_ram_mib, swap_used_mib = _system_resource_mib()
         gpu_total_mib, gpu_free_mib = _gpu_memory_mib()
-        enforce_resource_floor(
+        swap_warning = enforce_resource_floor(
             available_ram_mib=available_ram_mib,
             min_available_ram_mib=args.min_available_ram_mib,
             swap_used_mib=swap_used_mib,
             max_swap_used_mib=args.max_swap_used_mib,
         )
+        if swap_warning:
+            print(f"[strata] WARNING: {swap_warning}", file=sys.stderr, flush=True)
         memory_warning = assess_strata_memory_mode(
             system_ram_mib=total_ram_mib,
             gpu_vram_total_mib=gpu_total_mib,
