@@ -714,6 +714,9 @@ class ProfileCoordinator:
         self._transition_timeout = transition_timeout
         self._stop_timeout = stop_timeout
         self._active_requests = 0
+        # Leases held by /slots and /props probes. They block transitions like
+        # any other lease but never occupy a backend slot.
+        self._probe_requests = 0
         self._queued_transitions = 0
         self._transitioning = False
         self._transition_name: str | None = None
@@ -751,6 +754,7 @@ class ProfileCoordinator:
             return {
                 "profile": self._active_profile,
                 "active_requests": self._active_requests,
+                "inference_requests": self._active_requests - self._probe_requests,
                 "quiescing": self._quiescing_unlocked(),
                 "transitioning": self._transitioning,
                 "queued_transitions": self._queued_transitions,
@@ -1009,20 +1013,24 @@ class ProfileCoordinator:
             raise
         return temporary_restore
 
-    def _acquire_active(self) -> str:
+    def _acquire_active(self, *, probe: bool = False) -> str:
         with self._condition:
             if self._quiescing_unlocked():
                 raise self._quiescing_error_unlocked()
             if self._active_profile is None:
                 raise BrokerQuiescingError("private backend has no active profile")
             self._active_requests += 1
+            if probe:
+                self._probe_requests += 1
             return self._active_profile
 
-    def _release(self) -> None:
+    def _release(self, *, probe: bool = False) -> None:
         with self._condition:
             if self._active_requests <= 0:
                 raise RuntimeError("profile lease underflow")
             self._active_requests -= 1
+            if probe:
+                self._probe_requests -= 1
             if self._active_requests == 0:
                 self._condition.notify_all()
 
@@ -1058,12 +1066,12 @@ class ProfileCoordinator:
                 self._condition.notify_all()
 
     @contextmanager
-    def lease_active(self) -> Iterator[str]:
-        profile_id = self._acquire_active()
+    def lease_active(self, *, probe: bool = False) -> Iterator[str]:
+        profile_id = self._acquire_active(probe=probe)
         try:
             yield profile_id
         finally:
-            self._release()
+            self._release(probe=probe)
 
     def restore_when_idle(self, source_profile: str, target_profile: str) -> None:
         """Restore a transient source with the same bounded writer priority."""
@@ -2007,7 +2015,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not self._require_loopback():
                 return
             try:
-                with self.application.coordinator.lease_active():
+                with self.application.coordinator.lease_active(probe=True):
                     self._proxy_backend_get(path)
             except BrokerCoordinationError as error:
                 self._send_coordination_error(error)
