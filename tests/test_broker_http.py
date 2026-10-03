@@ -1181,6 +1181,98 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertFalse(any(stream.is_alive() for stream in streams))
         self.assertEqual(stream_errors, [])
 
+    def _post_large(self, headers: dict[str, str] | None = None) -> tuple[int, dict[str, object]]:
+        # Larger than the loopback socket buffers, so an unread body is still
+        # in flight when the broker answers.
+        payload = {
+            "model": "main",
+            "messages": [{"role": "user", "content": "x" * 900_000}],
+            "stream": True,
+        }
+        connection = http.client.HTTPConnection("127.0.0.1", self.broker.server_port, timeout=5)
+        try:
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps(payload),
+                headers={"Content-Type": "application/json", **(headers or {})},
+            )
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_rejection_before_body_read_is_delivered_not_reset(self) -> None:
+        status, payload = self._post_large()
+
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["type"], "authentication_error")  # type: ignore[index]
+
+    def test_saturated_broker_answers_large_requests_with_503_not_reset(self) -> None:
+        self._replace_broker(
+            max_workers=2,
+            control_workers=1,
+            drain_timeout=0.1,
+            transition_timeout=1,
+            stop_timeout=1,
+        )
+        auth = {"Authorization": f"Bearer {self.auth_key}"}
+
+        def held_stream() -> None:
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", self.broker.server_port, timeout=3
+            )
+            try:
+                connection.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body=json.dumps(
+                        {"model": "main", "messages": [], "stream": True, "_test_hold_stream": True}
+                    ),
+                    headers={"Content-Type": "application/json", **auth},
+                )
+                connection.getresponse().read()
+            finally:
+                connection.close()
+
+        streams = [threading.Thread(target=held_stream) for _ in range(2)]
+        for stream in streams:
+            stream.start()
+        self.assertTrue(
+            self.backend.hold_streams_entered.wait(timeout=1),  # type: ignore[attr-defined]
+            "both data workers should be occupied by held streams",
+        )
+
+        # Control lane: the handler refuses inference before reading the body.
+        status, payload = self._post_large(auth)
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["type"], "broker_overloaded")  # type: ignore[index]
+
+        # Occupy the only control worker with a client that never sends its
+        # request line, so the next connection is refused at accept time.
+        control_slots = self.broker._control_worker_slots  # type: ignore[attr-defined]
+
+        def wait_for_free_control_workers(expected: int) -> None:
+            deadline = time.monotonic() + 3
+            while control_slots._value != expected:  # type: ignore[attr-defined]
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.005)
+
+        wait_for_free_control_workers(1)
+        stalled = socket.create_connection(("127.0.0.1", self.broker.server_port))
+        try:
+            wait_for_free_control_workers(0)
+            status, payload = self._post_large(auth)
+        finally:
+            stalled.close()
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["type"], "broker_overloaded")  # type: ignore[index]
+        self.assertIn("capacity is exhausted", payload["error"]["message"])  # type: ignore[index]
+
+        self.backend.hold_stream_release.set()  # type: ignore[attr-defined]
+        for stream in streams:
+            stream.join(timeout=1)
+
     def test_health_uses_cached_state_while_controller_transition_lock_is_held(self) -> None:
         self._replace_broker(
             max_workers=2,
