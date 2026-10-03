@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import select
 import signal
 import socket
 import ssl
@@ -173,6 +174,9 @@ CONTROL_CLIENT_TIMEOUT = float(
         "2",
     )
 )
+# Bounds for draining request bodies the broker rejected without reading.
+REJECTED_BODY_DRAIN_TIMEOUT = 2.0
+REJECTION_DRAIN_WORKERS = 16
 DRAIN_TIMEOUT = float(
     _env_value("LLAMA_BROKER_DRAIN_TIMEOUT", "LLM_BROKER_DRAIN_TIMEOUT", "10")
 )
@@ -2776,9 +2780,74 @@ class _ClientDisconnectedError(Exception):
     """The downstream client went away while the broker was writing to it."""
 
 
+def _discard_until_eof(request: socket.socket, *, timeout: float, limit: int) -> None:
+    """Read and drop what the client is still sending, then return.
+
+    Closing a socket with unread bytes in its receive buffer makes the kernel
+    send a TCP RST, and the client sees "connection reset" instead of the
+    response that was already written. Callers drain first, bounded by time
+    and bytes, so a slow or hostile client cannot pin the thread.
+    """
+
+    deadline = time.monotonic() + timeout
+    drained = 0
+    try:
+        while drained < limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            readable, _, _ = select.select([request], [], [], remaining)
+            if not readable:
+                return
+            chunk = request.recv(min(65536, limit - drained))
+            if not chunk:
+                return
+            drained += len(chunk)
+    except (OSError, ValueError):
+        return
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "Llama-Broker/2.0"
+
+    def setup(self) -> None:
+        super().setup()
+        self._request_body_consumed = False
+
+    def finish(self) -> None:
+        # rfile is closed by super().finish(); the response is already on the
+        # wire because wfile is unbuffered.
+        try:
+            self._discard_unread_body()
+        finally:
+            super().finish()
+
+    def _discard_unread_body(self) -> None:
+        """Drain a request body that was rejected before it was read."""
+
+        if self._request_body_consumed:
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (AttributeError, ValueError):
+            return
+        remaining = min(length, self.application.max_body_bytes)
+        if remaining <= 0:
+            return
+        deadline = time.monotonic() + REJECTED_BODY_DRAIN_TIMEOUT
+        try:
+            while remaining > 0:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    return
+                self.connection.settimeout(budget)
+                chunk = self.rfile.read1(min(65536, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        except (OSError, ValueError):
+            return
 
     @property
     def application(self) -> BrokerApplication:
@@ -3345,6 +3414,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             raise ValueError(
                 f"request body exceeds broker limit {self.application.max_body_bytes} bytes"
             )
+        self._request_body_consumed = True
         body = self.rfile.read(length)
         if len(body) != length:
             raise ValueError("request body is incomplete")
@@ -3555,6 +3625,7 @@ class BrokerServer(ThreadingHTTPServer):
         self._data_worker_slots = threading.BoundedSemaphore(max_workers)
         self._control_worker_slots = threading.BoundedSemaphore(control_workers)
         self._control_client_timeout = control_client_timeout
+        self._rejection_drains = threading.BoundedSemaphore(REJECTION_DRAIN_WORKERS)
         self._request_lanes: dict[int, str] = {}
         self._request_lanes_lock = threading.Lock()
         self._request_context = threading.local()
@@ -3623,9 +3694,34 @@ class BrokerServer(ThreadingHTTPServer):
             request.settimeout(self._control_client_timeout)
             request.sendall(response)
         except OSError:
-            pass
-        finally:
             self.shutdown_request(request)
+            return
+        # The request body is still unread. Drain it off the accept thread so
+        # the client receives the 503 instead of a connection reset.
+        if not self._rejection_drains.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        threading.Thread(
+            target=self._drain_then_close,
+            args=(request,),
+            name="broker-reject-drain",
+            daemon=True,
+        ).start()
+
+    def _drain_then_close(self, request: socket.socket) -> None:
+        try:
+            try:
+                request.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            _discard_until_eof(
+                request,
+                timeout=self._control_client_timeout,
+                limit=self.application.max_body_bytes,
+            )
+            self.close_request(request)
+        finally:
+            self._rejection_drains.release()
 
     def server_close(self) -> None:
         try:
