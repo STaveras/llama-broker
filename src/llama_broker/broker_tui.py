@@ -365,6 +365,9 @@ _SPECULATIVE_COUNT_FIELDS = _SPECULATIVE_EDITOR_FIELDS - {"spec_type"}
 _MANAGED_SPECULATIVE_FLAGS = frozenset(
     ("--spec-type", "--draft-max", "--spec-draft-n-max", "--draft-min")
 )
+# Flags the editor derives from structured fields instead of letting them be
+# hand-edited inside the raw extra_args JSON.
+_MANAGED_FLAG_GROUPS = _MANAGED_SPECULATIVE_FLAGS | {"--reasoning"}
 
 
 def _extra_arg_value(extra_args: Any, flag: str) -> str:
@@ -403,6 +406,41 @@ def _without_managed_speculative_args(extra_args: Any) -> list[str]:
         result.append(token)
         index += 1
     return result
+
+
+def _without_managed_args(extra_args: Any) -> list[str]:
+    """Strip every flag group the editor derives from structured fields."""
+
+    if not isinstance(extra_args, list):
+        return []
+    result: list[str] = []
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token in _MANAGED_FLAG_GROUPS:
+            index += 1
+            if index < len(extra_args) and not extra_args[index].startswith("--"):
+                index += 1
+            continue
+        result.append(token)
+        index += 1
+    return result
+
+
+def _sync_reasoning_flag(
+    draft: dict[str, Any], extra_args: list[str], capabilities: list[str]
+) -> list[str]:
+    """Derive the --reasoning launch flag from the reasoning capability.
+
+    The flag is managed state: it is owned by the capability toggle, so the
+    user cannot enable the capability while leaving the launch argument off
+    (and vice versa).
+    """
+
+    enabled = "reasoning" in capabilities
+    return _replace_extra_arg(
+        extra_args, "--reasoning", "on" if enabled else None
+    )
 
 
 def _replace_extra_arg(
@@ -666,7 +704,7 @@ class TUIModel:
         if key in {"environment", "safety"}:
             return json.dumps(current.get(key, {}), sort_keys=True)
         if key == "extra_args":
-            return json.dumps(_without_managed_speculative_args(current.get(key, [])))
+            return json.dumps(_without_managed_args(current.get(key, [])))
         if key in _SPECULATIVE_FLAG_BY_FIELD:
             value = (
                 _draft_max_value(current.get("extra_args", []))
@@ -745,7 +783,13 @@ class TUIModel:
                     preserved.append(token)
                     if index + 1 < len(current_args) and not str(current_args[index + 1]).startswith("--"):
                         preserved.append(current_args[index + 1])
-            draft["extra_args"] = list(raw_args) + preserved
+            raw_args = _without_managed_args(raw_args)
+            capabilities = draft.get("capabilities", [])
+            draft["extra_args"] = _sync_reasoning_flag(
+                draft,
+                [*raw_args, *preserved],
+                capabilities if isinstance(capabilities, list) else [],
+            )
         elif key == "runtime_family":
             selected = self._family_for_value(value)
             if not selected or selected == "(custom/manual)":
@@ -818,6 +862,14 @@ class TUIModel:
                 }.get(key)
                 if hash_key:
                     draft[hash_key] = sha256_file(path)
+        elif key == "capabilities":
+            raw_caps = value if isinstance(value, (list, tuple, set, frozenset)) else str(value)
+            if isinstance(raw_caps, (list, tuple, set, frozenset)):
+                capabilities = [str(item).strip() for item in raw_caps if str(item).strip()]
+            else:
+                capabilities = [item.strip() for item in raw_caps.split(",") if item.strip()]
+            draft["capabilities"] = capabilities
+            draft["extra_args"] = _sync_reasoning_flag(draft, draft.get("extra_args", []), capabilities)
         elif key in SIMPLE_FIELDS:
             draft = apply_simple_fields(draft, {key: value})
             if key == "alias":
@@ -1164,7 +1216,11 @@ def _curses_checklist(
     import curses
 
     choices = list(options)
-    selected = {str(item) for item in (current or [])}
+    # Universal base capability: always present and non-removable, so the
+    # checklist cannot produce an invalid capabilities list (e.g. dropping
+    # "text").
+    locked = {"text"} if "text" in choices else set()
+    selected = {"text"} | {str(item) for item in (current or [])}
     cursor = 0
     while True:
         stdscr.erase()
@@ -1172,8 +1228,11 @@ def _curses_checklist(
         stdscr.addnstr(0, 0, f"{label} — choose values", max(width - 1, 1), curses.A_BOLD)
         stdscr.addnstr(1, 0, "↑/↓ move  Space toggle  Enter accept  Esc cancel", max(width - 1, 1))
         for row, choice in enumerate(choices, 3):
-            marker = "[x]" if choice in selected else "[ ]"
             attr = curses.A_REVERSE if row - 3 == cursor else 0
+            if choice in locked:
+                stdscr.addnstr(row, 2, f"[x] {choice} (always on)", max(width - 3, 1), curses.A_DIM | attr)
+                continue
+            marker = "[x]" if choice in selected else "[ ]"
             stdscr.addnstr(row, 2, f"{marker} {choice}", max(width - 3, 1), attr)
         key = _read_curses_key(stdscr)
         if key == 27:
@@ -1184,8 +1243,10 @@ def _curses_checklist(
             cursor = (cursor + 1) % len(choices)
         elif key == ord(" "):
             choice = choices[cursor]
+            if choice in locked:
+                continue
             if choice in selected:
-                selected.remove(choice)
+                selected.discard(choice)
             else:
                 selected.add(choice)
         elif key in (10, 13):
@@ -1470,6 +1531,8 @@ def run_tui(
     """Run a field-oriented full-screen profile editor (stdlib only)."""
 
     import curses
+    import threading
+    import time
 
     path = Path(profiles_path)
     manifest = load_manifest_source(path, allow_missing_artifacts=True)
@@ -1488,7 +1551,28 @@ def run_tui(
             pass
         stdscr.keypad(True)
         status = ""
+        apply_finished: threading.Event | None = None
+        apply_completion: dict[str, BaseException | None] = {}
+        pending_manifest: dict[str, Any] | None = None
+        apply_started_at = 0.0
         while True:
+            if apply_finished is not None and apply_finished.is_set():
+                error = apply_completion.get("error")
+                if error is not None:
+                    status = f"Cannot save: {error}"
+                else:
+                    assert pending_manifest is not None
+                    model.manifest = pending_manifest
+                    model.base_manifest = copy.deepcopy(pending_manifest)
+                    model.dirty = False
+                    status = "Applied successfully."
+                apply_finished = None
+                pending_manifest = None
+            if apply_finished is not None:
+                status = (
+                    f"Applying changes ({int(time.monotonic() - apply_started_at)}s); "
+                    "please wait."
+                )
             stdscr.erase()
             height, width = stdscr.getmaxyx()
             current = model.current
@@ -1525,8 +1609,16 @@ def run_tui(
 
             if status:
                 stdscr.addnstr(max(height - 3, 0), 0, status, max(width - 1, 1), curses.A_BOLD)
-            stdscr.addnstr(max(height - 2, 0), 0, "Enter opens a text box/dropdown; changes stay in memory until Save.", max(width - 1, 1))
+            footer = (
+                "Apply is running; wait here for its result."
+                if apply_finished is not None
+                else "Enter opens a text box/dropdown; changes stay in memory until Save."
+            )
+            stdscr.addnstr(max(height - 2, 0), 0, footer, max(width - 1, 1))
+            stdscr.timeout(250 if apply_finished is not None else -1)
             key = _read_curses_key(stdscr)
+            if apply_finished is not None:
+                continue
             if key in (ord("q"), 27):
                 if model.dirty:
                     if not _curses_confirm(stdscr, "Discard unsaved changes?", default=False):
@@ -1575,9 +1667,40 @@ def run_tui(
                         continue
                     if apply_callback is not None:
                         changed_ids = {str(current.get("id"))}
-                        apply_callback(merged, changed_ids)
-                    else:
-                        write_manifest_atomically(path, merged)
+                        finished_event = threading.Event()
+                        apply_finished = finished_event
+                        apply_completion = {}
+                        pending_manifest = merged
+                        apply_started_at = time.monotonic()
+
+                        def apply_in_background(
+                            callback: ApplyCallback = apply_callback,
+                            draft: dict[str, Any] = merged,
+                            ids: set[str] = changed_ids,
+                            completion: dict[str, BaseException | None] = apply_completion,
+                            finished: threading.Event = finished_event,
+                        ) -> None:
+                            try:
+                                callback(draft, ids)
+                            except BaseException as error:
+                                completion["error"] = error
+                            finally:
+                                finished.set()
+
+                        thread = threading.Thread(
+                            target=apply_in_background,
+                            name="llama-broker-profile-apply",
+                            daemon=False,
+                        )
+                        try:
+                            thread.start()
+                        except BaseException:
+                            apply_finished = None
+                            pending_manifest = None
+                            raise
+                        status = "Applying profile changes..."
+                        continue
+                    write_manifest_atomically(path, merged)
                     model.manifest = merged
                     model.base_manifest = copy.deepcopy(merged)
                     model.dirty = False

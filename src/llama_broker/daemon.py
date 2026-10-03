@@ -1287,7 +1287,10 @@ class ProfileCoordinator:
             target_profile = self._active_profile
             self._condition.notify_all()
         operation_name = "profile/catalog reload"
-        self._wait_for_transition_slot(operation_name)
+        # Reload swaps profile metadata and generated units without replacing
+        # the running backend, so in-flight requests can safely keep their
+        # existing profile snapshot while the new registry becomes active.
+        self._wait_for_transition_slot(operation_name, force_immediately=True)
         return self._run_transition(
             operation_name,
             lambda: action(commit_callback),
@@ -3078,7 +3081,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_coordination_error(error)
             return
         except BackendControllerError as error:
-            _log(f"[broker] profile switch failed for {profile.id}: {error}")
+            _log(
+                f"[broker] profile switch failed for {profile.id} "
+                f"(request {self._request_id()}): {error}"
+            )
             if not self.wfile.closed:
                 self._send_json(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -3091,7 +3097,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 )
             return
         except (OSError, TimeoutError, http.client.HTTPException) as error:
-            _log(f"[broker] backend proxy failure for {profile.id}: {error}")
+            _log(
+                f"[broker] backend proxy failure for {profile.id} "
+                f"(request {self._request_id()}): {error}"
+            )
             self.application.coordinator.invalidate_when_idle(profile.id)
             if self._proxy_response_started:
                 # The backend status line is already on the wire; appending a
@@ -3313,6 +3322,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         return True
 
     def _send_coordination_error(self, error: BrokerCoordinationError) -> None:
+        _log(
+            f"[broker] rejected {self.command} {urlsplit(self.path).path} "
+            f"(request {self._request_id()}, HTTP {error.http_status}): {error}"
+        )
         self._send_json(
             error.http_status,
             {"error": {"message": str(error), "type": error.error_type}},
@@ -3425,7 +3438,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         except _ClientDisconnectedError as error:
             # Client-side failures (including TLS EOF, which is an SSLError rather
             # than a ConnectionError) say nothing about backend health.
-            _log(f"[broker] client disconnected during {profile.id} response: {error}")
+            _log(
+                f"[broker] client disconnected during {profile.id} response "
+                f"(request {self._request_id()}): {error}"
+            )
         finally:
             if response is not None:
                 response.close()
@@ -3506,7 +3522,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._write_client(body)
         except (OSError, _ClientDisconnectedError) as error:
             # The backend call already finished; only the client side can fail here.
-            _log(f"[broker] client disconnected during backend GET {path}: {error}")
+            _log(
+                f"[broker] client disconnected during backend GET {path} "
+                f"(request {self._request_id()}): {error}"
+            )
         finally:
             client.close()
             self.close_connection = True

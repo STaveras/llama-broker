@@ -1076,10 +1076,15 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
 
     def test_live_profile_mutation_refreshes_broker_registry(self) -> None:
         output = io.StringIO()
-        admin = Mock(return_value={"status": "ok"})
+        admin = Mock(
+            return_value={"operation": {"request_id": "request-1", "status": "queued"}}
+        )
+        status = Mock(return_value={"operation": {"request_id": "request-1", "status": "succeeded"}})
         with (
             patch.object(brokerctl, "PROFILES_PATH", self.profiles),
             patch.object(brokerctl, "_broker_admin", admin),
+            patch.object(brokerctl, "_broker_admin_get", status),
+            patch.object(brokerctl.time, "sleep"),
             redirect_stdout(output),
         ):
             result = brokerctl.main(
@@ -1095,7 +1100,8 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/autotune/reload", {})
+        admin.assert_called_once_with("/admin/autotune/reload", {"wait": False})
+        status.assert_called_once_with("/admin/operations/request-1")
 
     def test_live_profile_mutation_rolls_back_if_registry_refresh_fails(self) -> None:
         before = self.profiles.read_bytes()
