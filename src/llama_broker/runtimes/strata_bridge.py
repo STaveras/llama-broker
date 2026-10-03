@@ -423,6 +423,8 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
         "--spec-min-p", "--mtp",
     }
     boolean_flags = {"--mmap-experts"}
+    # optional: parks the active conversation in RAM while another prompt runs (engine 0.1.29+)
+    optional_value_flags = {"--conversation-cache-mib"}
     if not isinstance(args, list) or not all(isinstance(arg, str) and arg for arg in args):
         raise StrataBridgeError("Strata engine_args must be a string list")
     seen: set[str] = set()
@@ -438,7 +440,7 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
             seen.add(flag)
             index += 1
             continue
-        if flag not in value_flags or flag in seen or index + 1 >= len(args):
+        if flag not in value_flags | optional_value_flags or flag in seen or index + 1 >= len(args):
             raise StrataBridgeError("Strata engine_args contain an unsupported or duplicate flag")
         value = args[index + 1]
         if value.startswith("--"):
@@ -454,6 +456,8 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
             raise StrataBridgeError("Strata profile must pin the supported four-token MTP window")
         elif flag == "--spec-min-p" and value != "0.5":
             raise StrataBridgeError("Strata profile must pin the supported MTP acceptance threshold")
+        elif flag == "--conversation-cache-mib" and not value.isdecimal():
+            raise StrataBridgeError("Strata conversation cache size must be a whole number of MiB")
         elif flag == "--kv-resident" and (
             not value.isdecimal() or int(value) < STRATA_MIN_KV_RESIDENT_CELLS
         ):
@@ -462,7 +466,7 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
             )
         index += 2
     required_flags = value_flags
-    if not required_flags.issubset(seen) or seen - required_flags - boolean_flags:
+    if not required_flags.issubset(seen) or seen - required_flags - boolean_flags - optional_value_flags:
         raise StrataBridgeError("Strata engine_args are missing required controls")
     if expert_profile is None:
         raise StrataBridgeError("Strata engine_args are missing the expert profile")

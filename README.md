@@ -205,7 +205,7 @@ deleted automatically.
 - `broker_security.py` — TLS material and API-key lifecycle.
 - `runtimes/` — runtime adapters (llamacpp, vllm, strata).
 - `configure/` — per-tool provider configuration (Hermes, Codex, Claude Code,
-  OpenCode, OpenClaw).
+  OpenCode, OpenClaw, Pi Coding Agent).
 
 The administrative interface is `brokerctl`; `manage-services.sh` is a
 compatibility shim. Profile switching must go through the broker's drain

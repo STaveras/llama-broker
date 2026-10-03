@@ -141,6 +141,25 @@ class CoordinatorShutdownTests(unittest.TestCase):
             with coordinator.lease_active():
                 self.fail("lease entered after control-plane handoff")
 
+    def test_slot_probe_lease_does_not_count_as_inference(self) -> None:
+        coordinator = ProfileCoordinator(
+            "main",
+            lambda _profile: None,
+            lambda: None,
+            drain_timeout=0.1,
+            transition_timeout=0.1,
+        )
+
+        with coordinator.lease("main"):
+            with coordinator.lease_active(probe=True):
+                snapshot = coordinator.snapshot()
+                self.assertEqual(snapshot["active_requests"], 2)
+                self.assertEqual(snapshot["inference_requests"], 1)
+
+        snapshot = coordinator.snapshot()
+        self.assertEqual(snapshot["active_requests"], 0)
+        self.assertEqual(snapshot["inference_requests"], 0)
+
     def test_shutdown_gate_rejects_new_requests_and_transitions(self) -> None:
         stop_entered = threading.Event()
         stop_release = threading.Event()

@@ -59,7 +59,7 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("runtime_family", "Runtime family", "select"),
     EditorField("runtime_build", "Backend build", "select"),
     EditorField("runtime", "Serving runtime", "select", options=runtime_names()),
-    EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools")),
+    EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools", "reasoning")),
     EditorField("context_size", "Context size", "int"),
     EditorField("parallel", "Parallel slots", "select", options=("1", "2")),
     EditorField("batch_size", "Batch size", "int"),

@@ -34,7 +34,7 @@ from .runtime_builds import (
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 ALLOWED_ROLES = frozenset({"persistent", "transient"})
-ALLOWED_CAPABILITIES = frozenset({"text", "vision", "tools"})
+ALLOWED_CAPABILITIES = frozenset({"text", "vision", "tools", "reasoning"})
 ALLOWED_CACHE_TYPES = frozenset(
     {"f16", "f32", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "turbo4", "kvarn4"}
 )
@@ -66,7 +66,7 @@ MAX_ADMISSION_SWAP_GROWTH_MIB = 128
 MIN_ADMISSION_TOTAL_VRAM_MIB = 12_000
 MIN_ADMISSION_FREE_VRAM_MIB = 8_192
 FLAG_ONLY_EXTRA_ARGS = frozenset({"--no-warmup", "--jinja"})
-ALLOWED_REASONING_MODES = frozenset({"off"})
+ALLOWED_REASONING_MODES = frozenset({"off", "on", "auto"})
 ALLOWED_SPECULATIVE_TYPES = frozenset({"mtp", "draft-mtp", "nextn"})
 SPECULATIVE_COUNT_FLAGS = frozenset(
     {"--draft-max", "--spec-draft-n-max", "--draft-min"}
@@ -240,7 +240,7 @@ def _parse_vllm_extra_args(
             )
         seen_flags.add(flag)
         index += 2
-    return args, frozenset()
+    return args, frozenset(), None
 
 
 def _parse_extra_args(
@@ -259,11 +259,12 @@ def _parse_extra_args(
     if runtime == "strata":
         if args:
             raise ProfileError(f"Strata profiles do not accept extra_args for {profile_id!r}")
-        return (), frozenset()
+        return (), frozenset(), None
     if runtime == "vllm":
         return _parse_vllm_extra_args(args, profile_id)
 
     speculative_types: set[str] = set()
+    reasoning_mode: str | None = None
     seen_flags: set[str] = set()
     i = 0
     while i < len(args):
@@ -315,6 +316,7 @@ def _parse_extra_args(
                     f"extra_args flag {flag} for {profile_id!r} has unsupported "
                     f"value {value!r}"
                 )
+            reasoning_mode = value
         elif flag == "--spec-type":
             requested = tuple(part.strip() for part in value.split(","))
             if (
@@ -340,7 +342,7 @@ def _parse_extra_args(
                 )
         i += 2
 
-    return args, frozenset(speculative_types)
+    return args, frozenset(speculative_types), reasoning_mode
 
 
 def _absolute_existing_path(
@@ -1342,6 +1344,8 @@ def _parse_strata_artifacts(
     }
     seen: set[str] = set()
     boolean_flags = {"--mmap-experts"}
+    # optional: RAM (MiB) for parking the active conversation while another prompt runs
+    optional_value_flags = {"--conversation-cache-mib"}
     uses_mmap_experts = False
     index = 0
     while index < len(raw_args):
@@ -1353,7 +1357,7 @@ def _parse_strata_artifacts(
             uses_mmap_experts = True
             index += 1
             continue
-        if flag not in {*allowed_values, "--kv-resident", "--expert-profile"} or flag in seen:
+        if flag not in {*allowed_values, "--kv-resident", "--expert-profile", *optional_value_flags} or flag in seen:
             raise ProfileError(f"unsupported or duplicate Strata engine argument for {profile_id!r}: {flag}")
         if index + 1 >= len(raw_args) or raw_args[index + 1].startswith("--"):
             raise ProfileError(f"Strata engine argument requires a value for {profile_id!r}: {flag}")
@@ -1364,6 +1368,9 @@ def _parse_strata_artifacts(
                     f"Strata KV streaming requires at least "
                     f"{MIN_STRATA_KV_RESIDENT_CELLS} resident cells for {profile_id!r}"
                 )
+        elif flag == "--conversation-cache-mib":
+            if not value.isdecimal() or not 0 < int(value) <= 16384:
+                raise ProfileError(f"Strata conversation cache must be 1-16384 MiB for {profile_id!r}")
         elif flag in allowed_values and value != allowed_values[flag]:
             raise ProfileError(f"Strata engine argument does not match pinned profile data for {profile_id!r}: {flag}")
         if flag == "--expert-profile":
@@ -1379,7 +1386,11 @@ def _parse_strata_artifacts(
         seen.add(flag)
         index += 2
     required_flags = {*allowed_values, "--kv-resident", "--expert-profile"}
-    if not required_flags.issubset(seen) or seen - required_flags - boolean_flags or expert_profile_path is None:
+    if (
+        not required_flags.issubset(seen)
+        or seen - required_flags - boolean_flags - optional_value_flags
+        or expert_profile_path is None
+    ):
         raise ProfileError(f"Strata engine_args are missing required controls for {profile_id!r}")
     if uses_mmap_experts and f"{pack.get('path')}/experts.bin" not in observed_pack_files:
         raise ProfileError(f"Strata mmap-experts mode requires the pack's experts.bin for {profile_id!r}")
@@ -1898,12 +1909,22 @@ def _parse_profile(
         )
         warnings.extend(cache_warnings)
         degraded_features.extend(cache_degraded)
-    extra_args, speculative_types = _parse_extra_args(
+    extra_args, speculative_types, reasoning_mode = _parse_extra_args(
         effective_raw_extra_args,
         profile_id,
         runtime=runtime,
         moe_cache_slots_limit=moe_cache_slots_limit,
     )
+    if "reasoning" in capabilities:
+        if reasoning_mode in (None, "off"):
+            raise ProfileError(
+                f"reasoning capability for {profile_id!r} requires "
+                f"--reasoning enabled in extra_args"
+            )
+    elif reasoning_mode is not None and reasoning_mode != "off":
+        # The launch config asserts the model produces reasoning output;
+        # the broker propagates that into the effective capabilities.
+        capabilities = capabilities | {"reasoning"}
     safety = _parse_safety(record, profile_id, runtime=runtime)
     strata_metadata: dict[str, Any] = {}
     if runtime == "strata":

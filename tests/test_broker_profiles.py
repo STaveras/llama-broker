@@ -771,6 +771,52 @@ class ProfileRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "extra_args"):
             ProfileRegistry.from_path(self._write([profile]))
 
+    def test_reasoning_launch_flag_adds_effective_capability(self) -> None:
+        for mode in ("on", "auto"):
+            profile = self._profile(
+                "main",
+                "main-27b",
+                self.main_model,
+                extra_args=["--no-warmup", "--reasoning", mode],
+            )
+            parsed = ProfileRegistry.from_path(self._write([profile])).get("main")
+            self.assertEqual(parsed.capabilities, frozenset({"text", "reasoning"}))
+
+    def test_reasoning_off_flag_keeps_capability_unadded(self) -> None:
+        profile = self._profile(
+            "main",
+            "main-27b",
+            self.main_model,
+            extra_args=["--no-warmup", "--reasoning", "off"],
+        )
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("main")
+        self.assertEqual(parsed.capabilities, frozenset({"text"}))
+
+    def test_reasoning_capability_requires_enabled_launch_flag(self) -> None:
+        for extra_args in (
+            ["--no-warmup", "--reasoning", "off"],
+            ["--no-warmup"],
+        ):
+            profile = self._profile(
+                "main",
+                "main-27b",
+                self.main_model,
+                capabilities=["text", "reasoning"],
+                extra_args=extra_args,
+            )
+            with self.assertRaisesRegex(ProfileError, "reasoning capability"):
+                ProfileRegistry.from_path(self._write([profile]))
+
+    def test_unsupported_reasoning_mode_is_rejected(self) -> None:
+        profile = self._profile(
+            "main",
+            "main-27b",
+            self.main_model,
+            extra_args=["--no-warmup", "--reasoning", "2"],
+        )
+        with self.assertRaisesRegex(ProfileError, "unsupported"):
+            ProfileRegistry.from_path(self._write([profile]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3927,12 +3927,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Context:   {profile.context_size:,} tokens total; {profile.context_size // profile.parallel:,} per slot")
                     leases = live_state.get("leases")
                     leases = leases if isinstance(leases, dict) else {}
-                    active = int(leases.get("active_requests", 0) or 0)
+                    # Leases count in-flight broker requests, not backend slots:
+                    # /slots and /props probes hold a lease, and requests beyond
+                    # the profile's parallel limit wait in the backend's queue.
+                    active = int(leases.get("inference_requests", leases.get("active_requests", 0)) or 0)
                     pending = int(leases.get("pending_requests", 0) or 0)
                     pending_transitions = int(leases.get("queued_transitions", 0) or 0)
-                    utilisation = min(active / profile.parallel, 1.0) if profile.parallel else 0.0
-                    print(f"Requests:  active={active} pending={pending} (pending transitions={pending_transitions})")
-                    print(f"Slots:     {active}/{profile.parallel} in use ({utilisation:.0%})")
+                    slots = max(int(profile.parallel or 0), 0)
+                    in_use = min(active, slots)
+                    pending += active - in_use
+                    utilisation = in_use / slots if slots else 0.0
+                    print(f"Requests:  active={in_use} pending={pending} (pending transitions={pending_transitions})")
+                    print(f"Slots:     {in_use}/{slots} in use ({utilisation:.0%})")
                     if runtime_configuration_pending:
                         print("Runtime configuration pending")
                 else:

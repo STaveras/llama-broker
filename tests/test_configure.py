@@ -19,7 +19,8 @@ from llama_broker.configure.codex import CodexProvider
 from llama_broker.configure.hermes import HermesProvider
 from llama_broker.configure.openclaw import OpenClawProvider
 from llama_broker.configure.opencode import OpenCodeProvider
-from llama_broker.configure.registry import ToolRegistry
+from llama_broker.configure.pi import PiProvider
+from llama_broker.configure.registry import ToolProfile, ToolRegistry
 
 
 class ConfigureSafetyTests(unittest.TestCase):
@@ -439,5 +440,190 @@ class ConfigureSafetyTests(unittest.TestCase):
             self.assertIn('model = "fixture-text-7b"', content)
 
 
+
+    def test_pi_setup_writes_broker_provider_into_models_json(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        registry = ToolRegistry(
+            broker_url="https://127.0.0.1:11434/v1",
+            profiles_path=str(root / "tests" / "fixtures" / "profiles.fixture.json"),
+            api_key="[REDACTED]",
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            agent_dir = Path(tempdir) / "agent"
+            agent_dir.mkdir(parents=True)
+            with (
+                patch("llama_broker.configure.pi.PI_AGENT_DIR", agent_dir),
+                patch("llama_broker.configure.pi.PI_MODELS_CONFIG", agent_dir / "models.json"),
+                patch("llama_broker.configure.pi.PI_SETTINGS_CONFIG", agent_dir / "settings.json"),
+            ):
+                result = PiProvider().configure(registry)
+
+            self.assertTrue(result.written)
+            data = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
+            provider = data["providers"]["llamacpp"]
+            self.assertEqual(provider["baseUrl"], "https://127.0.0.1:11434/v1")
+            self.assertEqual(provider["api"], "openai-completions")
+            self.assertEqual(provider["apiKey"], "[REDACTED]")
+            self.assertEqual(
+                [m["id"] for m in provider["models"]],
+                ["fixture-text-7b", "fixture-vision-12b"],
+            )
+            model_entry = provider["models"][0]
+            self.assertEqual(model_entry["contextWindow"], 32768)
+            self.assertEqual(model_entry["maxOutputTokens"], 32768)
+            self.assertNotIn("reasoning", model_entry)
+            # A fresh install must not be pointed at the broker by default.
+            self.assertFalse((agent_dir / "settings.json").exists())
+
+    def test_pi_setup_is_idempotent_and_keeps_other_providers(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        registry = ToolRegistry(
+            broker_url="https://127.0.0.1:11434/v1",
+            profiles_path=str(root / "tests" / "fixtures" / "profiles.fixture.json"),
+            api_key="[REDACTED]",
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            agent_dir = Path(tempdir) / "agent"
+            agent_dir.mkdir(parents=True)
+            models_path = agent_dir / "models.json"
+            models_path.write_text(
+                json.dumps(
+                    {
+                        "providers": {
+                            "anthropic": {
+                                "baseUrl": "https://example.invalid/v1",
+                                "models": [{"id": "claude-sonnet-5"}],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch("llama_broker.configure.pi.PI_AGENT_DIR", agent_dir),
+                patch("llama_broker.configure.pi.PI_MODELS_CONFIG", models_path),
+                patch("llama_broker.configure.pi.PI_SETTINGS_CONFIG", agent_dir / "settings.json"),
+            ):
+                first = PiProvider().configure(registry)
+                second = PiProvider().configure(registry)
+
+            self.assertTrue(first.written)
+            self.assertFalse(second.written)
+            data = json.loads(models_path.read_text(encoding="utf-8"))
+            self.assertIn("anthropic", data["providers"])
+            self.assertIn("llamacpp", data["providers"])
+
+    def test_pi_setup_removes_unavailable_models_and_updates_stale_url(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        registry = ToolRegistry(
+            broker_url="https://127.0.0.1:11434/v1",
+            profiles_path=str(root / "tests" / "fixtures" / "profiles.fixture.json"),
+            api_key="[REDACTED]",
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            agent_dir = Path(tempdir) / "agent"
+            agent_dir.mkdir(parents=True)
+            models_path = agent_dir / "models.json"
+            models_path.write_text(
+                json.dumps(
+                    {
+                        "providers": {
+                            "llamacpp": {
+                                "baseUrl": "http://127.0.0.1:9999/v1",
+                                "api": "openai-completions",
+                                "models": [{"id": "obsolete-alias"}],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch("llama_broker.configure.pi.PI_AGENT_DIR", agent_dir),
+                patch("llama_broker.configure.pi.PI_MODELS_CONFIG", models_path),
+                patch("llama_broker.configure.pi.PI_SETTINGS_CONFIG", agent_dir / "settings.json"),
+            ):
+                result = PiProvider().configure(registry)
+
+            data = json.loads(models_path.read_text(encoding="utf-8"))
+            provider = data["providers"]["llamacpp"]
+            self.assertEqual(provider["baseUrl"], "https://127.0.0.1:11434/v1")
+            self.assertEqual(
+                [m["id"] for m in provider["models"]],
+                ["fixture-text-7b", "fixture-vision-12b"],
+            )
+            self.assertIn("Removed unavailable model: obsolete-alias", result.details)
+            self.assertIn("baseUrl: http://127.0.0.1:9999/v1 -> https://127.0.0.1:11434/v1", result.details)
+
+    def test_pi_set_default_explicitly_selects_broker_model(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        registry = ToolRegistry(
+            broker_url="https://127.0.0.1:11434/v1",
+            profiles_path=str(root / "tests" / "fixtures" / "profiles.fixture.json"),
+            api_key="[REDACTED]",
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            agent_dir = Path(tempdir) / "agent"
+            agent_dir.mkdir(parents=True)
+            settings_path = agent_dir / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "defaultProvider": "anthropic",
+                        "defaultModel": "anthropic/claude-sonnet-5",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch("llama_broker.configure.pi.PI_AGENT_DIR", agent_dir),
+                patch("llama_broker.configure.pi.PI_MODELS_CONFIG", agent_dir / "models.json"),
+                patch("llama_broker.configure.pi.PI_SETTINGS_CONFIG", settings_path),
+            ):
+                result = PiProvider().configure(registry, model="fixture-text-7b")
+
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(settings["defaultProvider"], "llamacpp")
+            self.assertEqual(settings["defaultModel"], "llamacpp/fixture-text-7b")
+            self.assertEqual(result.path, str(agent_dir / "models.json"))
+
+    def test_pi_skips_when_pi_is_not_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            agent_dir = Path(tempdir) / "not-installed" / "agent"
+            with (
+                patch("llama_broker.configure.pi.PI_AGENT_DIR", agent_dir),
+                patch("llama_broker.configure.pi.PI_MODELS_CONFIG", agent_dir / "models.json"),
+                patch("llama_broker.configure.pi.PI_SETTINGS_CONFIG", agent_dir / "settings.json"),
+            ):
+                result = PiProvider().configure(
+                    ToolRegistry(
+                        broker_url="http://127.0.0.1:11434/v1",
+                        profiles_path=str(
+                            Path(__file__).resolve().parents[1]
+                            / "tests" / "fixtures" / "profiles.fixture.json"
+                        ),
+                        api_key="[REDACTED]",
+                    )
+                )
+            self.assertTrue(result.skipped)
+            self.assertFalse((agent_dir / "models.json").exists())
+
+    def test_pi_model_entry_declares_reasoning_when_capability_is_present(self) -> None:
+        profile = ToolProfile.from_broker(
+            {
+                "alias": "reasoning-27b",
+                "display_name": "Reasoning 27B",
+                "context_size": 65536,
+                "parallel": 2,
+                "capabilities": ["text", "reasoning"],
+            }
+        )
+        entry = PiProvider._model_entry(profile, 32768)
+        self.assertTrue(entry["reasoning"])
+        self.assertEqual(
+            entry["thinkingLevelMap"],
+            {"minimal": "minimal", "low": "low", "medium": "medium", "high": "high"},
+        )
+        self.assertEqual(entry["contextWindow"], 32768)
 if __name__ == "__main__":
     unittest.main()

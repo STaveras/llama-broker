@@ -14,8 +14,8 @@ from pathlib import Path
 from .registry import BROKER_URL, ToolRegistry
 
 # Lazy-import providers to avoid import errors when only some are needed
-ALL_TOOLS = ["hermes", "opencode", "claude-code", "codex", "openclaw"]
-DEFAULT_TOOLS = ["hermes", "opencode", "claude-code", "openclaw"]
+ALL_TOOLS = ["hermes", "opencode", "claude-code", "codex", "openclaw", "pi"]
+DEFAULT_TOOLS = ["hermes", "opencode", "claude-code", "openclaw", "pi"]
 
 
 def _select_tools(requested: list[str]) -> list[str]:
@@ -79,6 +79,9 @@ def _get_provider(name: str):
     elif name == "openclaw":
         from .openclaw import OpenClawProvider
         return OpenClawProvider()
+    elif name == "pi":
+        from .pi import PiProvider
+        return PiProvider()
     else:
         raise ValueError(f"Unknown tool: {name}")
 

@@ -570,15 +570,16 @@ def apply_reasoning_policy(
         ):
             levels = ("minimal", "low", "medium", "high", "extra high", "max")
             index = levels.index(effort)
-            low_budget = max(1, budget_limit // ubatch_size)
             if effort == "minimal":
+                # 1-batch anchor: a full batch of thinking.
                 budget = min(batch_size, budget_limit)
-            elif effort == "low":
-                budget = low_budget
             elif effort == "max":
                 budget = budget_limit
             else:
-                budget = min(budget_limit, low_budget * (2 ** (index + 1)))
+                # Each effort index n reserves n ubatch-sized chunks of the
+                # per-slot budget: n * budget_limit / ubatch_size.  Stays
+                # strictly below max for any positive ubatch_size.
+                budget = min(budget_limit, index * budget_limit // ubatch_size)
             rewritten["thinking_budget_tokens"] = max(1, budget)
         rewritten["reasoning_effort"] = effort
     else:
@@ -768,6 +769,9 @@ class ProfileCoordinator:
         self._transition_timeout = transition_timeout
         self._stop_timeout = stop_timeout
         self._active_requests = 0
+        # Leases held by /slots and /props probes. They block transitions like
+        # any other lease but never occupy a backend slot.
+        self._probe_requests = 0
         self._queued_transitions = 0
         self._external_queued_transitions = 0
         self._transitioning = False
@@ -812,6 +816,7 @@ class ProfileCoordinator:
             return {
                 "profile": self._active_profile,
                 "active_requests": self._active_requests,
+                "inference_requests": self._active_requests - self._probe_requests,
                 "quiescing": self._quiescing_unlocked(),
                 "transitioning": self._transitioning,
                 "queued_transitions": self._queued_transitions + self._external_queued_transitions,
@@ -1124,20 +1129,24 @@ class ProfileCoordinator:
             raise
         return temporary_restore
 
-    def _acquire_active(self) -> str:
+    def _acquire_active(self, *, probe: bool = False) -> str:
         with self._condition:
             if self._quiescing_unlocked():
                 raise self._quiescing_error_unlocked()
             if self._active_profile is None:
                 raise BrokerQuiescingError("private backend has no active profile")
             self._active_requests += 1
+            if probe:
+                self._probe_requests += 1
             return self._active_profile
 
-    def _release(self) -> None:
+    def _release(self, *, probe: bool = False) -> None:
         with self._condition:
             if self._active_requests <= 0:
                 raise RuntimeError("profile lease underflow")
             self._active_requests -= 1
+            if probe:
+                self._probe_requests -= 1
             if self._active_requests == 0:
                 self._condition.notify_all()
 
@@ -1173,12 +1182,12 @@ class ProfileCoordinator:
                 self._condition.notify_all()
 
     @contextmanager
-    def lease_active(self) -> Iterator[str]:
-        profile_id = self._acquire_active()
+    def lease_active(self, *, probe: bool = False) -> Iterator[str]:
+        profile_id = self._acquire_active(probe=probe)
         try:
             yield profile_id
         finally:
-            self._release()
+            self._release(probe=probe)
 
     def restore_when_idle(self, source_profile: str, target_profile: str) -> None:
         """Restore a transient source with the same bounded writer priority."""
@@ -2760,6 +2769,10 @@ def _json_bytes(payload: Mapping[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+class _ClientDisconnectedError(Exception):
+    """The downstream client went away while the broker was writing to it."""
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "Llama-Broker/2.0"
@@ -2900,7 +2913,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             if not self._require_loopback():
                 return
             try:
-                with self.application.coordinator.lease_active():
+                with self.application.coordinator.lease_active(probe=True):
                     self._proxy_backend_get(path)
             except BrokerCoordinationError as error:
                 self._send_coordination_error(error)
@@ -3055,6 +3068,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
 
+        self._proxy_response_started = False
         try:
             with self.application.coordinator.lease(
                 profile.id, transient=profile.is_transient
@@ -3079,6 +3093,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         except (OSError, TimeoutError, http.client.HTTPException) as error:
             _log(f"[broker] backend proxy failure for {profile.id}: {error}")
             self.application.coordinator.invalidate_when_idle(profile.id)
+            if self._proxy_response_started:
+                # The backend status line is already on the wire; appending a
+                # JSON error would corrupt the response. Closing ends it.
+                return
             try:
                 self._send_json(
                     HTTPStatus.BAD_GATEWAY,
@@ -3089,7 +3107,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         }
                     },
                 )
-            except (BrokenPipeError, ConnectionError):
+            except OSError:
                 pass
             return
 
@@ -3364,7 +3382,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             ca_file=self.application.security.backend_tls_ca_file,
         )
         response: http.client.HTTPResponse | None = None
-        response_started = False
+        self._proxy_response_started = False
         try:
             connection.request(
                 self.command,
@@ -3387,8 +3405,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self.send_header("X-Llama-Broker-Profile", profile.id)
             self.send_header("X-Request-ID", self._request_id())
             self.send_header("Connection", "close")
-            self.end_headers()
-            response_started = True
+            try:
+                self.end_headers()
+            except OSError as error:
+                raise _ClientDisconnectedError(str(error)) from error
+            self._proxy_response_started = True
 
             if streaming:
                 reader = getattr(response, "read1", response.read)
@@ -3396,22 +3417,27 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     chunk = reader(8192)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                    self._write_client(chunk)
             else:
                 data = response.read()
                 if data:
-                    self.wfile.write(data)
-                    self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError) as error:
-            if not response_started:
-                raise ConnectionError(str(error)) from error
+                    self._write_client(data)
+        except _ClientDisconnectedError as error:
+            # Client-side failures (including TLS EOF, which is an SSLError rather
+            # than a ConnectionError) say nothing about backend health.
             _log(f"[broker] client disconnected during {profile.id} response: {error}")
         finally:
             if response is not None:
                 response.close()
             connection.close()
             self.close_connection = True
+
+    def _write_client(self, data: bytes) -> None:
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except OSError as error:
+            raise _ClientDisconnectedError(str(error)) from error
 
     def _model_not_found(self, alias: str, *, message: str | None = None) -> None:
         self._send_json(
@@ -3459,24 +3485,28 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def _proxy_backend_get(self, path: str) -> None:
         client = self.application.backend_client()
         try:
-            status, content_type, body = client.get_raw(
-                path,
-                headers=self._request_headers(b""),
-            )
+            try:
+                status, content_type, body = client.get_raw(
+                    path,
+                    headers=self._request_headers(b""),
+                )
+            except (OSError, http.client.HTTPException) as e:
+                _log(f"[broker] backend proxy GET {path} failed: {e}")
+                self._send_json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": {"message": "backend unavailable", "type": "broker_proxy_error"}},
+                )
+                return
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
             self.end_headers()
             if body:
-                self.wfile.write(body)
-                self.wfile.flush()
-        except (OSError, http.client.HTTPException) as e:
-            _log(f"[broker] backend proxy GET {path} failed: {e}")
-            self._send_json(
-                HTTPStatus.BAD_GATEWAY,
-                {"error": {"message": "backend unavailable", "type": "broker_proxy_error"}},
-            )
+                self._write_client(body)
+        except (OSError, _ClientDisconnectedError) as error:
+            # The backend call already finished; only the client side can fail here.
+            _log(f"[broker] client disconnected during backend GET {path}: {error}")
         finally:
             client.close()
             self.close_connection = True

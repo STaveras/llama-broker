@@ -3,6 +3,8 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import ssl
+import struct
 import tempfile
 import threading
 import time
@@ -121,6 +123,21 @@ class BackendHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            self.close_connection = True
+            return
+        if payload and payload.get("_test_reset_stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'data: {"token":"partial"}\n\n')
+            self.wfile.flush()
+            self.server.reset_stream_release.wait(timeout=5)  # type: ignore[attr-defined]
+            # SO_LINGER 0 turns close() into a TCP RST, like a crashed backend.
+            self.connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+            )
+            self.connection.close()
             self.close_connection = True
             return
 
@@ -253,6 +270,7 @@ class BrokerHttpTests(unittest.TestCase):
         self.backend.hold_stream_count = 0  # type: ignore[attr-defined]
         self.backend.hold_streams_entered = threading.Event()  # type: ignore[attr-defined]
         self.backend.hold_stream_release = threading.Event()  # type: ignore[attr-defined]
+        self.backend.reset_stream_release = threading.Event()  # type: ignore[attr-defined]
         self.backend_thread = threading.Thread(target=self.backend.serve_forever, daemon=True)
         self.backend_thread.start()
 
@@ -281,6 +299,7 @@ class BrokerHttpTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.backend.hold_stream_release.set()  # type: ignore[attr-defined]
+        self.backend.reset_stream_release.set()  # type: ignore[attr-defined]
         self.broker.shutdown()
         self.broker.server_close()
         self.backend.shutdown()
@@ -647,7 +666,7 @@ class BrokerHttpTests(unittest.TestCase):
             forwarded["chat_template_kwargs"], {"enable_thinking": True}
         )
         self.assertEqual(forwarded["reasoning_effort"], "high")
-        self.assertEqual(forwarded["thinking_budget_tokens"], 16384)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 3072)
 
     def test_experimental_effort_uses_request_max_and_profile_ubatch(self) -> None:
         status, _ = self._post(
@@ -662,7 +681,7 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         forwarded = self.backend.seen_payloads[-1]  # type: ignore[attr-defined]
         self.assertEqual(forwarded["max_tokens"], 8192)
-        self.assertEqual(forwarded["thinking_budget_tokens"], 2048)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 384)
 
     def test_llamacpp_reasoning_policy_defaults_off_in_forwarded_payload(self) -> None:
         status, _ = self._post(
@@ -1384,6 +1403,109 @@ class BrokerHttpTests(unittest.TestCase):
                 self.fail("dead backend retained an active request lease")
         application.coordinator.stop_when_idle()
         self.assertIsNone(application._recovery_profile)
+
+    def _open_chat(self, payload: dict[str, object]) -> http.client.HTTPConnection:
+        connection = http.client.HTTPConnection("127.0.0.1", self.broker.server_port, timeout=5)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps(payload),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.auth_key}",
+            },
+        )
+        return connection
+
+    def test_client_tls_eof_mid_response_is_a_disconnect_not_a_backend_failure(self) -> None:
+        class TlsEofAfterHeaders:
+            """Lets the status line through, then fails like a vanished TLS peer."""
+
+            def __init__(self, inner: object) -> None:
+                self.inner = inner
+                self.writes = 0
+
+            def write(self, data: bytes) -> int:
+                self.writes += 1
+                if self.writes > 1:
+                    raise ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+                return self.inner.write(data)  # type: ignore[attr-defined]
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.inner.close()  # type: ignore[attr-defined]
+
+            @property
+            def closed(self) -> bool:
+                return self.inner.closed  # type: ignore[attr-defined]
+
+        original_setup = llama_broker.BrokerHandler.setup
+
+        def setup(handler: llama_broker.BrokerHandler) -> None:
+            original_setup(handler)
+            handler.wfile = TlsEofAfterHeaders(handler.wfile)  # type: ignore[assignment]
+
+        coordinator = self.broker.application.coordinator
+        with (
+            patch.object(llama_broker.BrokerHandler, "setup", setup),
+            patch.object(
+                coordinator,
+                "invalidate_when_idle",
+                wraps=coordinator.invalidate_when_idle,
+            ) as invalidate,
+            patch.object(self.broker, "handle_error") as handle_error,
+            patch.object(llama_broker, "_log") as log,
+        ):
+            connection = self._open_chat({"model": "main", "messages": []})
+            try:
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                with self.assertRaises(http.client.IncompleteRead):
+                    response.read()
+            finally:
+                connection.close()
+
+        invalidate.assert_not_called()
+        handle_error.assert_not_called()
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(
+            any("client disconnected during main response" in m for m in messages),
+            messages,
+        )
+        self.assertFalse(any("backend proxy failure" in m for m in messages), messages)
+        self.assertEqual(coordinator.active_profile, "main")
+
+    def test_backend_reset_mid_stream_does_not_append_json_error(self) -> None:
+        coordinator = self.broker.application.coordinator
+        with (
+            patch.object(
+                coordinator,
+                "invalidate_when_idle",
+                wraps=coordinator.invalidate_when_idle,
+            ) as invalidate,
+            patch.object(self.broker, "handle_error") as handle_error,
+            patch.object(llama_broker, "_log") as log,
+        ):
+            connection = self._open_chat(
+                {"model": "main", "messages": [], "stream": True, "_test_reset_stream": True}
+            )
+            try:
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                first = response.readline()
+                self.backend.reset_stream_release.set()  # type: ignore[attr-defined]
+                rest = response.read()
+            finally:
+                connection.close()
+
+        self.assertIn(b"partial", first)
+        self.assertNotIn(b"broker_proxy_error", rest)
+        invalidate.assert_called_once_with("main")
+        handle_error.assert_not_called()
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(any("backend proxy failure for main" in m for m in messages), messages)
 
     def test_saturated_streams_cannot_block_health_or_emergency_stop(self) -> None:
         self._replace_broker(
@@ -2189,9 +2311,9 @@ class CoordinatorTests(unittest.TestCase):
         expected = {
             "minimal": 256,
             "low": 128,
-            "medium": 1024,
-            "high": 2048,
-            "extra high": 4096,
+            "medium": 256,
+            "high": 384,
+            "extra high": 512,
             "max": 8192,
         }
         for effort, budget in expected.items():
@@ -2216,6 +2338,44 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertEqual(rewritten["reasoning_effort"], effort)
                 self.assertEqual(rewritten["thinking_budget_tokens"], budget)
 
+    def test_experimental_effort_scaling_ladder_is_monotonic(self) -> None:
+        for limit, batch, ubatch in (
+            (8192, 256, 64),
+            (32768, 256, 64),
+            (65536, 512, 128),
+            (4096, 128, 32),
+            (1024, 128, 32),
+            (256, 128, 32),
+        ):
+            with self.subTest(limit=limit, batch=batch, ubatch=ubatch):
+                budgets = []
+                for effort in ("low", "medium", "high", "extra high", "max"):
+                    rewritten = apply_reasoning_policy(
+                        {"reasoning_effort": effort},
+                        runtime="llamacpp",
+                        max_output_tokens=limit,
+                        batch_size=batch,
+                        ubatch_size=ubatch,
+                    )
+                    budgets.append(rewritten["thinking_budget_tokens"])
+                # low < medium < high < extra high < max, always.
+                self.assertEqual(budgets, sorted(budgets))
+                self.assertLess(budgets[-2], budgets[-1])
+                # Every derived level stays strictly below the slot limit.
+                for budget in budgets[:-1]:
+                    self.assertLess(budget, limit)
+                # minimal is the 1-batch anchor, capped by the limit.
+                rewritten = apply_reasoning_policy(
+                    {"reasoning_effort": "minimal"},
+                    runtime="llamacpp",
+                    max_output_tokens=limit,
+                    batch_size=batch,
+                    ubatch_size=ubatch,
+                )
+                self.assertEqual(
+                    rewritten["thinking_budget_tokens"], min(batch, limit)
+                )
+
     def test_experimental_effort_scaling_accepts_opencode_xhigh_alias(self) -> None:
         rewritten = apply_reasoning_policy(
             {
@@ -2230,7 +2390,7 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(rewritten["reasoning_effort"], "extra high")
         self.assertEqual(rewritten["chat_template_kwargs"], {"enable_thinking": True})
-        self.assertEqual(rewritten["thinking_budget_tokens"], 4096)
+        self.assertEqual(rewritten["thinking_budget_tokens"], 512)
 
     def test_experimental_effort_scaling_preserves_explicit_budget(self) -> None:
         rewritten = apply_reasoning_policy(
@@ -2279,7 +2439,7 @@ class CoordinatorTests(unittest.TestCase):
                 batch_size=256,
                 ubatch_size=64,
             )["thinking_budget_tokens"],
-            8192,
+            1536,
         )
 
     def test_zero_thinking_budget_disables_reasoning_safely(self) -> None:
@@ -2336,9 +2496,9 @@ class CoordinatorTests(unittest.TestCase):
         expected = {
             "minimal": 256,
             "low": 512,
-            "medium": 4096,
-            "high": 8192,
-            "extra high": 16384,
+            "medium": 1024,
+            "high": 1536,
+            "extra high": 2048,
             "max": 32768,
         }
         for effort, budget in expected.items():
