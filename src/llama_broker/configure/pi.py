@@ -15,16 +15,6 @@ PI_SETTINGS_CONFIG = PI_AGENT_DIR / "settings.json"
 # The broker serves the OpenAI chat-completions API to pi.
 PROVIDER_ID = "llamacpp"
 
-# Thinking levels pi offers for custom models; the broker maps them onto
-# its effort ladder.
-_THINKING_LEVEL_MAP = {
-    "minimal": "minimal",
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-}
-
-
 class PiProvider(ToolProvider):
 
     @property
@@ -50,9 +40,7 @@ class PiProvider(ToolProvider):
             )
 
         models_changes = self._configure_models(registry, dry_run)
-        settings_changes = (
-            self._configure_default_model(model, dry_run) if model else []
-        )
+        settings_changes = self._configure_default_model(model, dry_run) if model else []
 
         if not models_changes and not settings_changes:
             return ConfigureResult()
@@ -165,5 +153,4 @@ class PiProvider(ToolProvider):
         }
         if "reasoning" in profile.capabilities:
             entry["reasoning"] = True
-            entry["thinkingLevelMap"] = dict(_THINKING_LEVEL_MAP)
         return entry

@@ -343,7 +343,29 @@ def _refresh_live_profile_registry(profiles_path: Path) -> None:
     if not _is_authoritative_manifest(profiles_path):
         return
     try:
-        _broker_admin("/admin/autotune/reload", {})
+        submitted = _broker_admin("/admin/autotune/reload", {"wait": False})
+        operation = submitted.get("operation")
+        request_id = operation.get("request_id") if isinstance(operation, Mapping) else None
+        if not isinstance(request_id, str) or not request_id:
+            raise BackendControllerError(
+                "live broker did not return a profile reload request ID"
+            )
+        while True:
+            result = _broker_admin_get(f"/admin/operations/{request_id}")
+            operation = result.get("operation")
+            if not isinstance(operation, Mapping):
+                raise BackendControllerError(
+                    f"profile reload status is unavailable for request {request_id}"
+                )
+            status = operation.get("status")
+            if status in {"succeeded", "failed", "cancelled"}:
+                if status != "succeeded":
+                    detail = operation.get("error") or operation.get("error_type") or status
+                    raise BackendControllerError(
+                        f"profile reload request {request_id} {status}: {detail}"
+                    )
+                return
+            time.sleep(0.5)
     except Exception as error:
         raise ApplyError(f"live broker profile registry refresh failed: {error}") from error
 

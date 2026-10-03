@@ -620,10 +620,7 @@ class ConfigureSafetyTests(unittest.TestCase):
         )
         entry = PiProvider._model_entry(profile, 32768)
         self.assertTrue(entry["reasoning"])
-        self.assertEqual(
-            entry["thinkingLevelMap"],
-            {"minimal": "minimal", "low": "low", "medium": "medium", "high": "high"},
-        )
+        self.assertNotIn("thinkingLevelMap", entry)
         self.assertEqual(entry["contextWindow"], 32768)
 if __name__ == "__main__":
     unittest.main()
