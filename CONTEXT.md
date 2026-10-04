@@ -30,7 +30,10 @@ asynchronous by default.
 Operation state persists across broker restarts. Target failure is fail-closed
 with no automatic restoration. Duplicate queued targets coalesce; distinct
 queued targets remain strict FIFO, and an in-flight transition is never
-superseded. Each caller receives a request identity linked to the one shared
+superseded, with one exception: a request-driven load (or transient restore)
+that no request holds a slot on may be preempted by a request for another
+profile. The preempted request waits behind the newer one and never preempts
+in return. Each caller receives a request identity linked to the one shared
 execution for a coalesced target. A caller may stop waiting or cancel its own
 queued request without cancelling shared work another caller still wants.
 Cancellation is allowed while queued and, at most, before destructive work

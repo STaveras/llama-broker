@@ -10,6 +10,7 @@ from unittest.mock import patch
 from llama_broker import backend_controller
 
 from llama_broker.backend_controller import (
+    ActivationPreemptedError,
     AdmissionError,
     BackendController,
     CommandError,
@@ -92,6 +93,13 @@ class Harness:
                 active_state="active",
                 sub_state="running",
                 main_pid=4242,
+                control_pid=0,
+            )
+        if command[:4] == ("systemctl", "--user", "--no-block", "stop"):
+            self.service_states[command[4]] = ServiceStateSnapshot(
+                active_state="deactivating",
+                sub_state="stop-sigterm",
+                main_pid=4343,
                 control_pid=0,
             )
         if command[:3] == ("systemctl", "--user", "stop"):
@@ -1304,6 +1312,199 @@ class BackendControllerTest(unittest.TestCase):
         self.assertIsNone(state["profile"])
         self.assertEqual(state["stale_profile"], "main-27b")
         self.assertEqual(self.harness.probes, [("main-27b", 0.25)])
+
+
+class BackendHandoffTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.harness = Harness()
+        self.main = FakeProfile(
+            id="main-27b",
+            alias="main-27b",
+            display_name="Main 27B",
+            server_binary="/opt/llama-server",
+            model_path="/models/main.gguf",
+        )
+        self.vision = FakeProfile(
+            id="qwen-vision",
+            alias="qwen-vision",
+            display_name="Qwen vision",
+            server_binary="/opt/llama-server",
+            model_path="/models/qwen.gguf",
+        )
+        self.vram_readings: list[int] = []
+        self.vram_error: BaseException | None = None
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def vram_free(self) -> int:
+        if self.vram_error is not None:
+            raise self.vram_error
+        if len(self.vram_readings) > 1:
+            return self.vram_readings.pop(0)
+        return self.vram_readings[0]
+
+    def make_controller(self, **overrides: object) -> BackendController:
+        options: dict[str, object] = {
+            "profiles": {profile.id: profile for profile in (self.main, self.vision)},
+            "state_path": self.root / "state.json",
+            "systemd_dir": self.root / "systemd",
+            "service_prefix": "llama-broker-profile",
+            "command_runner": self.harness.run,
+            "readiness_probe": self.harness.probe,
+            "resource_probe": None,
+            "event_logger": self.harness.log_event,
+            "service_state_probe": self.harness.service_state,
+            "vram_probe": self.vram_free,
+            "handoff_poll_interval": 0.001,
+        }
+        options.update(overrides)
+        return BackendController(**options)  # type: ignore[arg-type]
+
+    def unit(self, controller: BackendController, profile_id: str) -> str:
+        return controller.unit_name(profile_id)
+
+    def handoff_decisions(self) -> list[object]:
+        return [
+            event["decision"]
+            for event in self.harness.events
+            if event["event"] == "backend_handoff"
+        ]
+
+    def test_next_backend_starts_once_free_vram_rises(self) -> None:
+        controller = self.make_controller()
+        controller.switch("main-27b")
+        main_unit = self.unit(controller, "main-27b")
+        self.harness.quiesce_on_stop.add(main_unit)
+        # Baseline, then a rise below the threshold, then the release begins.
+        self.vram_readings = [1_000, 1_100, 2_000]
+
+        state = controller.switch("qwen-vision")
+
+        self.assertEqual(state["profile"], "qwen-vision")
+        self.assertEqual(
+            self.harness.commands[1:],
+            [
+                ("systemctl", "--user", "--no-block", "stop", main_unit),
+                ("systemctl", "--user", "start", self.unit(controller, "qwen-vision")),
+                ("systemctl", "--user", "stop", main_unit),
+            ],
+        )
+        self.assertEqual(
+            self.handoff_decisions(),
+            ["stop_requested", "early_start", "prior_exited_after_start"],
+        )
+
+    def test_unreadable_vram_waits_for_prior_exit(self) -> None:
+        controller = self.make_controller()
+        controller.switch("main-27b")
+        self.vram_error = RuntimeError("nvidia-smi missing")
+
+        controller.switch("qwen-vision")
+
+        self.assertEqual(
+            self.harness.commands[1:],
+            [
+                ("systemctl", "--user", "stop", self.unit(controller, "main-27b")),
+                ("systemctl", "--user", "start", self.unit(controller, "qwen-vision")),
+            ],
+        )
+        self.assertEqual(self.handoff_decisions(), ["vram_probe_error"])
+
+    def test_vram_that_never_rises_falls_back_to_waiting_for_exit(self) -> None:
+        controller = self.make_controller(handoff_timeout=0.01)
+        controller.switch("main-27b")
+        main_unit = self.unit(controller, "main-27b")
+        self.harness.quiesce_on_stop.add(main_unit)
+        self.vram_readings = [1_000]
+
+        controller.switch("qwen-vision")
+
+        self.assertEqual(
+            self.harness.commands[1:],
+            [
+                ("systemctl", "--user", "--no-block", "stop", main_unit),
+                ("systemctl", "--user", "stop", main_unit),
+                ("systemctl", "--user", "start", self.unit(controller, "qwen-vision")),
+            ],
+        )
+        self.assertEqual(self.handoff_decisions(), ["stop_requested", "wait_for_exit"])
+
+    def test_endpoint_still_bound_delays_early_start(self) -> None:
+        endpoint_checks: list[bool] = [True, False]
+
+        def endpoint_present() -> bool:
+            return endpoint_checks.pop(0) if len(endpoint_checks) > 1 else endpoint_checks[0]
+
+        controller = self.make_controller(endpoint_probe=endpoint_present)
+        self.vram_readings = [1_000]
+        endpoint_checks[:] = [False]
+        controller.switch("main-27b")
+        main_unit = self.unit(controller, "main-27b")
+        self.harness.quiesce_on_stop.add(main_unit)
+        self.vram_readings = [1_000, 2_000]
+        # Still bound on the first rising sample, then released.
+        endpoint_checks[:] = [True, False]
+
+        controller.switch("qwen-vision")
+
+        self.assertIn(
+            ("systemctl", "--user", "start", self.unit(controller, "qwen-vision")),
+            self.harness.commands,
+        )
+        self.assertIn("early_start", self.handoff_decisions())
+
+    def test_preempted_activation_stops_target_and_records_inactive_state(self) -> None:
+        controller = self.make_controller(handoff_timeout=0.01)
+        self.vram_readings = [1_000]
+        controller.switch("main-27b")
+        self.harness.quiesce_on_stop.add(self.unit(controller, "main-27b"))
+
+        def preempted_probe(alias: str, timeout: float) -> bool:
+            self.assertTrue(controller.preempt_activation())
+            return False
+
+        controller.readiness_probe = preempted_probe
+        with self.assertRaises(SwitchError) as caught:
+            controller.switch("qwen-vision")
+
+        self.assertIsInstance(caught.exception.__cause__, ActivationPreemptedError)
+        vision_unit = self.unit(controller, "qwen-vision")
+        self.assertEqual(
+            self.harness.commands[-1],
+            ("systemctl", "--user", "--no-block", "stop", vision_unit),
+        )
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "inactive")
+        self.assertIsNone(state["profile"])
+        self.assertEqual(state["preempted_profile"], "qwen-vision")
+        self.assertFalse(controller.preempt_activation())
+
+        # The next switch finishes stopping the preempted target before it
+        # can prove the endpoint free and start.
+        controller.readiness_probe = self.harness.probe
+        self.harness.quiesce_on_stop.add(vision_unit)
+        state = controller.switch("main-27b")
+
+        self.assertEqual(state["profile"], "main-27b")
+        self.assertEqual(
+            self.harness.commands[-2:],
+            [
+                ("systemctl", "--user", "stop", vision_unit),
+                ("systemctl", "--user", "start", self.unit(controller, "main-27b")),
+            ],
+        )
+
+    def test_preempt_without_switch_in_progress_is_ignored(self) -> None:
+        controller = self.make_controller()
+        self.vram_readings = [1_000]
+
+        self.assertFalse(controller.preempt_activation())
+        state = controller.switch("main-27b")
+
+        self.assertEqual(state["profile"], "main-27b")
 
 
 if __name__ == "__main__":
