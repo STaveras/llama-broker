@@ -413,7 +413,7 @@ class Controller(Protocol):
 
 
 def _verify_profile_artifacts(profile: Any, *, force: bool = False) -> None:
-    """Verify every immutable artifact immediately before a backend start."""
+    """Hash pinned artifacts for explicit checks or backend failure diagnostics."""
 
     checks: list[tuple[Path, object, str]] = [
         (
@@ -659,7 +659,7 @@ def route_payload(
                 f"active model is unavailable: {active_profile}"
             ) from error
     rewritten = dict(payload)
-    rewritten["model"] = profile.alias
+    rewritten["model"] = getattr(profile, "backend_model_name", profile.alias)
     return profile, rewritten
 
 
@@ -1593,7 +1593,6 @@ class BrokerApplication:
         self.max_output_tokens = max_output_tokens
         self.admin_operation_timeout = drain_timeout + transition_timeout + 1.0
         self.security = security or SecurityConfig()
-        self._artifact_verification_cache: dict[str, tuple[tuple[Any, ...], bool]] = {}
         self._state_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
@@ -1622,7 +1621,7 @@ class BrokerApplication:
             return backend_serves_alias(
                 backend_host,
                 backend_port,
-                alias,
+                getattr(profile, "backend_model_name", profile.alias),
                 probe_timeout,
                 scheme=endpoint_scheme,
                 ca_file=self._backend_ca_file,
@@ -1742,9 +1741,9 @@ class BrokerApplication:
             )
         if getattr(self.controller, "state_store", None) is not None:
             profile = self.registry.get(target)
-            if not self._profile_artifacts_verified(profile):
+            if not self._profile_artifacts_available(profile):
                 raise StaleOperationSnapshotError(
-                    f"pinned artifacts changed or failed verification for {target!r}"
+                    f"required artifacts are missing or unsafe for {target!r}"
                 )
 
     def _operation_worker_loop(self) -> None:
@@ -2391,75 +2390,24 @@ class BrokerApplication:
 
         return self.security.authentication_keys()
 
-    def _profile_artifacts_verified(self, profile: Profile) -> bool:
-        checks: list[tuple[Path, str]] = [
-            (profile.server_binary, profile.server_sha256),
-            (profile.model_path, profile.model_sha256),
-        ]
+    def _profile_artifacts_available(self, profile: Profile) -> bool:
+        """Check file presence without hashing artifacts during normal operation."""
+        paths = [profile.server_binary, profile.model_path]
         if profile.mmproj_path is not None:
-            if profile.mmproj_sha256 is None:
-                return False
-            checks.append((profile.mmproj_path, profile.mmproj_sha256))
+            paths.append(profile.mmproj_path)
         if profile.runtime == "strata":
-            for path_field, hash_field in (
-                ("strata_artifacts_manifest_path", "strata_artifacts_manifest_sha256"),
-                ("strata_launch_config_path", "strata_launch_config_sha256"),
-            ):
-                path = getattr(profile, path_field, None)
-                digest = getattr(profile, hash_field, None)
-                if not isinstance(path, Path) or not isinstance(digest, str):
+            for field in ("strata_artifacts_manifest_path", "strata_launch_config_path"):
+                path = getattr(profile, field, None)
+                if not isinstance(path, Path):
                     return False
-                checks.append((path, digest))
-            strata_files = getattr(profile, "strata_artifact_files", ())
-            if not strata_files:
+                paths.append(path)
+            if not profile.strata_artifact_files:
                 return False
-            for item in strata_files:
-                if (
-                    not isinstance(item, tuple)
-                    or len(item) != 2
-                    or not isinstance(item[0], Path)
-                    or not isinstance(item[1], str)
-                ):
-                    return False
-                checks.append((item[0], item[1]))
-        fingerprint: list[Any] = []
-        for path, expected in checks:
-            try:
-                if path.is_symlink() or not path.is_file():
-                    return False
-                stat = path.stat()
-            except OSError:
-                return False
-            fingerprint.extend(
-                (str(path), stat.st_dev, stat.st_ino, stat.st_size,
-                 stat.st_mtime_ns, stat.st_ctime_ns, expected)
-            )
-        cache_key = tuple(fingerprint)
-        cached = self._artifact_verification_cache.get(profile.id)
-        if cached is not None and cached[0] == cache_key:
-            return cached[1]
-        verified = True
-        for path, expected in checks:
-            try:
-                before = path.stat()
-                if sha256_file(path) != expected:
-                    verified = False
-                    break
-                after = path.stat()
-                if (
-                    before.st_dev, before.st_ino, before.st_size,
-                    before.st_mtime_ns, before.st_ctime_ns,
-                ) != (
-                    after.st_dev, after.st_ino, after.st_size,
-                    after.st_mtime_ns, after.st_ctime_ns,
-                ):
-                    verified = False
-                    break
-            except OSError:
-                verified = False
-                break
-        self._artifact_verification_cache[profile.id] = (cache_key, verified)
-        return verified
+            paths.extend(path for path, _digest in profile.strata_artifact_files)
+        try:
+            return all(not path.is_symlink() and path.is_file() for path in paths)
+        except OSError:
+            return False
 
     def _openai_model_record(
         self,
@@ -2515,7 +2463,7 @@ class BrokerApplication:
         visible_profiles = {
             profile.alias: profile
             for profile in self.registry.profiles
-            if self._profile_artifacts_verified(profile) or profile.id == active_profile_id
+            if self._profile_artifacts_available(profile) or profile.id == active_profile_id
         }
         models = [
             self._openai_model_record({}, profile=profile)
@@ -2739,7 +2687,6 @@ class BrokerApplication:
             ) from error
 
         self.registry = new_registry
-        self._artifact_verification_cache.clear()
         self._autotune_degraded_reason = None
         self._remember_controller_state(dict(self.controller.state()))
         return self.health()
@@ -2940,8 +2887,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._model_not_found(alias)
                 return
             if (
-                not self.application._profile_artifacts_verified(profile)
-                and profile.id != self.application.coordinator.active_profile
+                profile.id != self.application.coordinator.active_profile
+                and not self.application._profile_artifacts_available(profile)
             ):
                 self._model_not_found(alias, message=f"model unavailable: {alias}")
                 return
@@ -3100,8 +3047,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         }
                     )
                 if (
-                    not self.application._profile_artifacts_verified(profile)
-                    and profile.id != self.application.coordinator.active_profile
+                    profile.id != self.application.coordinator.active_profile
+                    and not self.application._profile_artifacts_available(profile)
                 ):
                     self._model_not_found(
                         profile.alias,
@@ -3118,8 +3065,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 proxy_payload = rewritten
                 body = _json_bytes(rewritten)
             if path == "/v1/audio/transcriptions" and (
-                not self.application._profile_artifacts_verified(profile)
-                and profile.id != self.application.coordinator.active_profile
+                profile.id != self.application.coordinator.active_profile
+                and not self.application._profile_artifacts_available(profile)
             ):
                 self._model_not_found(
                     profile.alias,
@@ -3696,10 +3643,11 @@ class BrokerServer(ThreadingHTTPServer):
         except OSError:
             self.shutdown_request(request)
             return
-        # The request body is still unread. Drain it off the accept thread so
-        # the client receives the 503 instead of a connection reset.
+        # Drain off the accept thread when possible. If all drain slots are
+        # occupied, perform this one bounded drain inline instead of closing
+        # with unread bytes and resetting the response.
         if not self._rejection_drains.acquire(blocking=False):
-            self.shutdown_request(request)
+            self._drain_rejected_request(request)
             return
         threading.Thread(
             target=self._drain_then_close,
@@ -3710,18 +3658,21 @@ class BrokerServer(ThreadingHTTPServer):
 
     def _drain_then_close(self, request: socket.socket) -> None:
         try:
-            try:
-                request.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-            _discard_until_eof(
-                request,
-                timeout=self._control_client_timeout,
-                limit=self.application.max_body_bytes,
-            )
-            self.close_request(request)
+            self._drain_rejected_request(request)
         finally:
             self._rejection_drains.release()
+
+    def _drain_rejected_request(self, request: socket.socket) -> None:
+        try:
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        _discard_until_eof(
+            request,
+            timeout=self._control_client_timeout,
+            limit=self.application.max_body_bytes,
+        )
+        self.close_request(request)
 
     def server_close(self) -> None:
         try:
@@ -3893,7 +3844,8 @@ def create_production_controller(
             raise ProfileError(f"unknown model alias: {alias}")
         probe_url = backend_url_for_runtime(backend_url, profile.runtime)
         return _readiness_probe(
-            alias, timeout, shutdown_requested, security, probe_url
+            getattr(profile, "backend_model_name", profile.alias),
+            timeout, shutdown_requested, security, probe_url
         )
 
     setattr(readiness_probe, "replace_profiles", replace_readiness_profiles)
@@ -3923,6 +3875,7 @@ def create_production_controller(
         backend_listen_host=backend_listen_host,
         backend_listen_port=BACKEND_LISTEN_PORT,
         managed_args=managed_args,
+        # Hash artifacts only to diagnose a failed backend activation.
         artifact_verifier=lambda profile: _verify_profile_artifacts(profile, force=True),
         verify_command=lambda profile: (
             sys.executable,

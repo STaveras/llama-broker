@@ -8,6 +8,14 @@ Each adapter owns the backend command shape. `llamacpp` preserves the existing
 `strata` launches the pinned `strata-server` bridge and a per-profile Strata
 launch config; it does not use llama.cpp or vLLM flags.
 
+## Artifact verification
+
+Normal requests, model listing, and profile switches check file presence without
+hashing model weights or runtime artifacts. If backend activation fails, the
+controller cleans up the target, runs a full artifact verification, and records
+its result in the failed state and broker events. `brokerctl verify PROFILE`
+remains available for an explicit content check.
+
 ## Strata contract
 
 - Strata profiles are text-only and require `parallel: 1`. Vision, MCP,
@@ -45,8 +53,10 @@ launch config; it does not use llama.cpp or vLLM flags.
   profile-specific absolute paths with SHA-256 pins. The manifest has safe
   model-root-relative paths and hashes for both GGUF shards and every Strata
   pack file. The launch config pins the engine binary/hash, pack/native/PLE
-  paths, tokenizer, context, and alias. Unknown config fields and non-loopback
-  host, API-key, MCP, vision, and network flags are rejected.
+  paths, tokenizer, context, and backend model name. The broker profile alias
+  can be renamed independently; requests are translated to the pinned backend
+  name. Unknown config fields and non-loopback host, API-key, MCP, vision, and
+  network flags are rejected.
 - Strata IQ2_XS profiles have a resident mode (about 48 GiB system RAM) and an
   explicit low-RAM mmap mode. Low-RAM mode requires the pack's `experts.bin` and
   `--mmap-experts`; it estimates the hot-set fit using total system RAM plus GPU

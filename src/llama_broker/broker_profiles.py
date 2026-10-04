@@ -595,6 +595,12 @@ class Profile:
     strata_artifact_files: tuple[tuple[Path, str], ...] = ()
     strata_engine_binary: Path | None = None
     strata_engine_sha256: str | None = None
+    strata_model_name: str | None = None
+
+    @property
+    def backend_model_name(self) -> str:
+        """Return the backend's model identifier behind the public profile alias."""
+        return self.strata_model_name or self.alias
 
     @property
     def is_transient(self) -> bool:
@@ -1120,7 +1126,6 @@ def _parse_strata_artifacts(
     record: Mapping[str, Any],
     *,
     profile_id: str,
-    alias: str,
     model_path: Path,
     model_sha256: str,
     context_size: int,
@@ -1269,8 +1274,11 @@ def _parse_strata_artifacts(
         forbidden = sorted(set(launch) & {"host", "api_key", "mcp", "mcp_servers", "mcp_config"}) if isinstance(launch, dict) else []
         detail = f" (forbidden fields: {', '.join(forbidden)})" if forbidden else ""
         raise ProfileError(f"invalid or unsafe Strata launch config for {profile_id!r}{detail}")
-    if launch.get("schema_version") != 1 or launch.get("model_name") != alias:
-        raise ProfileError(f"Strata launch config model/schema mismatch for {profile_id!r}")
+    if launch.get("schema_version") != 1:
+        raise ProfileError(f"unsupported Strata launch config schema for {profile_id!r}")
+    model_name = launch.get("model_name")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ProfileError(f"Strata launch config requires a non-empty model_name for {profile_id!r}")
     engine_binary = Path(str(launch.get("engine_binary", ""))).expanduser()
     if not engine_binary.is_absolute() or engine_binary.is_symlink():
         raise ProfileError(f"Strata engine_binary must be an absolute non-symlink path for {profile_id!r}")
@@ -1345,7 +1353,7 @@ def _parse_strata_artifacts(
     seen: set[str] = set()
     boolean_flags = {"--mmap-experts"}
     # optional: RAM (MiB) for parking the active conversation while another prompt runs
-    optional_value_flags = {"--conversation-cache-mib"}
+    optional_value_flags = {"--conversation-cache-mib", "--resident-budget-gib"}
     uses_mmap_experts = False
     index = 0
     while index < len(raw_args):
@@ -1371,6 +1379,9 @@ def _parse_strata_artifacts(
         elif flag == "--conversation-cache-mib":
             if not value.isdecimal() or not 0 < int(value) <= 16384:
                 raise ProfileError(f"Strata conversation cache must be 1-16384 MiB for {profile_id!r}")
+        elif flag == "--resident-budget-gib":
+            if not value.isdecimal() or not 0 < int(value) <= 64:
+                raise ProfileError(f"Strata resident budget must be 1-64 GiB for {profile_id!r}")
         elif flag in allowed_values and value != allowed_values[flag]:
             raise ProfileError(f"Strata engine argument does not match pinned profile data for {profile_id!r}: {flag}")
         if flag == "--expert-profile":
@@ -1401,6 +1412,7 @@ def _parse_strata_artifacts(
         "manifest_sha256": manifest_sha256,
         "launch_path": launch_path,
         "launch_sha256": launch_sha256,
+        "model_name": model_name,
         "artifact_files": tuple(artifact_files),
         "engine_binary": engine_binary,
         "engine_sha256": engine_sha256,
@@ -1933,7 +1945,6 @@ def _parse_profile(
         strata_metadata = _parse_strata_artifacts(
             record,
             profile_id=profile_id,
-            alias=alias,
             model_path=model_path,
             model_sha256=model_sha256,
             context_size=context_size,
@@ -2054,4 +2065,5 @@ def _parse_profile(
         strata_artifact_files=strata_metadata.get("artifact_files", ()),
         strata_engine_binary=strata_metadata.get("engine_binary"),
         strata_engine_sha256=strata_metadata.get("engine_sha256"),
+        strata_model_name=strata_metadata.get("model_name"),
     )

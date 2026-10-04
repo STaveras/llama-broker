@@ -1692,6 +1692,10 @@ class BrokerHttpTests(unittest.TestCase):
         stalled = socket.create_connection(("127.0.0.1", self.broker.server_port))
         try:
             wait_for_free_control_workers(0)
+            # Force the accept-time rejection down the saturated-drainer fallback.
+            self.broker._rejection_drains = threading.BoundedSemaphore(  # type: ignore[attr-defined]
+                0
+            )
             status, payload = self._post_large(auth)
         finally:
             stalled.close()

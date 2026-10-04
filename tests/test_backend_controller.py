@@ -752,23 +752,24 @@ class BackendControllerTest(unittest.TestCase):
         self.assertEqual(self.controller.state()["phase"], "active")
         self.assertEqual(self.harness.commands, commands_before)
 
-    def test_target_artifact_failure_is_proven_before_stopping_prior_backend(self) -> None:
+    def test_successful_switch_skips_artifact_verification(self) -> None:
         self.controller.switch("main-27b")
-        commands_before = list(self.harness.commands)
 
         def reject(_profile: FakeProfile) -> None:
-            raise ConfigurationError("artifact digest mismatch")
+            self.fail("successful activation must not verify artifacts")
 
         self.controller.artifact_verifier = reject  # type: ignore[attr-defined]
-        with self.assertRaises(SwitchError):
-            self.controller.switch("qwen-vision")
+        self.controller.switch("qwen-vision")
 
-        self.assertEqual(self.controller.state()["profile"], "main-27b")
+        self.assertEqual(self.controller.state()["profile"], "qwen-vision")
         self.assertEqual(self.controller.state()["phase"], "active")
-        self.assertEqual(self.harness.commands, commands_before)
 
-    def test_switch_verifies_artifacts_before_starting_unit(self) -> None:
+    def test_failed_start_verifies_artifacts_after_cleanup(self) -> None:
+        unit = self.controller.unit_name("main-27b")
+        self.harness.command_failures.add(("systemctl", "--user", "start", unit))
+
         def reject(_profile: FakeProfile) -> None:
+            self.assertEqual(self.harness.commands[-1], ("systemctl", "--user", "stop", unit))
             raise ConfigurationError("artifact digest mismatch")
 
         self.controller.artifact_verifier = reject  # type: ignore[attr-defined]
@@ -776,13 +777,9 @@ class BackendControllerTest(unittest.TestCase):
         with self.assertRaises(SwitchError) as caught:
             self.controller.switch("main-27b")
 
-        self.assertIsInstance(caught.exception.__cause__, ConfigurationError)
-        self.assertIn("artifact digest mismatch", str(caught.exception))
-
-        self.assertNotIn(
-            ("systemctl", "--user", "start", self.controller.unit_name("main-27b")),
-            self.harness.commands,
-        )
+        self.assertIn("injected command failure", str(caught.exception))
+        self.assertEqual(self.controller.state()["artifact_verification"],
+                         {"status": "failed", "error": "artifact digest mismatch"})
 
     def test_successful_switch_persists_concrete_running_build_identity(self) -> None:
         profile = replace(
