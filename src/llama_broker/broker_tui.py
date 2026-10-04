@@ -1565,7 +1565,7 @@ def run_tui(
                     model.manifest = pending_manifest
                     model.base_manifest = copy.deepcopy(pending_manifest)
                     model.dirty = False
-                    status = "Applied successfully."
+                    status = "Saved successfully; loaded model keeps running."
                 apply_finished = None
                 pending_manifest = None
             if apply_finished is not None:
@@ -1612,7 +1612,7 @@ def run_tui(
             footer = (
                 "Apply is running; wait here for its result."
                 if apply_finished is not None
-                else "Enter opens a text box/dropdown; changes stay in memory until Save."
+                else "s saves profile config and refreshes aliases; the loaded model keeps running."
             )
             stdscr.addnstr(max(height - 2, 0), 0, footer, max(width - 1, 1))
             stdscr.timeout(250 if apply_finished is not None else -1)
@@ -1662,7 +1662,7 @@ def run_tui(
                             status = "Save cancelled; external conflicts remain."
                             continue
                     validate_manifest(merged, directory=path.parent)
-                    if not _curses_confirm(stdscr, "Apply changes?", default=True):
+                    if not _curses_confirm(stdscr, "Save profile config?", default=True):
                         status = "Save cancelled."
                         continue
                     if apply_callback is not None:
@@ -1704,7 +1704,7 @@ def run_tui(
                     model.manifest = merged
                     model.base_manifest = copy.deepcopy(merged)
                     model.dirty = False
-                    status = "Applied successfully."
+                    status = "Saved profile configuration."
                 except Exception as error:
                     status = f"Cannot save: {error}"
         return 0

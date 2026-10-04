@@ -59,8 +59,11 @@ Once restoration has begun draining or stopping a backend, it finishes before
 later queued work runs. Only one transient context is supported initially; a
 future restore stack may support nested transient contexts. A queued execution
 uses the immutable profile/catalog snapshot captured when it was requested. It
-must recheck that snapshot's pinned artifacts and safety facts before destructive
-work, but it never silently re-resolves to newer profile data. Verification uses
+must recheck that snapshot's configuration, artifact availability, and safety facts
+before destructive work, but it never silently re-resolves to newer profile data.
+Artifact content hashing runs after failed backend activation or an explicit
+`brokerctl verify`; ordinary requests, model listing, and switches do not hash
+model weights or runtime artifacts. Verification uses
 deterministic in-memory adapters for orchestration-core tests, with separate
 contract tests for persistence and process-control adapters; tests must never
 operate on the live broker or model. Focused tests cover ordinary

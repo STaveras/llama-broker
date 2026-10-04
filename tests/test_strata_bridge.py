@@ -128,6 +128,28 @@ class StrataBridgeTests(unittest.TestCase):
                 hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
             )
 
+    def test_resident_budget_mode_is_accepted(self) -> None:
+        args = list(self.launch_config["engine_args"])
+        mmap_index = args.index("--mmap-experts")
+        args[mmap_index:mmap_index + 1] = ["--resident-budget-gib", "9"]
+        self.launch_config["engine_args"] = args
+        self.config_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+
+        loaded = _load_launch_config(
+            self.config_path,
+            hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
+        )
+
+        self.assertIn("--resident-budget-gib", loaded["engine_args"])
+        warning = assess_strata_memory_mode(
+            system_ram_mib=24 * 1024,
+            gpu_vram_total_mib=12 * 1024,
+            mmap_experts=False,
+            has_experts_bin=True,
+            resident_budget_gib=9,
+        )
+        self.assertIn("bounded resident", warning or "")
+
     def test_reads_last_key_from_private_file(self) -> None:
         self.key_file.write_text("older-key\ncurrent-key\n", encoding="utf-8")
         self.key_file.chmod(0o600)

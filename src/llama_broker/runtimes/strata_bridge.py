@@ -158,8 +158,9 @@ def assess_strata_memory_mode(
     gpu_vram_total_mib: int,
     mmap_experts: bool,
     has_experts_bin: bool,
+    resident_budget_gib: int | None = None,
 ) -> str | None:
-    """Return the vendor low-RAM fit warning; require the disk-backed pack when selected."""
+    """Return fit warnings for mmap or bounded resident-expert modes."""
     if mmap_experts:
         if not has_experts_bin:
             raise StrataBridgeError("Strata mmap-experts mode requires the pack's experts.bin")
@@ -173,6 +174,20 @@ def assess_strata_memory_mode(
             return (
                 f"Strata low-RAM estimate is {estimated_cache_gib:.1f} GiB for a "
                 f"{STRATA_IQ2_XS_ARENA_GIB:.1f} GiB expert arena; mmap mode may page heavily from the SSD"
+            )
+        return None
+    if resident_budget_gib is not None:
+        if resident_budget_gib <= 0 or resident_budget_gib > 64:
+            raise StrataBridgeError("Strata resident budget must be 1-64 GiB")
+        if system_ram_mib < (resident_budget_gib + int(STRATA_LOW_RAM_HOST_HEADROOM_GIB)) * 1024:
+            raise StrataBridgeError(
+                f"bounded resident Strata budget of {resident_budget_gib} GiB requires "
+                f"at least {resident_budget_gib + int(STRATA_LOW_RAM_HOST_HEADROOM_GIB)} GiB system RAM"
+            )
+        if system_ram_mib < int(STRATA_RESIDENT_RAM_GIB * 1024):
+            return (
+                f"bounded resident budget of {resident_budget_gib} GiB on "
+                f"{system_ram_mib / 1024:.1f} GiB system RAM may still page cold experts"
             )
         return None
     if system_ram_mib < int(STRATA_RESIDENT_RAM_GIB * 1024):
@@ -423,8 +438,8 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
         "--spec-min-p", "--mtp",
     }
     boolean_flags = {"--mmap-experts"}
-    # optional: parks the active conversation in RAM while another prompt runs (engine 0.1.29+)
-    optional_value_flags = {"--conversation-cache-mib"}
+    # Optional: parks the active conversation in RAM while another prompt runs
+    optional_value_flags = {"--conversation-cache-mib", "--resident-budget-gib"}
     if not isinstance(args, list) or not all(isinstance(arg, str) and arg for arg in args):
         raise StrataBridgeError("Strata engine_args must be a string list")
     seen: set[str] = set()
@@ -600,6 +615,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = _load_launch_config(config_path, args.config_sha256)
     engine_args = config["engine_args"]
     mmap_experts = "--mmap-experts" in engine_args
+    resident_budget_gib = None
+    if "--resident-budget-gib" in engine_args:
+        resident_budget_gib = int(engine_args[engine_args.index("--resident-budget-gib") + 1])
     pack_arg = engine_args[engine_args.index("--pack") + 1]
     has_experts_bin = (Path(pack_arg) / "experts.bin").is_file()
     try:
@@ -618,6 +636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             gpu_vram_total_mib=gpu_total_mib,
             mmap_experts=mmap_experts,
             has_experts_bin=has_experts_bin,
+            resident_budget_gib=resident_budget_gib,
         )
         if memory_warning:
             print(f"[strata] WARNING: {memory_warning}", file=sys.stderr, flush=True)

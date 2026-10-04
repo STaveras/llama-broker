@@ -918,8 +918,6 @@ class BackendController:
                     or prior_state["phase"] != "active"
                     or restart_current
                 )
-                if target_requires_activation and self.artifact_verifier is not None:
-                    self.artifact_verifier(target)
                 if prior_id is not None and target_requires_activation:
                     if commit_callback is not None:
                         commit_callback()
@@ -1435,6 +1433,21 @@ class BackendController:
             failed_state["cleanup_error"] = str(cleanup_error)
         self._write_state(failed_state)
         self._update_alias(None)
+        if (
+            cleanup_target
+            and not isinstance(target_error, LifecycleCancelledError)
+            and self.artifact_verifier is not None
+        ):
+            self._emit("artifact_verification", profile=profile_id, decision="started")
+            try:
+                self.artifact_verifier(self._profile(profile_id))
+            except Exception as error:
+                verification = {"status": "failed", "error": str(error)}
+            else:
+                verification = {"status": "passed"}
+            failed_state["artifact_verification"] = verification
+            self._write_state(failed_state)
+            self._emit("artifact_verification", profile=profile_id, **verification)
         self._emit(
             "profile_transition",
             decision="failed",
@@ -1642,13 +1655,11 @@ class BackendController:
         return snapshot
 
     def _start(self, profile_id: str) -> None:
-        profile = self._profile(profile_id)
+        self._profile(profile_id)
         self._require_not_cancelled(f"start:{profile_id}")
         self._require_all_quiescent(stage=f"pre_start:{profile_id}")
         self._require_endpoint_absent(stage=f"pre_start:{profile_id}")
         self._require_not_cancelled(f"pre_command_start:{profile_id}")
-        if self.artifact_verifier is not None:
-            self.artifact_verifier(profile)
         self._run("systemctl", "--user", "start", self.unit_name(profile_id))
 
     def _stop(self, profile_id: str) -> None:

@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import llama_broker.cli as brokerctl
 from llama_broker.broker_profiles import ProfileError, ProfileRegistry
@@ -22,7 +22,9 @@ from llama_broker.daemon import (
     BrokerApplication,
     _verify_profile_artifacts,
     backend_url_for_runtime,
+    route_payload,
 )
+from llama_broker.profile_config import write_manifest_atomically
 
 
 def sha256(path: Path) -> str:
@@ -264,6 +266,18 @@ class StrataProfileTests(unittest.TestCase):
                                     "runtime_builds": [runtime]}), encoding="utf-8")
         return path
 
+    def test_strata_profile_accepts_bounded_resident_budget_mode(self) -> None:
+        resident_launch = dict(self.launch_config)
+        args = list(resident_launch["engine_args"])
+        mmap_index = args.index("--mmap-experts")
+        args[mmap_index:mmap_index + 1] = ["--resident-budget-gib", "9"]
+        resident_launch["engine_args"] = args
+        self.launch_path.write_text(json.dumps(resident_launch), encoding="utf-8")
+
+        profile = ProfileRegistry.from_path(self._write_profiles(self._profile())).get(self.profile_id)
+
+        self.assertEqual(profile.strata_launch_config_path, self.launch_path)
+
     def test_strata_profile_parses_pinned_bundle_and_model_artifacts(self) -> None:
         profile = ProfileRegistry.from_path(self._write_profiles(self._profile())).get(self.profile_id)
 
@@ -273,6 +287,77 @@ class StrataProfileTests(unittest.TestCase):
         self.assertEqual(profile.strata_artifacts_manifest_path, self.manifest_path)
         self.assertEqual(profile.strata_launch_config_path, self.launch_path)
         self.assertEqual(profile.bundle_root, self.bundle)
+
+    def test_editor_rename_is_usable_without_restarting_loaded_strata_backend(self) -> None:
+        path = self._write_profiles(self._profile())
+        registry = ProfileRegistry.from_path(path)
+        renamed = "qwen3.8-flash-next"
+        original_launch = self.launch_path.read_bytes()
+        controller = SimpleNamespace(
+            state=lambda: {"profile": self.profile_id, "phase": "active", "generation": 1},
+            replace_profiles=Mock(),
+            install_units=Mock(),
+            switch=Mock(side_effect=AssertionError("rename started a model")),
+            restart=Mock(side_effect=AssertionError("rename restarted a model")),
+            stop_all=Mock(side_effect=AssertionError("rename stopped a model")),
+        )
+
+        def make_app(current_registry: ProfileRegistry) -> BrokerApplication:
+            return BrokerApplication(
+                registry=current_registry, controller=controller,
+                backend_host="127.0.0.1", backend_port=10000,
+                backend_timeout=2.0, max_body_bytes=1024,
+                backend_ready=lambda: True, security=SecurityConfig(),
+                start_operation_worker=False, profiles_path=path,
+            )
+
+        def edit_in_tui(profiles_path: Path, selector: str, *, apply_callback=None) -> int:
+            model = TUIModel(json.loads(profiles_path.read_text(encoding="utf-8")))
+            model.set_field("alias", renamed)
+            if apply_callback is None:
+                write_manifest_atomically(profiles_path, model.manifest)
+            else:
+                apply_callback(model.manifest, {selector})
+            return 0
+
+        with patch("llama_broker.daemon.backend_serves_alias",
+                   side_effect=lambda _host, _port, alias, *_args, **_kwargs: alias == self.alias):
+            app = make_app(registry)
+            try:
+                with (
+                    patch.object(brokerctl.sys.stdin, "isatty", return_value=True),
+                    patch.object(brokerctl.sys.stdout, "isatty", return_value=True),
+                    patch("llama_broker.broker_tui.run_tui", side_effect=edit_in_tui),
+                    patch.object(brokerctl, "_is_authoritative_manifest", return_value=True),
+                    patch.object(brokerctl, "create_production_controller", return_value=controller),
+                    patch.object(brokerctl, "_refresh_live_profile_registry",
+                                 side_effect=lambda _path: app.reload_profiles_for_operation(lambda: None)),
+                ):
+                    self.assertEqual(brokerctl.main(
+                        ["--profiles", str(path), "profile", "edit", self.profile_id]), 0)
+
+                profile, payload = route_payload(
+                    app.registry, {"model": renamed}, active_profile=app.coordinator.active_profile)
+                self.assertEqual(profile.alias, renamed)
+                self.assertEqual(payload["model"], self.alias)
+                self.assertEqual(app.health()["backend"]["phase"], "active")
+                with app.coordinator.lease(profile.id, transient=False):
+                    self.assertEqual(app.coordinator.active_profile, self.profile_id)
+                self.assertEqual(self.launch_path.read_bytes(), original_launch)
+                controller.switch.assert_not_called()
+                controller.restart.assert_not_called()
+                controller.stop_all.assert_not_called()
+            finally:
+                app.shutdown()
+
+            # A new broker process must also recognize the already loaded backend
+            # when its public alias differs from the pinned Strata server name.
+            app = make_app(ProfileRegistry.from_path(path))
+            try:
+                self.assertEqual(app.coordinator.active_profile, self.profile_id)
+                self.assertEqual(app.health()["backend"]["phase"], "active")
+            finally:
+                app.shutdown()
 
     def test_strata_profile_accepts_262144_context_when_launch_uses_streaming(self) -> None:
         args = list(self.launch_config["engine_args"])
@@ -485,7 +570,7 @@ class StrataProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "not pinned to the declared revision"):
             ProfileRegistry.from_path(self._write_profiles(self._profile()))
 
-    def test_broker_model_visibility_invalidates_on_strata_pack_tampering(self) -> None:
+    def test_broker_model_visibility_does_not_hash_strata_pack(self) -> None:
         registry = ProfileRegistry.from_path(self._write_profiles(self._profile()))
         controller: Any = SimpleNamespace(
             state=lambda: {"profile": self.profile_id, "phase": "active", "generation": 1}
@@ -503,9 +588,9 @@ class StrataProfileTests(unittest.TestCase):
         )
         try:
             profile = registry.get(self.profile_id)
-            self.assertTrue(app._profile_artifacts_verified(profile))
+            self.assertTrue(app._profile_artifacts_available(profile))
             self.pack_files["dense.bin"].write_bytes(b"tampered")
-            self.assertFalse(app._profile_artifacts_verified(profile))
+            self.assertTrue(app._profile_artifacts_available(profile))
         finally:
             app.shutdown()
 
