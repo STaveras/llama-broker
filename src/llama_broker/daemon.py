@@ -33,6 +33,7 @@ from urllib.parse import unquote, urlsplit
 from .backend_controller import (
     BackendController,
     BackendControllerError,
+    nvidia_smi_vram_free_probe,
     subprocess_command_runner,
     systemd_service_inventory_probe,
     systemd_service_state_probe,
@@ -189,6 +190,15 @@ MAX_BODY_BYTES = int(
 )
 MAX_OUTPUT_TOKENS = _optional_env_int(
     "LLAMA_BROKER_MAX_OUTPUT_TOKENS", "LLM_BROKER_MAX_OUTPUT_TOKENS"
+)
+# A request for another profile may preempt a backend that is still loading
+# when no request holds one of its slots.
+PREEMPT_IDLE_LOADS = os.environ.get("LLAMA_BROKER_PREEMPT_IDLE_LOADS", "1") != "0"
+# Start the next backend once free VRAM rises after the prior stop request,
+# instead of waiting for the prior process to exit.
+VRAM_HANDOFF = os.environ.get("LLAMA_BROKER_VRAM_HANDOFF", "1") != "0"
+HANDOFF_MIN_VRAM_RISE_MIB = int(
+    os.environ.get("LLAMA_BROKER_HANDOFF_MIN_VRAM_RISE_MIB", "256")
 )
 
 
@@ -347,6 +357,10 @@ class BrokerDrainTimeoutError(BrokerCoordinationError):
 class BrokerTransitionTimeoutError(BrokerCoordinationError):
     error_type = "broker_transition_timeout"
     http_status = HTTPStatus.GATEWAY_TIMEOUT
+
+
+class BrokerPreemptedError(BrokerQuiescingError):
+    """An idle in-flight activation was preempted by a newer request."""
 
 
 class BrokerLifecycleError(BrokerCoordinationError):
@@ -698,6 +712,7 @@ class ProfileCoordinator:
         drain_timeout: float = DRAIN_TIMEOUT,
         transition_timeout: float = TRANSITION_TIMEOUT,
         stop_timeout: float = STOP_TIMEOUT,
+        preempt_activation: Callable[[], Any] | None = None,
     ):
         for name, value in (
             ("drain_timeout", drain_timeout),
@@ -722,6 +737,12 @@ class ProfileCoordinator:
         self._restore_generation = object()
         self._temporary_restore: tuple[object, str, str | None] | None = None
         self._shutdown_requested = False
+        self._preempt_activation = preempt_activation
+        # Request-driven loads may be preempted while no lease is held; the
+        # preempting request reserves the next transition slot.
+        self._transition_preemptible = False
+        self._transition_preempted = False
+        self._slot_reservation: object | None = None
         self._condition = threading.Condition()
 
     def _quiescing_unlocked(self) -> bool:
@@ -756,6 +777,7 @@ class ProfileCoordinator:
                 "queued_transitions": self._queued_transitions,
                 "transition": self._transition_name,
                 "transition_target": self._transition_target,
+                "transition_preempted": self._transition_preempted,
                 "pending_restore": self._pending_restore,
                 "shutting_down": self._shutdown_requested,
             }
@@ -776,6 +798,8 @@ class ProfileCoordinator:
         *,
         force_after_drain_timeout: bool = False,
         force_immediately: bool = False,
+        preemptible: bool = False,
+        reservation: object | None = None,
     ) -> bool:
         forced = False
         with self._condition:
@@ -784,7 +808,10 @@ class ProfileCoordinator:
                     raise BrokerQuiescingError("Llama-Broker is shutting down")
 
                 transition_deadline = time.monotonic() + self._transition_timeout
-                while self._transitioning:
+                while self._transitioning or (
+                    self._slot_reservation is not None
+                    and self._slot_reservation is not reservation
+                ):
                     if self._shutdown_requested:
                         raise BrokerQuiescingError("Llama-Broker is shutting down")
                     remaining = transition_deadline - time.monotonic()
@@ -820,10 +847,16 @@ class ProfileCoordinator:
                 self._queued_transitions -= 1
                 self._transitioning = True
                 self._transition_name = operation_name
+                self._transition_preemptible = preemptible
+                self._transition_preempted = False
+                if reservation is not None and self._slot_reservation is reservation:
+                    self._slot_reservation = None
                 self._condition.notify_all()
                 return forced
             except BaseException:
                 self._queued_transitions -= 1
+                if reservation is not None and self._slot_reservation is reservation:
+                    self._slot_reservation = None
                 self._condition.notify_all()
                 raise
 
@@ -833,6 +866,8 @@ class ProfileCoordinator:
             self._transitioning = False
             self._transition_name = None
             self._transition_target = None
+            self._transition_preemptible = False
+            self._transition_preempted = False
             if (
                 self._pending_restore is not None
                 and self._pending_restore[0] == failed_target
@@ -857,6 +892,7 @@ class ProfileCoordinator:
             "abandoned": False,
             "done": False,
             "error": None,
+            "preempted": False,
             "result": None,
         }
 
@@ -886,9 +922,12 @@ class ProfileCoordinator:
                     # A failed lifecycle operation leaves backend ownership
                     # unknown; never continue leasing the prior profile.
                     self._active_profile = None
+                outcome["preempted"] = self._transition_preempted
                 self._transitioning = False
                 self._transition_name = None
                 self._transition_target = None
+                self._transition_preemptible = False
+                self._transition_preempted = False
                 pending_restore = self._pending_restore
                 if pending_restore is not None and pending_restore[0] == target_profile:
                     self._pending_restore = None
@@ -948,6 +987,10 @@ class ProfileCoordinator:
 
         error = outcome["error"]
         if error is not None:
+            if outcome["preempted"]:
+                raise BrokerPreemptedError(
+                    f"{operation_name} was preempted by a request for another profile"
+                ) from error
             raise error
         return outcome["result"]
 
@@ -957,13 +1000,65 @@ class ProfileCoordinator:
             f"broker is quiescing for {reason}; retry after the transition settles"
         )
 
+    def _can_preempt_unlocked(self, profile_id: str) -> bool:
+        return (
+            self._preempt_activation is not None
+            and not self._shutdown_requested
+            and self._transitioning
+            and self._transition_preemptible
+            and not self._transition_preempted
+            and self._transition_target is not None
+            and self._transition_target != profile_id
+            and self._active_requests == 0
+            and self._queued_transitions == 0
+            and self._slot_reservation is None
+        )
+
+    def _request_preemption(self, preempted: str | None, profile_id: str) -> None:
+        try:
+            accepted = bool(self._preempt_activation())  # type: ignore[misc]
+        except BaseException as error:
+            accepted = False
+            _log(f"[broker] could not preempt {preempted}: {error}")
+        if accepted:
+            _log(
+                f"[broker] preempting idle {preempted} for a request "
+                f"for {profile_id!r}"
+            )
+
     def _acquire(
         self,
         profile_id: str,
         *,
         transient: bool = False,
     ) -> tuple[object, str, str | None] | None:
+        # A request whose own load was preempted waits its turn again but never
+        # preempts in return, so two clients cannot keep cancelling each other.
+        may_preempt = not transient
+        while True:
+            try:
+                return self._acquire_once(
+                    profile_id, transient=transient, may_preempt=may_preempt
+                )
+            except BrokerPreemptedError:
+                if transient:
+                    raise
+                _log(
+                    f"[broker] request for {profile_id!r} was preempted; "
+                    "waiting to load it after the newer request"
+                )
+                may_preempt = False
+
+    def _acquire_once(
+        self,
+        profile_id: str,
+        *,
+        transient: bool,
+        may_preempt: bool,
+    ) -> tuple[object, str, str | None] | None:
         temporary_restore: tuple[object, str, str | None] | None = None
+        reservation: object | None = None
+        preempted: str | None = None
         with self._condition:
             if self._active_profile == profile_id:
                 if self._quiescing_unlocked():
@@ -978,13 +1073,25 @@ class ProfileCoordinator:
                 raise self._quiescing_error_unlocked()
             if transient:
                 temporary_restore = (object(), profile_id, self._active_profile)
+            if may_preempt and self._can_preempt_unlocked(profile_id):
+                reservation = object()
+                preempted = self._transition_name
             self._queue_transition_unlocked()
+            if reservation is not None:
+                self._slot_reservation = reservation
+                self._transition_preempted = True
             if temporary_restore is not None:
                 self._temporary_restore = temporary_restore
 
+        if reservation is not None:
+            self._request_preemption(preempted, profile_id)
         operation_name = f"request switch to {profile_id!r}"
         try:
-            self._wait_for_transition_slot(operation_name)
+            self._wait_for_transition_slot(
+                operation_name,
+                preemptible=not transient,
+                reservation=reservation,
+            )
             if temporary_restore is not None:
                 with self._condition:
                     temporary_restore_is_current = self._temporary_restore is temporary_restore
@@ -1081,7 +1188,7 @@ class ProfileCoordinator:
                 return
             self._queue_transition_unlocked()
         operation_name = f"restore {source_profile!r} to {target_profile!r}"
-        self._wait_for_transition_slot(operation_name)
+        self._wait_for_transition_slot(operation_name, preemptible=True)
         with self._condition:
             source_is_still_active = self._active_profile == source_profile
         if not source_is_still_active:
@@ -1238,6 +1345,7 @@ class ProfileCoordinator:
                 self._condition.wait(timeout=remaining)
             self._transitioning = True
             self._transition_name = operation_name
+            self._transition_preemptible = False
             self._condition.notify_all()
         if forced:
             _log(
@@ -1251,6 +1359,8 @@ class ProfileCoordinator:
                 self._transitioning = False
                 self._transition_name = None
                 self._transition_target = None
+                self._transition_preemptible = False
+                self._transition_preempted = False
                 self._condition.notify_all()
             raise
         with self._condition:
@@ -1258,6 +1368,7 @@ class ProfileCoordinator:
             self._transitioning = False
             self._transition_name = None
             self._transition_target = None
+            self._transition_preemptible = False
             self._condition.notify_all()
         return result
 
@@ -1330,6 +1441,7 @@ class BrokerApplication:
         drain_timeout: float = DRAIN_TIMEOUT,
         transition_timeout: float = TRANSITION_TIMEOUT,
         stop_timeout: float = STOP_TIMEOUT,
+        preempt_idle_loads: bool = PREEMPT_IDLE_LOADS,
     ) -> None:
         if max_output_tokens is not None and max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
@@ -1393,6 +1505,11 @@ class BrokerApplication:
             drain_timeout=drain_timeout,
             transition_timeout=transition_timeout,
             stop_timeout=stop_timeout,
+            preempt_activation=(
+                getattr(controller, "preempt_activation", None)
+                if preempt_idle_loads
+                else None
+            ),
         )
 
     def start_recovery_watchdog(self) -> None:
@@ -2626,6 +2743,10 @@ class LockedController:
         with _operation_lock(self.lock_path):
             return self.controller.switch(profile_id)
 
+    def preempt_activation(self) -> bool:
+        # Deliberately lock-free: the switch being preempted holds the lock.
+        return self.controller.preempt_activation()
+
     def restart(self, profile_id: str) -> dict[str, Any]:
         with _operation_lock(self.lock_path):
             return self.controller.restart(profile_id)
@@ -2648,6 +2769,7 @@ def _readiness_probe(
     shutdown_requested: threading.Event | None = None,
     security: SecurityConfig | None = None,
     backend_url: str | None = None,
+    preempted: threading.Event | None = None,
 ) -> bool:
     security = security or load_security_config()
     backend_url = backend_url or effective_backend_url(security)
@@ -2655,6 +2777,9 @@ def _readiness_probe(
     while time.monotonic() < deadline:
         if shutdown_requested is not None and shutdown_requested.is_set():
             raise BrokerQuiescingError("Llama-Broker startup was interrupted")
+        if preempted is not None and preempted.is_set():
+            # The controller reports the preemption at its next check.
+            return False
         remaining = max(0.05, deadline - time.monotonic())
         client = BackendClient(
             backend_url,
@@ -2697,6 +2822,7 @@ def create_production_controller(
         raise SecurityError(
             "LLM_BROKER_BACKEND_URL scheme and backend TLS certificate settings disagree"
         )
+    preemption_event = threading.Event()
     managed_args = {
         runtime: security.backend_server_args(
             listen_host=backend_listen_host,
@@ -2712,7 +2838,8 @@ def create_production_controller(
         service_prefix=SERVICE_PREFIX,
         command_runner=subprocess_command_runner,
         readiness_probe=lambda alias, timeout: _readiness_probe(
-            alias, timeout, shutdown_requested, security, backend_url
+            alias, timeout, shutdown_requested, security, backend_url,
+            preemption_event,
         ),
         # Production keeps resource probing advisory: the Phase 2 contract
         # forbids a mandatory nvidia-smi/NVML or fixed-free-VRAM gate.
@@ -2732,6 +2859,10 @@ def create_production_controller(
         backend_listen_port=BACKEND_LISTEN_PORT,
         managed_args=managed_args,
         artifact_verifier=_verify_profile_artifacts,
+        # Advisory only: an unreadable GPU falls back to waiting for exit.
+        vram_probe=nvidia_smi_vram_free_probe if VRAM_HANDOFF else None,
+        preemption_event=preemption_event,
+        handoff_min_vram_rise_mib=HANDOFF_MIN_VRAM_RISE_MIB,
         verify_command=lambda profile: (
             sys.executable,
             str(ROOT / "brokerctl.py"),

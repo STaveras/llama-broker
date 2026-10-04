@@ -75,6 +75,7 @@ class ResourceSnapshot:
 
 
 ResourceProbe = Callable[[], ResourceSnapshot]
+VramProbe = Callable[[], int]
 EventLogger = Callable[[dict[str, object]], None]
 CancellationProbe = Callable[[], bool]
 
@@ -191,6 +192,41 @@ ServiceStateProbe = Callable[[str], ServiceStateSnapshot]
 ServiceInventoryProbe = Callable[[str], Sequence[str]]
 
 
+def nvidia_smi_vram_free_probe(
+    *, nvidia_smi: str = "nvidia-smi", timeout: float = 2.0
+) -> int:
+    """Return free primary-GPU memory in MiB for advisory backend handoff.
+
+    Unlike resource admission, callers treat any failure here as "VRAM cannot
+    be read" and fall back to waiting for the prior backend to exit.
+    """
+
+    result = subprocess.run(
+        (
+            nvidia_smi,
+            "-i",
+            "0",
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    line = next(
+        (candidate.strip() for candidate in result.stdout.splitlines() if candidate.strip()),
+        "",
+    )
+    try:
+        free_mib = int(line)
+    except ValueError as error:
+        raise ValueError("nvidia-smi returned non-numeric free VRAM") from error
+    if free_mib < 0:
+        raise ValueError("nvidia-smi returned negative free VRAM")
+    return free_mib
+
+
 def systemd_service_state_probe(unit_name: str) -> ServiceStateSnapshot:
     """Read exact user-unit process state without any Windows-side IPC."""
 
@@ -268,6 +304,10 @@ class QuiescenceError(BackendControllerError):
 
 class LifecycleCancelledError(BackendControllerError):
     """A start or admission step was cancelled before model activation."""
+
+
+class ActivationPreemptedError(LifecycleCancelledError):
+    """A newer request preempted an idle backend activation."""
 
 
 class ServiceOwnershipError(BackendControllerError):
@@ -451,6 +491,11 @@ class BackendController:
         managed_args: Sequence[str] | Mapping[str, Sequence[str]] = (),
         verify_command: VerifyCommand | None = None,
         artifact_verifier: ArtifactVerifier | None = None,
+        vram_probe: VramProbe | None = None,
+        preemption_event: threading.Event | None = None,
+        handoff_min_vram_rise_mib: int = 256,
+        handoff_timeout: float = 30.0,
+        handoff_poll_interval: float = 0.25,
     ) -> None:
         if not profiles:
             raise ConfigurationError("at least one profile is required")
@@ -483,6 +528,21 @@ class BackendController:
             }
         else:
             self.managed_args = tuple(managed_args)
+        if handoff_min_vram_rise_mib <= 0:
+            raise ConfigurationError("handoff_min_vram_rise_mib must be positive")
+        if handoff_timeout < 0 or handoff_poll_interval <= 0:
+            raise ConfigurationError("handoff timings must be positive")
+        self.vram_probe = vram_probe
+        self.handoff_min_vram_rise_mib = handoff_min_vram_rise_mib
+        self.handoff_timeout = handoff_timeout
+        self.handoff_poll_interval = handoff_poll_interval
+        # Units whose stop was requested without waiting for exit, and the
+        # free-VRAM reading taken just before the first of those stops.
+        self._released_units: set[str] = set()
+        self._handoff_baseline_mib: int | None = None
+        self._preempt_event = preemption_event or threading.Event()
+        self._activation_guard = threading.Lock()
+        self._activation_target: str | None = None
         self._lock = threading.RLock()
         self._validate_profiles()
 
@@ -887,116 +947,159 @@ class BackendController:
         """Switch to *profile_id*, restoring the prior profile on any failure."""
 
         with self._lock:
-            self._require_not_cancelled("switch")
-            target = self._profile(profile_id)
-            prior_state = self._read_state()
-            if prior_state["phase"] == "switching":
-                prior_state = self.reconcile()
-            prior_id = prior_state.get("profile")
-            if prior_id is not None:
-                self._profile(prior_id)
-            generation = prior_state["generation"]
+            with self._activation_guard:
+                self._activation_target = profile_id
+                self._preempt_event.clear()
+            try:
+                return self._switch_locked(profile_id, force_restart=force_restart)
+            finally:
+                with self._activation_guard:
+                    self._activation_target = None
+                    self._preempt_event.clear()
+
+    def preempt_activation(self) -> bool:
+        """Ask an in-progress switch to abandon its target gracefully.
+
+        The broker only calls this when no request holds a slot on the
+        activating backend. The switch observes the request at its next
+        cancellation point (including the readiness wait), stops the partially
+        started target, and records an inactive state. Returns whether a switch
+        was in progress to receive the request.
+        """
+
+        with self._activation_guard:
+            target = self._activation_target
+            if target is None:
+                return False
+            self._preempt_event.set()
+        self._emit(
+            "profile_transition",
+            decision="preempt_requested",
+            target_profile=target,
+        )
+        return True
+
+    def _switch_locked(
+        self,
+        profile_id: str,
+        *,
+        force_restart: bool,
+    ) -> dict[str, Any]:
+        self._require_not_cancelled("switch")
+        target = self._profile(profile_id)
+        prior_state = self._read_state()
+        if prior_state["phase"] == "switching":
+            prior_state = self.reconcile()
+        prior_id = prior_state.get("profile")
+        if prior_id is not None:
+            self._profile(prior_id)
+        generation = prior_state["generation"]
+        self._emit(
+            "profile_transition",
+            decision="requested",
+            prior_profile=prior_id,
+            target_profile=profile_id,
+            generation=generation,
+        )
+
+        restart_current = force_restart
+        if prior_id == profile_id and prior_state["phase"] == "active":
+            if not restart_current:
+                try:
+                    self._probe_owned(profile_id, target)
+                except (ReadinessError, ServiceOwnershipError):
+                    # Persisted state can outlive the process.  Fall through to a
+                    # controlled restart when the exact alias is no longer ready.
+                    restart_current = True
+                else:
+                    self._emit(
+                        "profile_transition",
+                        decision="already_active",
+                        prior_profile=prior_id,
+                        target_profile=profile_id,
+                        generation=generation,
+                    )
+                    return prior_state
+
+        switching_state = {
+            "generation": generation,
+            "profile": prior_id,
+            "phase": "switching",
+            "target_profile": profile_id,
+        }
+        self._write_state(switching_state)
+
+        target_start_attempted = False
+        try:
+            if prior_id is not None and (
+                prior_id != profile_id
+                or prior_state["phase"] != "active"
+                or restart_current
+            ):
+                if prior_id == profile_id:
+                    self._stop(prior_id)
+                else:
+                    self._release_unit(self.unit_name(prior_id))
+            lingering = self._await_handoff(stage=f"pre_start:{profile_id}")
+            pre_start_snapshot = self._admit_pre_start(target)
             self._emit(
                 "profile_transition",
-                decision="requested",
+                decision="target_starting",
                 prior_profile=prior_id,
                 target_profile=profile_id,
                 generation=generation,
             )
-
-            restart_current = force_restart
-            if prior_id == profile_id and prior_state["phase"] == "active":
-                if not restart_current:
-                    try:
-                        self._probe_owned(profile_id, target)
-                    except (ReadinessError, ServiceOwnershipError):
-                        # Persisted state can outlive the process.  Fall through to a
-                        # controlled restart when the exact alias is no longer ready.
-                        restart_current = True
-                    else:
-                        self._emit(
-                            "profile_transition",
-                            decision="already_active",
-                            prior_profile=prior_id,
-                            target_profile=profile_id,
-                            generation=generation,
-                        )
-                        return prior_state
-
-            switching_state = {
-                "generation": generation,
-                "profile": prior_id,
-                "phase": "switching",
-                "target_profile": profile_id,
-            }
-            self._write_state(switching_state)
-
-            target_start_attempted = False
-            try:
-                if prior_id is not None and (
-                    prior_id != profile_id
-                    or prior_state["phase"] != "active"
-                    or restart_current
-                ):
-                    self._stop(prior_id)
-                pre_start_snapshot = self._admit_pre_start(target)
-                self._emit(
-                    "profile_transition",
-                    decision="target_starting",
-                    prior_profile=prior_id,
-                    target_profile=profile_id,
-                    generation=generation,
-                )
-                target_start_attempted = True
-                self._start(profile_id)
-                self._probe_owned(profile_id, target)
-                self._admit_post_ready(target, pre_start_snapshot)
-                self._emit(
-                    "profile_transition",
-                    decision="target_ready",
-                    prior_profile=prior_id,
-                    target_profile=profile_id,
-                    generation=generation,
-                )
-            except Exception as target_error:
-                self._emit(
-                    "profile_transition",
-                    decision="target_failed",
-                    prior_profile=prior_id,
-                    target_profile=profile_id,
-                    generation=generation,
-                    error_type=type(target_error).__name__,
-                    error=str(target_error),
-                )
-                self._handle_failed_switch(
-                    profile_id=profile_id,
-                    prior_id=prior_id,
-                    generation=generation,
-                    target_error=target_error,
-                    cleanup_target=target_start_attempted,
-                )
-                raise AssertionError("failed switch handler must raise")
-
-            active_state = {
-                "generation": generation + 1,
-                "profile": profile_id,
-                "phase": "active",
-            }
-            runtime_build = getattr(target, "runtime_build", None)
-            server_sha256 = getattr(target, "server_sha256", None)
-            if isinstance(runtime_build, str) and runtime_build and isinstance(server_sha256, str) and server_sha256:
-                active_state["runtime_build"] = runtime_build
-                active_state["server_sha256"] = server_sha256
-            self._write_state(active_state)
-            self._update_alias(profile_id)
+            target_start_attempted = True
+            self._start(profile_id, lingering=lingering)
+            self._finish_handoff(lingering, target_profile=profile_id)
+            self._probe_owned(profile_id, target)
+            self._admit_post_ready(target, pre_start_snapshot)
             self._emit(
                 "profile_transition",
-                decision="committed",
+                decision="target_ready",
                 prior_profile=prior_id,
                 target_profile=profile_id,
-                generation=active_state["generation"],
+                generation=generation,
             )
-            return active_state
+        except Exception as target_error:
+            self._emit(
+                "profile_transition",
+                decision="target_failed",
+                prior_profile=prior_id,
+                target_profile=profile_id,
+                generation=generation,
+                error_type=type(target_error).__name__,
+                error=str(target_error),
+            )
+            self._handle_failed_switch(
+                profile_id=profile_id,
+                prior_id=prior_id,
+                generation=generation,
+                target_error=target_error,
+                cleanup_target=target_start_attempted,
+            )
+            raise AssertionError("failed switch handler must raise")
+
+        active_state = {
+            "generation": generation + 1,
+            "profile": profile_id,
+            "phase": "active",
+        }
+        runtime_build = getattr(target, "runtime_build", None)
+        server_sha256 = getattr(target, "server_sha256", None)
+        if isinstance(runtime_build, str) and runtime_build and isinstance(server_sha256, str) and server_sha256:
+            active_state["runtime_build"] = runtime_build
+            active_state["server_sha256"] = server_sha256
+        self._write_state(active_state)
+        self._update_alias(profile_id)
+        self._emit(
+            "profile_transition",
+            decision="committed",
+            prior_profile=prior_id,
+            target_profile=profile_id,
+            generation=active_state["generation"],
+        )
+        return active_state
 
     def restart(self, profile_id: str) -> dict[str, Any]:
         """Restart a profile even when its alias is currently healthy."""
@@ -1230,10 +1333,15 @@ class BackendController:
         target_error: BaseException,
         cleanup_target: bool,
     ) -> None:
+        preempted = isinstance(target_error, ActivationPreemptedError)
         cleanup_error: BaseException | None = None
         if cleanup_target:
             try:
-                self._stop(profile_id)
+                if preempted:
+                    # Let the next switch overlap this stop with its own load.
+                    self._release_unit(self.unit_name(profile_id))
+                else:
+                    self._stop(profile_id)
                 self._emit(
                     "profile_transition",
                     decision="target_stopped",
@@ -1252,6 +1360,25 @@ class BackendController:
                     error_type=type(error).__name__,
                     error=str(error),
                 )
+
+        if preempted and cleanup_error is None:
+            preempted_state = {
+                "generation": generation + 1,
+                "profile": None,
+                "phase": "inactive",
+                "prior_profile": prior_id,
+                "preempted_profile": profile_id,
+            }
+            self._write_state(preempted_state)
+            self._update_alias(None)
+            self._emit(
+                "profile_transition",
+                decision="preempted",
+                prior_profile=prior_id,
+                target_profile=profile_id,
+                generation=generation,
+            )
+            raise SwitchError(profile_id, target_error) from target_error
 
         failed_state = {
             "generation": generation,
@@ -1308,10 +1435,12 @@ class BackendController:
             pass
 
     def _require_not_cancelled(self, stage: str) -> None:
-        if self.cancellation_probe is None:
-            return
         try:
-            cancelled = bool(self.cancellation_probe())
+            cancelled = (
+                bool(self.cancellation_probe())
+                if self.cancellation_probe is not None
+                else False
+            )
         except Exception as error:
             raise LifecycleCancelledError(
                 f"lifecycle cancellation probe failed at {stage}: {error}"
@@ -1319,6 +1448,10 @@ class BackendController:
         if cancelled:
             raise LifecycleCancelledError(
                 f"backend activation cancelled at {stage}"
+            )
+        if self._preempt_event.is_set():
+            raise ActivationPreemptedError(
+                f"backend activation preempted at {stage}"
             )
 
     def _admit_pre_start(self, profile: Profile) -> ResourceSnapshot | None:
@@ -1462,10 +1595,14 @@ class BackendController:
             ) from error
         return snapshot
 
-    def _start(self, profile_id: str) -> None:
+    def _start(
+        self, profile_id: str, *, lingering: Iterable[str] = ()
+    ) -> None:
         profile = self._profile(profile_id)
         self._require_not_cancelled(f"start:{profile_id}")
-        self._require_all_quiescent(stage=f"pre_start:{profile_id}")
+        stopping = set(lingering)
+        for unit_name in sorted(self._all_backend_unit_names() - stopping):
+            self._require_unit_quiescent(unit_name, stage=f"pre_start:{profile_id}")
         self._require_endpoint_absent(stage=f"pre_start:{profile_id}")
         self._require_not_cancelled(f"pre_command_start:{profile_id}")
         if self.artifact_verifier is not None:
@@ -1474,6 +1611,147 @@ class BackendController:
 
     def _stop(self, profile_id: str) -> None:
         self._stop_unit(self.unit_name(profile_id))
+
+    def _handoff_enabled(self) -> bool:
+        return self.vram_probe is not None and self.service_state_probe is not None
+
+    def _sample_vram_free(self) -> int | None:
+        if self.vram_probe is None:
+            return None
+        try:
+            free_mib = self.vram_probe()
+            if isinstance(free_mib, bool) or not isinstance(free_mib, int) or free_mib < 0:
+                raise ValueError(f"invalid free VRAM reading: {free_mib!r}")
+        except Exception as error:
+            self._emit(
+                "backend_handoff",
+                decision="vram_probe_error",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+            return None
+        return free_mib
+
+    def _unit_is_quiescent(self, unit_name: str) -> bool:
+        if self.service_state_probe is None:
+            return True
+        try:
+            snapshot = self.service_state_probe(unit_name)
+        except Exception:
+            return False
+        return isinstance(snapshot, ServiceStateSnapshot) and snapshot.is_quiescent
+
+    def _endpoint_is_absent(self) -> bool:
+        if self.endpoint_probe is None:
+            return True
+        try:
+            return not bool(self.endpoint_probe())
+        except Exception:
+            return False
+
+    def _release_unit(self, unit_name: str) -> None:
+        """Ask *unit_name* to stop without waiting for its process to exit.
+
+        The next activation may start as soon as free VRAM begins rising.
+        Without a readable VRAM probe this is an ordinary blocking stop.
+        """
+
+        if not self._handoff_enabled():
+            self._stop_unit(unit_name)
+            return
+        if not self._released_units:
+            self._handoff_baseline_mib = self._sample_vram_free()
+        if self._handoff_baseline_mib is None:
+            self._stop_unit(unit_name)
+            return
+        try:
+            self._run("systemctl", "--user", "--no-block", "stop", unit_name)
+        except Exception as error:
+            self._emit(
+                "backend_handoff",
+                unit=unit_name,
+                decision="no_block_stop_failed",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+            self._stop_unit(unit_name)
+            return
+        self._released_units.add(unit_name)
+        self._emit(
+            "backend_handoff",
+            unit=unit_name,
+            decision="stop_requested",
+            baseline_vram_free_mib=self._handoff_baseline_mib,
+        )
+
+    def _await_handoff(self, *, stage: str) -> set[str]:
+        """Wait until released units exit or free VRAM starts rising.
+
+        Returns the units that are still stopping when the next backend may
+        start. They must be finished with :meth:`_finish_handoff` after the
+        new unit has been started.
+        """
+
+        if not self._released_units:
+            return set()
+        baseline = self._handoff_baseline_mib
+        deadline = time.monotonic() + self.handoff_timeout
+        while True:
+            self._require_not_cancelled(stage)
+            self._released_units = {
+                unit for unit in self._released_units
+                if not self._unit_is_quiescent(unit)
+            }
+            if not self._released_units:
+                self._handoff_baseline_mib = None
+                self._emit("backend_handoff", stage=stage, decision="prior_exited")
+                return set()
+            if baseline is not None:
+                free_mib = self._sample_vram_free()
+                if (
+                    free_mib is not None
+                    and free_mib - baseline >= self.handoff_min_vram_rise_mib
+                    and self._endpoint_is_absent()
+                ):
+                    self._emit(
+                        "backend_handoff",
+                        stage=stage,
+                        decision="early_start",
+                        units=sorted(self._released_units),
+                        baseline_vram_free_mib=baseline,
+                        vram_free_mib=free_mib,
+                    )
+                    return set(self._released_units)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.handoff_poll_interval)
+
+        self._emit(
+            "backend_handoff",
+            stage=stage,
+            decision="wait_for_exit",
+            units=sorted(self._released_units),
+        )
+        for unit_name in sorted(self._released_units):
+            self._stop_unit(unit_name)
+        self._released_units.clear()
+        self._handoff_baseline_mib = None
+        return set()
+
+    def _finish_handoff(self, lingering: Iterable[str], *, target_profile: str) -> None:
+        """Prove units released early have exited while the target loads."""
+
+        for unit_name in sorted(lingering):
+            self._stop_unit(unit_name)
+            self._released_units.discard(unit_name)
+            self._emit(
+                "backend_handoff",
+                unit=unit_name,
+                target_profile=target_profile,
+                decision="prior_exited_after_start",
+            )
+        if not self._released_units:
+            self._handoff_baseline_mib = None
 
     def _stop_unit(self, unit_name: str) -> None:
         try:
@@ -1703,6 +1981,7 @@ class BackendController:
     def _probe(self, profile: Profile) -> None:
         self._require_not_cancelled(f"readiness:{profile.id}")
         if not self.readiness_probe(profile.alias, float(profile.startup_timeout)):
+            self._require_not_cancelled(f"readiness:{profile.id}")
             raise ReadinessError(
                 f"profile {profile.id!r} did not serve exact alias {profile.alias!r} "
                 f"within {profile.startup_timeout:g}s"
