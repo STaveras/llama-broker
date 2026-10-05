@@ -119,32 +119,46 @@ class ProductionManifestTests(unittest.TestCase):
 
         self.assertEqual(controller.backend_listen_host, "127.0.0.1")
 
-    def test_linux_resource_snapshot_reads_meminfo_and_primary_gpu(self) -> None:
-        with self.subTest("valid sample"):
-            with tempfile.TemporaryDirectory() as directory:
-                meminfo = Path(directory) / "meminfo"
-                meminfo.write_text(
-                    "MemAvailable:       24576000 kB\n"
-                    "SwapTotal:           8388608 kB\n"
-                    "SwapFree:            8327168 kB\n",
-                    encoding="utf-8",
-                )
-                with patch(
-                    "llama_broker.backend_controller.subprocess.run",
-                    return_value=SimpleNamespace(stdout="12227, 10913\n"),
-                ) as run:
-                    snapshot = linux_resource_snapshot(meminfo)
+    def test_linux_resource_snapshot_leaves_gpu_memory_unknown_without_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            meminfo = Path(directory) / "meminfo"
+            meminfo.write_text(
+                "MemAvailable:       24576000 kB\n"
+                "SwapTotal:           8388608 kB\n"
+                "SwapFree:            8327168 kB\n",
+                encoding="utf-8",
+            )
+            with patch("llama_broker.backend_controller.subprocess.run") as run:
+                snapshot = linux_resource_snapshot(meminfo)
 
-                self.assertEqual(
-                    snapshot,
-                    ResourceSnapshot(
-                        ram_available_mib=24000,
-                        swap_used_mib=60,
-                        vram_total_mib=12227,
-                        vram_free_mib=10913,
-                    ),
-                )
-                self.assertEqual(run.call_args.args[0][:3], ("nvidia-smi", "-i", "0"))
+            self.assertEqual(
+                snapshot,
+                ResourceSnapshot(
+                    ram_available_mib=24000,
+                    swap_used_mib=60,
+                    vram_total_mib=None,
+                    vram_free_mib=None,
+                ),
+            )
+            run.assert_not_called()
+
+    def test_linux_resource_snapshot_accepts_an_injected_gpu_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            meminfo = Path(directory) / "meminfo"
+            meminfo.write_text(
+                "MemAvailable:       24576000 kB\n"
+                "SwapTotal:           8388608 kB\n"
+                "SwapFree:            8327168 kB\n",
+                encoding="utf-8",
+            )
+
+            snapshot = linux_resource_snapshot(
+                meminfo,
+                gpu_memory_probe=lambda: (12227, 10913),
+            )
+
+            self.assertEqual(snapshot.vram_total_mib, 12227)
+            self.assertEqual(snapshot.vram_free_mib, 10913)
 
     def test_controller_render_has_one_model_and_alias_pair(self) -> None:
         controller = BackendController(

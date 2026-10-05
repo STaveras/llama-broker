@@ -23,6 +23,14 @@ class SafetyLadderPortabilityTests(unittest.TestCase):
     def test_ladder_reaches_full_window_with_template_reserve(self) -> None:
         self.assertEqual(safety_ladder.MAX_TARGET_TOKENS, 262_000)
 
+    def test_gpu_state_is_unknown_without_a_portable_provider(self) -> None:
+        with patch.object(
+            safety_ladder.subprocess,
+            "run",
+            side_effect=AssertionError("GPU telemetry must not invoke a vendor utility"),
+        ):
+            self.assertIsNone(safety_ladder.gpu_state())
+
     def test_default_fault_collection_has_no_windows_dependency(self) -> None:
         with (
             patch.object(safety_ladder, "linux_gpu_faults", return_value=[]),

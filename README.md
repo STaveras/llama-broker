@@ -227,9 +227,10 @@ directly.
   a client budget use the inverse-parallel default
   (`slot_context_window // parallel`); `LLAMA_BROKER_MAX_OUTPUT_TOKENS` may set
   an explicit operator ceiling.
-- **No GPU-telemetry dependency for normal switching.** Resource bounds come
-  from systemd cgroups; `nvidia-smi`-based admission is only used in explicit
-  qualification experiments.
+- **No automatic GPU-telemetry dependency.** Resource bounds come from systemd
+  cgroups; GPU safety limits that require VRAM fail closed when no provider is
+  configured. Production controller resource admission is not configured by
+  default, and the Strata bridge refuses startup without VRAM telemetry.
 - **Lifecycle failure handling.** Successful transient requests retain the
   current restore behavior. Failed transitions stop/quarantine the failed
   target, clear the active alias, and do not automatically restore or restart

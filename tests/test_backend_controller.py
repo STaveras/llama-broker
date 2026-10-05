@@ -10,6 +10,7 @@ from unittest.mock import patch
 from llama_broker import backend_controller
 
 from llama_broker.backend_controller import (
+    ActivationPreemptedError,
     AdmissionError,
     BackendController,
     CommandError,
@@ -888,6 +889,28 @@ class BackendControllerTest(unittest.TestCase):
         self.assertIn("ram_available_mib", " ".join(decision["violations"]))
         self.assertEqual(self.read_state()["phase"], "failed")
 
+    def test_unknown_vram_fails_closed_when_vram_admission_is_required(self) -> None:
+        self.controller.resource_probe = lambda: ResourceSnapshot(
+            ram_available_mib=24_000,
+            swap_used_mib=0,
+            vram_total_mib=None,
+            vram_free_mib=None,
+        )
+
+        with self.assertRaises(SwitchError) as raised:
+            self.controller.switch("main-27b")
+
+        self.assertIsInstance(raised.exception.cause, AdmissionError)
+        self.assertEqual(self.harness.commands, [])
+        decision = next(
+            event for event in self.harness.events
+            if event.get("event") == "resource_admission"
+        )
+        self.assertEqual(decision["decision"], "deny")
+        violations = str(decision.get("violations", ""))
+        self.assertIn("vram_total_mib unavailable", violations)
+        self.assertIn("vram_free_mib unavailable", violations)
+
     def test_resource_probe_failure_fails_closed_and_is_logged(self) -> None:
         self.harness.resource_probe_error = OSError("qualification probe unavailable")
 
@@ -1486,6 +1509,90 @@ class BackendControllerTest(unittest.TestCase):
         self.assertIsNone(state["profile"])
         self.assertEqual(state["stale_profile"], "main-27b")
         self.assertEqual(self.harness.probes, [("main-27b", 0.25)])
+
+
+class BackendPreemptionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.harness = Harness()
+        self.main = FakeProfile(
+            id="main-27b",
+            alias="main-27b",
+            display_name="Main 27B",
+            server_binary="/opt/llama-server",
+            model_path="/models/main.gguf",
+        )
+        self.vision = FakeProfile(
+            id="qwen-vision",
+            alias="qwen-vision",
+            display_name="Qwen vision",
+            server_binary="/opt/llama-server",
+            model_path="/models/qwen.gguf",
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def make_controller(self, **overrides: object) -> BackendController:
+        options: dict[str, object] = {
+            "profiles": {profile.id: profile for profile in (self.main, self.vision)},
+            "state_path": self.root / "state.json",
+            "systemd_dir": self.root / "systemd",
+            "service_prefix": "llama-broker-profile",
+            "command_runner": self.harness.run,
+            "readiness_probe": self.harness.probe,
+            "resource_probe": None,
+            "event_logger": self.harness.log_event,
+            "service_state_probe": self.harness.service_state,
+        }
+        options.update(overrides)
+        return BackendController(**options)  # type: ignore[arg-type]
+
+    def unit(self, controller: BackendController, profile_id: str) -> str:
+        return controller.unit_name(profile_id)
+
+    def test_preempted_activation_stops_target_and_records_inactive_state(self) -> None:
+        controller = self.make_controller()
+        controller.switch("main-27b")
+
+        def preempted_probe(alias: str, timeout: float) -> bool:
+            self.assertTrue(controller.preempt_activation())
+            return False
+
+        controller.readiness_probe = preempted_probe
+        with self.assertRaises(SwitchError) as caught:
+            controller.switch("qwen-vision")
+
+        self.assertIsInstance(caught.exception.__cause__, ActivationPreemptedError)
+        vision_unit = self.unit(controller, "qwen-vision")
+        self.assertEqual(
+            self.harness.commands[-1],
+            ("systemctl", "--user", "stop", vision_unit),
+        )
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "inactive")
+        self.assertIsNone(state["profile"])
+        self.assertEqual(state["preempted_profile"], "qwen-vision")
+        self.assertTrue(self.harness.service_state(vision_unit).is_quiescent)
+        self.assertFalse(controller.preempt_activation())
+
+        controller.readiness_probe = self.harness.probe
+        state = controller.switch("main-27b")
+
+        self.assertEqual(state["profile"], "main-27b")
+        self.assertEqual(
+            self.harness.commands[-1],
+            ("systemctl", "--user", "start", self.unit(controller, "main-27b")),
+        )
+
+    def test_preempt_without_switch_in_progress_is_ignored(self) -> None:
+        controller = self.make_controller()
+
+        self.assertFalse(controller.preempt_activation())
+        state = controller.switch("main-27b")
+
+        self.assertEqual(state["profile"], "main-27b")
 
 
 if __name__ == "__main__":
