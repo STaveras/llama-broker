@@ -20,8 +20,6 @@ from llama_broker.hygiene import (
     HygieneError,
     apply_plan,
     build_plan,
-    parse_lxss_base_path,
-    windows_to_wsl_path,
 )
 
 MIB = 1024 * 1024
@@ -321,30 +319,6 @@ class ApplyTests(HygieneTestCase):
         self.assertIn("same filesystem", result.failed[0]["error"])
 
 
-class WslDiskTests(unittest.TestCase):
-    def test_base_path_is_found_for_the_named_distribution(self) -> None:
-        output = (
-            "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\n"
-            "    DefaultDistribution    REG_SZ    {a}\n\n"
-            "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{a}\n"
-            "    BasePath    REG_SZ    \\\\?\\C:\\Users\\example\\wsl\\Debian\n"
-            "    DistributionName    REG_SZ    Debian\n\n"
-            "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{b}\n"
-            "    BasePath    REG_SZ    C:\\Users\\example\\AppData\\Local\\Packages\\Ubuntu\\LocalState\n"
-            "    DistributionName    REG_SZ    Ubuntu\n"
-        )
-        self.assertEqual(
-            parse_lxss_base_path(output, "ubuntu"),
-            "C:\\Users\\example\\AppData\\Local\\Packages\\Ubuntu\\LocalState",
-        )
-        self.assertEqual(parse_lxss_base_path(output, "Debian"), "C:\\Users\\example\\wsl\\Debian")
-        self.assertIsNone(parse_lxss_base_path(output, "Arch"))
-
-    def test_windows_paths_map_to_drvfs_mounts(self) -> None:
-        self.assertEqual(windows_to_wsl_path("C:\\Users\\example\\ext4.vhdx"), Path("/mnt/c/Users/example/ext4.vhdx"))
-        self.assertIsNone(windows_to_wsl_path("\\\\server\\share"))
-
-
 class BrokerctlCleanTests(HygieneTestCase):
     def run_cli(self, *argv: str, terminal: bool = False, answer: object = None) -> tuple[int, str, str]:
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -354,7 +328,6 @@ class BrokerctlCleanTests(HygieneTestCase):
             patch.object(brokerctl, "_interactive_terminal", return_value=terminal),
             patch.object(brokerctl, "_clean_roots", return_value=self.roots),
             patch.object(brokerctl, "CONFIG_DIR", self.roots.config_dir),
-            patch.object(brokerctl, "wsl_disk_report", return_value=None),
             patch.object(brokerctl, "build_plan", side_effect=lambda roots, options: build_plan(
                 roots, options, now=LATER, running_executables=lambda: ())),
             redirect_stdout(stdout),

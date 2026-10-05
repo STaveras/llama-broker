@@ -137,7 +137,7 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 | `brokerctl restart` | reload the active model or start a new one |
 | `brokerctl unload` | stop the current backing backend |
 | `brokerctl verify` | verify pinned runtime/model/projector SHA-256 |
-| `brokerctl clean [models\|runtimes\|backups\|caches]` | list unused models, orphaned runtime bundles and old manifest backups, then ask before cleaning them (scripts and `--json` only get the list); `--apply` cleans without asking. Cleaning deletes; with `--archive-dir DIR` (or `LLAMA_BROKER_ARCHIVE_DIR`) models and backups are copied there and SHA-256 verified first. Package caches are included only when `caches` is named; under WSL it also reports how much compacting the virtual disk would return. Paths in `~/.config/llama-broker/clean-keep` (or `--keep`) are never touched |
+| `brokerctl clean [models\|runtimes\|backups\|caches]` | list unused models, orphaned runtime bundles and old manifest backups, then ask before cleaning them (scripts and `--json` only get the list); `--apply` cleans without asking. Cleaning deletes; with `--archive-dir DIR` (or `LLAMA_BROKER_ARCHIVE_DIR`) models and backups are copied there and SHA-256 verified first. Package caches are included only when `caches` is named. Paths in `~/.config/llama-broker/clean-keep` (or `--keep`) are never touched |
 | `brokerctl setup` | first-time discovery wizard; `--check`/`--dry-run` are non-mutating |
 | `brokerctl runtime list` | list registered runtimes and the profiles selecting each (`--json` for a schema-versioned report) |
 | `brokerctl security init` | provision TLS + API-key material |

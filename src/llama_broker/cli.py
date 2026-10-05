@@ -79,7 +79,6 @@ from .integration import filtered_manifest, inspect_manifest, report_for
 from .hygiene import (
     CATEGORIES as CLEAN_CATEGORIES,
     DEFAULT_CATEGORIES as DEFAULT_CLEAN_CATEGORIES,
-    WSL_COMPACT_THRESHOLD_BYTES,
     ApplyResult,
     CleanOptions,
     CleanPlan,
@@ -88,8 +87,6 @@ from .hygiene import (
     apply_plan,
     build_plan,
     still_unreferenced,
-    wsl_compaction_steps,
-    wsl_disk_report,
 )
 from .paths import (
     CONFIG_DIR,
@@ -391,21 +388,6 @@ def _print_clean_result(result: ApplyResult) -> None:
         print(f"  FAILED {entry['path']}: {entry['error']} (original kept)", file=sys.stderr)
 
 
-def _print_wsl_disk(wsl_disk: Mapping[str, object] | None) -> None:
-    if wsl_disk and "error" not in wsl_disk:
-        reclaimable = int(wsl_disk.get("reclaimable_bytes", 0))
-        if reclaimable >= WSL_COMPACT_THRESHOLD_BYTES:
-            print(
-                f"\nWSL: {wsl_disk['vhdx_path']} takes {_format_bytes(int(wsl_disk['vhdx_bytes']))} "
-                f"on Windows but Linux uses {_format_bytes(int(wsl_disk['filesystem_used_bytes']))}; "
-                f"compacting it returns ~{_format_bytes(reclaimable)} to Windows:"
-            )
-            for step in wsl_compaction_steps(str(wsl_disk["vhdx_path"])):
-                print(f"  {step}")
-    elif wsl_disk:
-        print(f"\nWSL disk check unavailable: {wsl_disk['error']}")
-
-
 def _confirm_clean(plan: CleanPlan) -> bool:
     """Ask before acting on a dry run's plan; anything but yes declines."""
     steps = []
@@ -454,7 +436,6 @@ def _cmd_clean(args: argparse.Namespace) -> int:
         )
 
     result = apply() if args.apply else None
-    wsl_disk = wsl_disk_report()
     if args.json:
         print(json.dumps({
             "schema_version": 1,
@@ -466,7 +447,6 @@ def _cmd_clean(args: argparse.Namespace) -> int:
                 "archive_bytes": plan.total_bytes("archive"),
                 "delete_bytes": plan.total_bytes("delete"),
             },
-            "wsl_disk": wsl_disk,
             "result": result.as_mapping() if result is not None else None,
         }, indent=2, sort_keys=True))
         return 1 if result is not None and result.failed else 0
@@ -474,7 +454,6 @@ def _cmd_clean(args: argparse.Namespace) -> int:
     _print_clean_plan(plan, categories, applying=args.apply)
     if result is not None:
         _print_clean_result(result)
-    _print_wsl_disk(wsl_disk)
     if result is None and plan.candidates:
         # A dry run at a terminal offers to go ahead; scripts get the plan only.
         if not _interactive_terminal():
