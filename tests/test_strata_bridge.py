@@ -150,6 +150,25 @@ class StrataBridgeTests(unittest.TestCase):
         )
         self.assertIn("bounded resident", warning or "")
 
+    def test_streaming_kv_formats_are_accepted_and_k8v4_is_rejected(self) -> None:
+        base_args = list(self.launch_config["engine_args"])
+        for kv_format in ("fp16", "int8", "q4_0"):
+            self.launch_config["engine_args"] = [*base_args, "--kv", kv_format]
+            self.config_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+            loaded = _load_launch_config(
+                self.config_path,
+                hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(loaded["engine_args"][-1], kv_format)
+
+        self.launch_config["engine_args"] = [*base_args, "--kv", "k8v4"]
+        self.config_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+        with self.assertRaisesRegex(StrataBridgeError, "KV format"):
+            _load_launch_config(
+                self.config_path,
+                hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
+            )
+
     def test_reads_last_key_from_private_file(self) -> None:
         self.key_file.write_text("older-key\ncurrent-key\n", encoding="utf-8")
         self.key_file.chmod(0o600)
