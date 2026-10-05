@@ -23,7 +23,6 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 import tarfile
 import time
 from dataclasses import dataclass, field
@@ -43,7 +42,6 @@ ARCHIVABLE_CATEGORIES = frozenset({"models", "backups"})
 # Manifests whose backups accumulate next to the live file.
 BACKUP_BASENAMES = ("profiles.json", "state.json", "catalog.json")
 BUNDLE_STEM_MARKER = "runtime-bundle"
-WSL_COMPACT_THRESHOLD_BYTES = 5 * 1024**3
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w.~-])(/[^\s\"'=,;]+)")
 _GGUF_SPLIT_RE = re.compile(r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$")
 _HASH_CHUNK = 8 * 1024 * 1024
@@ -521,8 +519,8 @@ def _archive_file(source: Path, destination: Path) -> dict[str, object]:
 def _archive_tree(source: Path, destination: Path) -> dict[str, object]:
     """Write ``source`` to an uncompressed tar, then prove the tar matches it.
 
-    A tar keeps symlinks, hard links and modes intact on filesystems (NTFS
-    under WSL) that cannot represent them.
+    A tar keeps symlinks, hard links and modes intact on filesystems that
+    cannot represent them.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
     expected: dict[str, tuple[str, str, tuple[int, int]]] = {}
@@ -662,76 +660,3 @@ def apply_plan(
         except (OSError, HygieneError, tarfile.TarError) as error:
             result.failed.append({**record, "error": str(error)})
     return result
-
-
-# ── WSL virtual disk ────────────────────────────────────────────────────────
-
-def is_wsl() -> bool:
-    try:
-        return "microsoft" in Path("/proc/version").read_text(encoding="ascii", errors="ignore").lower()
-    except OSError:
-        return False
-
-
-def parse_lxss_base_path(reg_output: str, distribution: str) -> str | None:
-    """Find a distribution's BasePath in `reg.exe query ...\\Lxss /s` output."""
-    blocks = re.split(r"\r?\n(?=HKEY_)", reg_output)
-    for block in blocks:
-        values = dict(re.findall(r"^\s+(\w+)\s+REG_\w+\s+(.*?)\s*$", block, flags=re.MULTILINE))
-        if values.get("DistributionName", "").lower() == distribution.lower() and "BasePath" in values:
-            return values["BasePath"].removeprefix("\\\\?\\")
-    return None
-
-
-def windows_to_wsl_path(path: str) -> Path | None:
-    match = re.match(r"^([A-Za-z]):[\\/](.*)$", path)
-    if match is None:
-        return None
-    return Path("/mnt") / match[1].lower() / match[2].replace("\\", "/")
-
-
-def wsl_disk_report(*, timeout: float = 10.0) -> dict[str, object] | None:
-    """Compare this distribution's ext4.vhdx with what its filesystem uses."""
-    if not is_wsl():
-        return None
-    distribution = os.environ.get("WSL_DISTRO_NAME", "")
-    report: dict[str, object] = {"distribution": distribution or None}
-    try:
-        completed = subprocess.run(
-            ["reg.exe", "query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss", "/s"],
-            capture_output=True, text=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        return {**report, "error": f"cannot query WSL registration: {error}"}
-    base = parse_lxss_base_path(completed.stdout, distribution) if distribution else None
-    if base is None:
-        return {**report, "error": "cannot find this distribution's virtual disk"}
-    windows_vhdx = base.rstrip("\\") + "\\ext4.vhdx"
-    vhdx = windows_to_wsl_path(windows_vhdx)
-    try:
-        if vhdx is None:
-            raise OSError(f"unsupported Windows path {windows_vhdx}")
-        info = vhdx.stat()
-        filesystem = os.statvfs("/")
-    except OSError as error:
-        return {**report, "vhdx_path": windows_vhdx, "error": str(error)}
-    allocated = info.st_blocks * 512 if info.st_blocks else info.st_size
-    vhdx_bytes = min(info.st_size, allocated)
-    used = (filesystem.f_blocks - filesystem.f_bfree) * filesystem.f_frsize
-    return {
-        **report,
-        "vhdx_path": windows_vhdx,
-        "vhdx_bytes": vhdx_bytes,
-        "filesystem_used_bytes": used,
-        "reclaimable_bytes": max(0, vhdx_bytes - used),
-    }
-
-
-def wsl_compaction_steps(vhdx_path: str) -> tuple[str, ...]:
-    return (
-        "sudo fstrim -v /",
-        "In an administrator PowerShell (this stops WSL and every model):",
-        f'  wsl --shutdown; "select vdisk file=`"{vhdx_path}`"`nattach vdisk readonly`n'
-        'compact vdisk`ndetach vdisk" | Set-Content "$env:TEMP\\compact-wsl.txt"; '
-        'diskpart /s "$env:TEMP\\compact-wsl.txt"',
-    )
