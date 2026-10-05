@@ -153,14 +153,17 @@ Each profile declares two safety layers in `profiles.json`:
 - `safety.service` renders `Type=exec`, `MemoryMax`, `MemorySwapMax`,
   `TasksMax`, `KillSignal=SIGINT`, and `TimeoutStopSec` into the generated user
   unit. `Restart=no` remains mandatory.
-- `safety.admission` records capacity assumptions for explicit qualification
-  experiments; production switching does not enforce these telemetry values.
+- `safety.admission` records capacity assumptions for the controller's optional
+  resource probe. The production controller does not enable that probe; runtime
+  wrappers may enforce their own explicit gates and must fail closed on unknown
+  required telemetry.
 
-Production has no `nvidia-smi` dependency and no fixed free-VRAM gate.
-llama-server owns device placement, while systemd enforces the declared RAM,
-swap, and task ceilings. The controller keeps optional injectable resource
-admission for controlled tests, but the production controller configures none
-and logs `resource_admission=not_configured`.
+Production controller resource admission remains unconfigured by default and logs
+`resource_admission=not_configured`; it does not infer free GPU memory. The
+Linux resource snapshot reports VRAM as unknown unless a platform provider is
+injected, and any configured admission requirement that needs unknown VRAM is
+denied. The Strata bridge currently has no such provider and refuses startup
+rather than bypassing its required GPU floor.
 
 Lifecycle safety remains active: the old unit must be proven inactive with no
 processes, the private endpoint must be absent, the new unit must own the exact
@@ -468,8 +471,8 @@ the template and 128 requested output tokens. After every request the tool:
 - checks the server-reported prompt length and opening marker;
 - verifies `X-Llama-Broker-Profile`;
 - verifies that the backend PID did not change;
-- records prompt/decode rates and `nvidia-smi` memory, utilization,
-  temperature, and power;
+- records prompt/decode rates; GPU memory, utilization, temperature, and power
+  remain unknown until a portable telemetry provider is available;
 - scans the portable Linux kernel journal and the exact profile journal for
   CUDA failures, Xid reports, a fallen-off GPU, device assertions, and related
   backend errors, including a llama-server OOM kill.
@@ -514,7 +517,6 @@ python3 brokerctl.py status
 systemctl --user status llama-broker.service --no-pager -l
 journalctl --user -u llama-broker.service -n 200 --no-pager
 journalctl --user -u llama-broker-profile-example-9b-v3.service -n 200 --no-pager
-nvidia-smi
 ```
 
 Confirm the active production safety environment from the running process:

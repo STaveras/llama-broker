@@ -58,14 +58,14 @@ ArtifactVerifier = Callable[[Profile], None]
 
 @dataclass(frozen=True)
 class ResourceSnapshot:
-    """Linux host and primary-GPU capacity sampled at one transition boundary."""
+    """Host capacity and optional GPU memory data at one transition boundary."""
 
     ram_available_mib: int
     swap_used_mib: int
-    vram_total_mib: int
-    vram_free_mib: int
+    vram_total_mib: int | None = None
+    vram_free_mib: int | None = None
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | None]:
         return {
             "ram_available_mib": self.ram_available_mib,
             "swap_used_mib": self.swap_used_mib,
@@ -75,6 +75,7 @@ class ResourceSnapshot:
 
 
 ResourceProbe = Callable[[], ResourceSnapshot]
+GpuMemoryProbe = Callable[[], tuple[int, int]]
 EventLogger = Callable[[dict[str, object]], None]
 CancellationProbe = Callable[[], bool]
 
@@ -82,20 +83,14 @@ CancellationProbe = Callable[[], bool]
 def linux_resource_snapshot(
     proc_meminfo: str | os.PathLike[str] = "/proc/meminfo",
     *,
-    nvidia_smi: str = "nvidia-smi",
-    timeout: float = 5.0,
+    gpu_memory_probe: GpuMemoryProbe | None = None,
 ) -> ResourceSnapshot:
-    """Sample host RAM/swap and primary-GPU capacity using Linux-native probes.
+    """Read host RAM/swap and optionally accept a platform-provided GPU probe.
 
-    The probe intentionally fails closed when either `/proc/meminfo` or the
-    primary NVIDIA device cannot be read; callers convert that failure into a
-    denied profile transition instead of starting a model without a safety
-    snapshot. Available RAM is rounded down and swap usage is rounded up so
-    admission never overstates usable capacity.
+    Linux has no portable interface for reading free GPU memory. Without an
+    injected provider, VRAM values are unknown; admission checks that require
+    them must fail closed. RAM is rounded down and swap usage is rounded up.
     """
-
-    if timeout <= 0:
-        raise ValueError("resource probe timeout must be positive")
 
     meminfo = Path(proc_meminfo).read_text(encoding="utf-8")
     values_kib: dict[str, int] = {}
@@ -121,30 +116,19 @@ def linux_resource_snapshot(
     if values_kib["SwapFree"] > values_kib["SwapTotal"]:
         raise ValueError("/proc/meminfo reports SwapFree above SwapTotal")
 
-    result = subprocess.run(
-        (
-            nvidia_smi,
-            "-i",
-            "0",
-            "--query-gpu=memory.total,memory.free",
-            "--format=csv,noheader,nounits",
-        ),
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    line = next((candidate.strip() for candidate in result.stdout.splitlines() if candidate.strip()), "")
-    fields = [field.strip() for field in line.split(",")]
-    if len(fields) != 2:
-        raise ValueError("nvidia-smi returned no primary-GPU memory pair")
-    try:
-        vram_total_mib = int(fields[0])
-        vram_free_mib = int(fields[1])
-    except ValueError as error:
-        raise ValueError("nvidia-smi returned non-numeric primary-GPU memory") from error
-    if vram_total_mib <= 0 or vram_free_mib < 0 or vram_free_mib > vram_total_mib:
-        raise ValueError("nvidia-smi returned an invalid primary-GPU memory pair")
+    vram_total_mib = vram_free_mib = None
+    if gpu_memory_probe is not None:
+        vram_total_mib, vram_free_mib = gpu_memory_probe()
+        if (
+            isinstance(vram_total_mib, bool)
+            or not isinstance(vram_total_mib, int)
+            or isinstance(vram_free_mib, bool)
+            or not isinstance(vram_free_mib, int)
+            or vram_total_mib <= 0
+            or vram_free_mib < 0
+            or vram_free_mib > vram_total_mib
+        ):
+            raise ValueError("GPU memory provider returned an invalid total/free memory pair")
 
     def floor_mib(kib: int) -> int:
         return kib // 1024
@@ -268,6 +252,10 @@ class QuiescenceError(BackendControllerError):
 
 class LifecycleCancelledError(BackendControllerError):
     """A start or admission step was cancelled before model activation."""
+
+
+class ActivationPreemptedError(LifecycleCancelledError):
+    """A newer inference request preempted an idle backend activation."""
 
 
 class ServiceOwnershipError(BackendControllerError):
@@ -428,6 +416,7 @@ class BackendController:
         managed_args: Sequence[str] | Mapping[str, Sequence[str]] = (),
         verify_command: VerifyCommand | None = None,
         artifact_verifier: ArtifactVerifier | None = None,
+        preemption_event: threading.Event | None = None,
     ) -> None:
         if not profiles:
             raise ConfigurationError("at least one profile is required")
@@ -455,6 +444,9 @@ class BackendController:
         self.backend_listen_port = backend_listen_port
         self.verify_command = verify_command
         self.artifact_verifier = artifact_verifier
+        self._preempt_event = preemption_event or threading.Event()
+        self._activation_guard = threading.Lock()
+        self._activation_target: str | None = None
         if isinstance(managed_args, Mapping):
             self.managed_args = {
                 runtime: tuple(args) for runtime, args in managed_args.items()
@@ -863,8 +855,44 @@ class BackendController:
         force_restart: bool = False,
         commit_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        """Switch to *profile_id*, restoring the prior profile on any failure."""
+        """Switch to a profile while exposing a cancellable activation window."""
+        with self._lock:
+            with self._activation_guard:
+                self._activation_target = profile_id
+                self._preempt_event.clear()
+            try:
+                return self._switch_transaction(
+                    profile_id,
+                    force_restart=force_restart,
+                    commit_callback=commit_callback,
+                )
+            finally:
+                with self._activation_guard:
+                    self._activation_target = None
+                    self._preempt_event.clear()
 
+    def preempt_activation(self) -> bool:
+        """Request cooperative cancellation of the current target activation."""
+        with self._activation_guard:
+            target = self._activation_target
+            if target is None:
+                return False
+            self._preempt_event.set()
+        self._emit(
+            "profile_transition",
+            decision="preempt_requested",
+            target_profile=target,
+        )
+        return True
+
+    def _switch_transaction(
+        self,
+        profile_id: str,
+        *,
+        force_restart: bool = False,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Perform a transactional switch while holding the controller lock."""
         with self._lock:
             self._require_not_cancelled("switch")
             target = self._profile(profile_id)
@@ -946,9 +974,9 @@ class BackendController:
                     generation=generation,
                 )
             except LifecycleCancelledError as cancellation_error:
-                if commit_called:
-                    # Once the old backend was stopped (or target start began),
-                    # cancellation cannot restore the prior state as if nothing happened.
+                if commit_called or target_start_attempted:
+                    # Once destructive work begins, even an activation preemption
+                    # must stop the target before publishing an inactive state.
                     self._handle_failed_switch(
                         profile_id=profile_id,
                         prior_id=prior_id,
@@ -1420,15 +1448,24 @@ class BackendController:
                     error=str(error),
                 )
 
-        failed_state = {
-            "generation": generation,
-            "profile": None,
-            "phase": "failed",
-            "prior_profile": prior_id,
-            "target_profile": profile_id,
-            "error": str(target_error),
-            "restore": "not_attempted",
-        }
+        preempted = isinstance(target_error, ActivationPreemptedError)
+        if preempted and cleanup_error is None:
+            failed_state = {
+                "generation": generation,
+                "profile": None,
+                "phase": "inactive",
+                "preempted_profile": profile_id,
+            }
+        else:
+            failed_state = {
+                "generation": generation,
+                "profile": None,
+                "phase": "failed",
+                "prior_profile": prior_id,
+                "target_profile": profile_id,
+                "error": str(target_error),
+                "restore": "not_attempted",
+            }
         if cleanup_error is not None:
             failed_state["cleanup_error"] = str(cleanup_error)
         self._write_state(failed_state)
@@ -1450,7 +1487,7 @@ class BackendController:
             self._emit("artifact_verification", profile=profile_id, **verification)
         self._emit(
             "profile_transition",
-            decision="failed",
+            decision="preempted" if preempted and cleanup_error is None else "failed",
             prior_profile=prior_id,
             target_profile=profile_id,
             generation=generation,
@@ -1500,18 +1537,45 @@ class BackendController:
             pass
 
     def _require_not_cancelled(self, stage: str) -> None:
-        if self.cancellation_probe is None:
-            return
-        try:
-            cancelled = bool(self.cancellation_probe())
-        except Exception as error:
-            raise LifecycleCancelledError(
-                f"lifecycle cancellation probe failed at {stage}: {error}"
-            ) from error
-        if cancelled:
-            raise LifecycleCancelledError(
-                f"backend activation cancelled at {stage}"
+        if self.cancellation_probe is not None:
+            try:
+                cancelled = bool(self.cancellation_probe())
+            except Exception as error:
+                raise LifecycleCancelledError(
+                    f"lifecycle cancellation probe failed at {stage}: {error}"
+                ) from error
+            if cancelled:
+                raise LifecycleCancelledError(
+                    f"backend activation cancelled at {stage}"
+                )
+        if self._preempt_event.is_set():
+            raise ActivationPreemptedError(
+                f"backend activation preempted at {stage}"
             )
+
+    @staticmethod
+    def _vram_violations(
+        snapshot: ResourceSnapshot,
+        *,
+        min_total_vram_mib: int,
+        min_free_vram_mib: int,
+    ) -> list[str]:
+        violations: list[str] = []
+        if min_total_vram_mib > 0:
+            if snapshot.vram_total_mib is None:
+                violations.append("vram_total_mib unavailable")
+            elif snapshot.vram_total_mib < min_total_vram_mib:
+                violations.append(
+                    f"vram_total_mib {snapshot.vram_total_mib} < {min_total_vram_mib}"
+                )
+        if min_free_vram_mib > 0:
+            if snapshot.vram_free_mib is None:
+                violations.append("vram_free_mib unavailable")
+            elif snapshot.vram_free_mib < min_free_vram_mib:
+                violations.append(
+                    f"vram_free_mib {snapshot.vram_free_mib} < {min_free_vram_mib}"
+                )
+        return violations
 
     def _admit_pre_start(self, profile: Profile) -> ResourceSnapshot | None:
         self._require_not_cancelled(f"pre_start_admission:{profile.id}")
@@ -1536,16 +1600,13 @@ class BackendController:
                 "swap_used_mib "
                 f"{snapshot.swap_used_mib} > {admission.max_swap_used_mib}"
             )
-        if snapshot.vram_total_mib < admission.min_total_vram_mib:
-            violations.append(
-                "vram_total_mib "
-                f"{snapshot.vram_total_mib} < {admission.min_total_vram_mib}"
+        violations.extend(
+            self._vram_violations(
+                snapshot,
+                min_total_vram_mib=admission.min_total_vram_mib,
+                min_free_vram_mib=admission.min_free_vram_before_start_mib,
             )
-        if snapshot.vram_free_mib < admission.min_free_vram_before_start_mib:
-            violations.append(
-                "vram_free_mib "
-                f"{snapshot.vram_free_mib} < {admission.min_free_vram_before_start_mib}"
-            )
+        )
 
         self._emit(
             "resource_admission",
@@ -1593,16 +1654,13 @@ class BackendController:
                 "swap_growth_mib "
                 f"{swap_growth_mib} > {admission.max_swap_growth_mib}"
             )
-        if snapshot.vram_total_mib < admission.min_total_vram_mib:
-            violations.append(
-                "vram_total_mib "
-                f"{snapshot.vram_total_mib} < {admission.min_total_vram_mib}"
+        violations.extend(
+            self._vram_violations(
+                snapshot,
+                min_total_vram_mib=admission.min_total_vram_mib,
+                min_free_vram_mib=admission.post_ready_min_free_vram_mib,
             )
-        if snapshot.vram_free_mib < admission.post_ready_min_free_vram_mib:
-            violations.append(
-                "vram_free_mib "
-                f"{snapshot.vram_free_mib} < {admission.post_ready_min_free_vram_mib}"
-            )
+        )
 
         self._emit(
             "resource_admission",
@@ -1630,11 +1688,16 @@ class BackendController:
             invalid = [
                 name
                 for name, value in values.items()
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0
+                if value is not None
+                and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
             ]
-            if snapshot.vram_total_mib <= 0:
+            if snapshot.vram_total_mib is not None and snapshot.vram_total_mib <= 0:
                 invalid.append("vram_total_mib")
-            if snapshot.vram_free_mib > snapshot.vram_total_mib:
+            if (
+                snapshot.vram_free_mib is not None
+                and snapshot.vram_total_mib is not None
+                and snapshot.vram_free_mib > snapshot.vram_total_mib
+            ):
                 invalid.append("vram_free_mib")
             if invalid:
                 raise ValueError(
@@ -1892,7 +1955,9 @@ class BackendController:
 
     def _probe(self, profile: Profile) -> None:
         self._require_not_cancelled(f"readiness:{profile.id}")
-        if not self.readiness_probe(profile.alias, float(profile.startup_timeout)):
+        ready = self.readiness_probe(profile.alias, float(profile.startup_timeout))
+        self._require_not_cancelled(f"readiness:{profile.id}")
+        if not ready:
             raise ReadinessError(
                 f"profile {profile.id!r} did not serve exact alias {profile.alias!r} "
                 f"within {profile.startup_timeout:g}s"

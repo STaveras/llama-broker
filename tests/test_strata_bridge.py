@@ -338,11 +338,14 @@ class StrataBridgeTests(unittest.TestCase):
         )
 
     def test_gpu_admission_checks_total_and_post_stop_free_vram(self) -> None:
-        enforce_gpu_floor(
-            gpu_total_mib=12_227,
-            gpu_free_mib=11_900,
-            min_total_vram_mib=12_000,
-            min_free_vram_mib=8192,
+        self.assertEqual(
+            enforce_gpu_floor(
+                gpu_total_mib=12_227,
+                gpu_free_mib=11_900,
+                min_total_vram_mib=12_000,
+                min_free_vram_mib=8192,
+            ),
+            (12_227, 11_900),
         )
         with self.assertRaisesRegex(StrataBridgeError, "free VRAM"):
             enforce_gpu_floor(
@@ -350,6 +353,22 @@ class StrataBridgeTests(unittest.TestCase):
                 gpu_free_mib=678,
                 min_total_vram_mib=12_000,
                 min_free_vram_mib=8192,
+            )
+        with self.assertRaisesRegex(StrataBridgeError, "telemetry is unavailable"):
+            enforce_gpu_floor(
+                gpu_total_mib=None,
+                gpu_free_mib=None,
+                min_total_vram_mib=12_000,
+                min_free_vram_mib=8192,
+            )
+
+    def test_strata_mmap_assessment_fails_closed_when_vram_is_unknown(self) -> None:
+        with self.assertRaisesRegex(StrataBridgeError, "VRAM telemetry is unavailable"):
+            assess_strata_memory_mode(
+                system_ram_mib=32 * 1024,
+                gpu_vram_total_mib=None,
+                mmap_experts=True,
+                has_experts_bin=True,
             )
 
     def test_runtime_engine_log_is_private_and_included_in_server_config(self) -> None:
