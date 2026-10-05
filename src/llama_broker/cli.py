@@ -21,6 +21,7 @@ Usage:
     brokerctl profile edit [MODEL]         Open the field-oriented profile editor
     brokerctl profile add MODEL            Inspect a candidate (non-mutating)
     brokerctl runtime list                 List runtimes and their profiles
+    brokerctl clean [CATEGORY ...]         List unused models/runtimes/backups; --apply cleans
 """
 
 from __future__ import annotations
@@ -75,7 +76,29 @@ from .runtime_builds import (
 )
 from .runtimes import get_runtime_info, list_runtimes, runtime_names
 from .integration import filtered_manifest, inspect_manifest, report_for
-from .paths import MODELS_DIR, RUNTIME_CATALOG_PATH, RUNTIMES_DIR
+from .hygiene import (
+    CATEGORIES as CLEAN_CATEGORIES,
+    DEFAULT_CATEGORIES as DEFAULT_CLEAN_CATEGORIES,
+    WSL_COMPACT_THRESHOLD_BYTES,
+    ApplyResult,
+    CleanOptions,
+    CleanPlan,
+    CleanRoots,
+    HygieneError,
+    apply_plan,
+    build_plan,
+    still_unreferenced,
+    wsl_compaction_steps,
+    wsl_disk_report,
+)
+from .paths import (
+    CONFIG_DIR,
+    MODELS_DIR,
+    RUNTIME_CATALOG_PATH,
+    RUNTIME_PROVENANCE_INDEX_PATH,
+    RUNTIMES_DIR,
+    XDG_CACHE_HOME,
+)
 from .setup_wizard import (
     apply_profile_plan,
     build_setup_plan,
@@ -282,6 +305,186 @@ def _verify_profile(profile: Profile) -> list[str]:
                 f"{profile.id} {kind} SHA mismatch: expected {expected}, got {actual} ({path})"
             )
     return failures
+
+
+CLEAN_KEEP_FILENAME = "clean-keep"
+
+
+def _format_bytes(count: int) -> str:
+    value = float(count)
+    for unit in ("B", "KiB", "MiB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"
+
+
+def _clean_roots(profiles_path: Path) -> CleanRoots:
+    return CleanRoots(
+        profiles_path=profiles_path,
+        catalog_path=RUNTIME_CATALOG_PATH,
+        provenance_path=RUNTIME_PROVENANCE_INDEX_PATH,
+        models_dir=MODELS_DIR,
+        runtimes_dir=RUNTIMES_DIR,
+        config_dir=CONFIG_DIR,
+        cache_home=XDG_CACHE_HOME,
+        home=Path.home(),
+    )
+
+
+def _clean_keep_paths(extra: Sequence[str]) -> tuple[Path, ...]:
+    """Paths `clean` must never touch: --keep plus CONFIG_DIR/clean-keep."""
+    lines = list(extra)
+    keep_file = CONFIG_DIR / CLEAN_KEEP_FILENAME
+    if keep_file.is_file():
+        lines.extend(
+            line.strip()
+            for line in keep_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    paths = tuple(Path(line).expanduser() for line in lines)
+    for path in paths:
+        if not path.is_absolute():
+            raise HygieneError(f"keep path must be absolute: {path}")
+    return paths
+
+
+def _interactive_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _print_clean_plan(plan: CleanPlan, categories: Sequence[str], *, applying: bool) -> None:
+    print("brokerctl clean")
+    for category in CLEAN_CATEGORIES:
+        if category not in categories:
+            if category == "caches":
+                print("\ncaches: not checked (add `caches` to include package caches)")
+            continue
+        items = [c for c in plan.candidates if c.category == category]
+        action = items[0].action if items else ""
+        print(f"\n{category}" + (f" ({action})" if action else ": nothing to clean"))
+        for item in items:
+            print(f"  {_format_bytes(item.size_bytes):>10}  {item.path}")
+            print(f"  {'':>10}  {item.reason}")
+    if plan.skipped:
+        print("\nleft alone:")
+        for skipped in plan.skipped:
+            print(f"  {skipped.category:<9} {skipped.path}  ({skipped.reason})")
+    if not applying and plan.candidates:
+        print(
+            f"\nWould archive {_format_bytes(plan.total_bytes('archive'))} "
+            f"and delete {_format_bytes(plan.total_bytes('delete'))}."
+        )
+        if any(c.category == "models" and c.action == "delete" for c in plan.candidates):
+            print("Model files are deleted permanently; add --archive-dir DIR to keep a copy.")
+
+
+def _print_clean_result(result: ApplyResult) -> None:
+    archived = sum(int(entry["size_bytes"]) for entry in result.archived)
+    deleted = sum(int(entry["size_bytes"]) for entry in result.deleted)
+    print(f"\nArchived {len(result.archived)} item(s), {_format_bytes(archived)}"
+          + (f" to {result.run_dir} (see MANIFEST.json)" if result.run_dir else ""))
+    print(f"Deleted {len(result.deleted)} item(s), {_format_bytes(deleted)}")
+    for entry in result.skipped:
+        print(f"  skipped {entry['path']}: {entry['reason']}")
+    for entry in result.failed:
+        print(f"  FAILED {entry['path']}: {entry['error']} (original kept)", file=sys.stderr)
+
+
+def _print_wsl_disk(wsl_disk: Mapping[str, object] | None) -> None:
+    if wsl_disk and "error" not in wsl_disk:
+        reclaimable = int(wsl_disk.get("reclaimable_bytes", 0))
+        if reclaimable >= WSL_COMPACT_THRESHOLD_BYTES:
+            print(
+                f"\nWSL: {wsl_disk['vhdx_path']} takes {_format_bytes(int(wsl_disk['vhdx_bytes']))} "
+                f"on Windows but Linux uses {_format_bytes(int(wsl_disk['filesystem_used_bytes']))}; "
+                f"compacting it returns ~{_format_bytes(reclaimable)} to Windows:"
+            )
+            for step in wsl_compaction_steps(str(wsl_disk["vhdx_path"])):
+                print(f"  {step}")
+    elif wsl_disk:
+        print(f"\nWSL disk check unavailable: {wsl_disk['error']}")
+
+
+def _confirm_clean(plan: CleanPlan) -> bool:
+    """Ask before acting on a dry run's plan; anything but yes declines."""
+    steps = []
+    for action, verb in (("archive", "archive"), ("delete", "permanently delete")):
+        items = [c for c in plan.candidates if c.action == action]
+        if items:
+            steps.append(f"{verb} {len(items)} item(s), {_format_bytes(plan.total_bytes(action))}")
+    question = " and ".join(steps)
+    try:
+        answer = input(f"\n{question[0].upper()}{question[1:]}? [y/N] ").strip().casefold()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _cmd_clean(args: argparse.Namespace) -> int:
+    categories = tuple(dict.fromkeys(args.categories)) or DEFAULT_CLEAN_CATEGORIES
+    unknown = [category for category in categories if category not in CLEAN_CATEGORIES]
+    if unknown:
+        raise HygieneError(
+            f"unknown clean category {', '.join(unknown)}; choose from {', '.join(CLEAN_CATEGORIES)}"
+        )
+    if args.min_size_mib < 0 or args.min_age_days < 0 or args.keep_backups < 0:
+        raise HygieneError("--min-size-mib, --min-age-days and --keep-backups cannot be negative")
+    # Deleting is the default; an archive directory opts models and backups
+    # into being copied off first.
+    archive_value = args.archive_dir or os.environ.get("LLAMA_BROKER_ARCHIVE_DIR")
+    archive_dir = Path(archive_value).expanduser() if archive_value else None
+    options = CleanOptions(
+        categories=categories,
+        min_size_bytes=args.min_size_mib * 1024 * 1024,
+        min_age_seconds=args.min_age_days * 86400.0,
+        keep_backups=args.keep_backups,
+        keep_paths=_clean_keep_paths(args.keep),
+        archive=archive_dir is not None,
+    )
+    roots = _clean_roots(args.profiles)
+    plan = build_plan(roots, options)
+
+    def apply() -> ApplyResult:
+        return apply_plan(
+            plan,
+            archive_dir=archive_dir,
+            still_unreferenced=still_unreferenced(roots, options),
+            log=(lambda _message: None) if args.json else (lambda message: print(message, file=sys.stderr)),
+        )
+
+    result = apply() if args.apply else None
+    wsl_disk = wsl_disk_report()
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "dry_run": result is None,
+            "categories": list(categories),
+            "candidates": [candidate.as_mapping() for candidate in plan.candidates],
+            "skipped": [skipped.as_mapping() for skipped in plan.skipped],
+            "totals": {
+                "archive_bytes": plan.total_bytes("archive"),
+                "delete_bytes": plan.total_bytes("delete"),
+            },
+            "wsl_disk": wsl_disk,
+            "result": result.as_mapping() if result is not None else None,
+        }, indent=2, sort_keys=True))
+        return 1 if result is not None and result.failed else 0
+
+    _print_clean_plan(plan, categories, applying=args.apply)
+    if result is not None:
+        _print_clean_result(result)
+    _print_wsl_disk(wsl_disk)
+    if result is None and plan.candidates:
+        # A dry run at a terminal offers to go ahead; scripts get the plan only.
+        if not _interactive_terminal():
+            print("\nRun the same command with --apply to do this.")
+        elif _confirm_clean(plan):
+            result = apply()
+            _print_clean_result(result)
+        else:
+            print("Nothing changed.")
+    return 1 if result is not None and result.failed else 0
 
 
 PROFILE_MUTATION_REMINDER = (
@@ -3400,6 +3603,42 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("model", nargs="?")
     verify.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
 
+    clean = subparsers.add_parser(
+        "clean",
+        help="list unused models, orphaned runtime bundles and old backups; --apply cleans them",
+        description=(
+            "Lists unused models, orphaned runtime bundles and old manifest backups, "
+            "then asks before cleaning them (scripts and --json only get the list). "
+            "--apply cleans without asking. Cleaning deletes; with --archive-dir, models "
+            "and backups are copied there and verified first. Package caches are "
+            "included only when `caches` is named."
+        ),
+    )
+    clean.add_argument(
+        "categories",
+        nargs="*",
+        metavar="CATEGORY",
+        help=f"any of {', '.join(CLEAN_CATEGORIES)} (default: {', '.join(DEFAULT_CLEAN_CATEGORIES)})",
+    )
+    clean.add_argument("--apply", action="store_true", help="clean the listed items without asking")
+    clean.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="copy models and backups here before removing them, instead of deleting; "
+        "must be on another disk (or set LLAMA_BROKER_ARCHIVE_DIR)",
+    )
+    clean.add_argument("--min-size-mib", type=int, default=256, help="ignore smaller unused model files (default 256)")
+    clean.add_argument("--min-age-days", type=float, default=7.0, help="leave anything modified more recently (default 7)")
+    clean.add_argument("--keep-backups", type=int, default=10, help="newest backups kept per manifest (default 10)")
+    clean.add_argument(
+        "--keep",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=f"never touch PATH (repeatable; also read from {CONFIG_DIR / CLEAN_KEEP_FILENAME})",
+    )
+    clean.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+
     # Public setup is the discovery wizard. It never selects a runtime profile
     # implicitly.
     setup = subparsers.add_parser(
@@ -3860,6 +4099,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command in {"operation", "operations"}:
             return _cmd_operation(args)
+        if args.command == "clean":
+            return _cmd_clean(args)
 
         # Original commands
         registry = ProfileRegistry.from_path(
