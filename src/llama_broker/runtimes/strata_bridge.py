@@ -19,6 +19,12 @@ from types import ModuleType
 from typing import Sequence
 
 
+try:
+    from llama_broker.gpu_memory import GpuTelemetryError, probe_gpu_memory
+except ModuleNotFoundError:  # packaged bridge: shared module is bundled beside the launcher
+    from gpu_memory import GpuTelemetryError, probe_gpu_memory
+
+
 class StrataBridgeError(ValueError):
     """The Strata wrapper configuration violates the broker contract."""
 
@@ -597,6 +603,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         total_ram_mib, available_ram_mib, swap_used_mib = _system_resource_mib()
         gpu_total_mib = gpu_free_mib = None
+        try:
+            gpu_reading = probe_gpu_memory()
+        except GpuTelemetryError as error:
+            raise StrataBridgeError(f"GPU telemetry failed: {error}") from error
+        if gpu_reading is not None:
+            gpu_total_mib, gpu_free_mib = gpu_reading
         swap_warning = enforce_resource_floor(
             available_ram_mib=available_ram_mib,
             min_available_ram_mib=args.min_available_ram_mib,

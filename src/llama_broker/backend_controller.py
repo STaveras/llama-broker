@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .broker_profiles import launch_environment
+from .gpu_memory import probe_gpu_memory
 from .state_store import StateFileError, StateFileStore, atomic_write_text
 
 
@@ -76,6 +77,7 @@ class ResourceSnapshot:
 
 ResourceProbe = Callable[[], ResourceSnapshot]
 GpuMemoryProbe = Callable[[], tuple[int, int]]
+VramProbe = Callable[[], int]
 EventLogger = Callable[[dict[str, object]], None]
 CancellationProbe = Callable[[], bool]
 
@@ -117,7 +119,11 @@ def linux_resource_snapshot(
         raise ValueError("/proc/meminfo reports SwapFree above SwapTotal")
 
     vram_total_mib = vram_free_mib = None
-    if gpu_memory_probe is not None:
+    if gpu_memory_probe is None:
+        detected = probe_gpu_memory()
+        if detected is not None:
+            vram_total_mib, vram_free_mib = detected
+    else:
         vram_total_mib, vram_free_mib = gpu_memory_probe()
         if (
             isinstance(vram_total_mib, bool)
@@ -152,6 +158,7 @@ class ServiceStateSnapshot:
     sub_state: str
     main_pid: int
     control_pid: int
+    unit_id: str | None = None
 
     @property
     def is_quiescent(self) -> bool:
@@ -185,6 +192,7 @@ def systemd_service_state_probe(unit_name: str) -> ServiceStateSnapshot:
             "show",
             unit_name,
             "--no-pager",
+            "--property=Id",
             "--property=ActiveState",
             "--property=SubState",
             "--property=MainPID",
@@ -223,6 +231,7 @@ def systemd_service_state_probe(unit_name: str) -> ServiceStateSnapshot:
         sub_state=values["SubState"],
         main_pid=main_pid,
         control_pid=control_pid,
+        unit_id=values.get("Id") or None,
     )
 
 
@@ -416,7 +425,12 @@ class BackendController:
         managed_args: Sequence[str] | Mapping[str, Sequence[str]] = (),
         verify_command: VerifyCommand | None = None,
         artifact_verifier: ArtifactVerifier | None = None,
+        vram_probe: VramProbe | None = None,
         preemption_event: threading.Event | None = None,
+        handoff_min_vram_rise_mib: int = 256,
+        handoff_window_samples: int = 3,
+        handoff_timeout: float = 30.0,
+        handoff_poll_interval: float = 0.25,
     ) -> None:
         if not profiles:
             raise ConfigurationError("at least one profile is required")
@@ -444,6 +458,17 @@ class BackendController:
         self.backend_listen_port = backend_listen_port
         self.verify_command = verify_command
         self.artifact_verifier = artifact_verifier
+        if handoff_min_vram_rise_mib <= 0 or handoff_window_samples < 2:
+            raise ConfigurationError("handoff rise must be positive and window must have at least two samples")
+        if handoff_timeout < 0 or handoff_poll_interval <= 0:
+            raise ConfigurationError("handoff timings must be positive")
+        self.vram_probe = vram_probe
+        self.handoff_min_vram_rise_mib = handoff_min_vram_rise_mib
+        self.handoff_window_samples = handoff_window_samples
+        self.handoff_timeout = handoff_timeout
+        self.handoff_poll_interval = handoff_poll_interval
+        self._released_units: set[str] = set()
+        self._handoff_baseline_mib: int | None = None
         self._preempt_event = preemption_event or threading.Event()
         self._activation_guard = threading.Lock()
         self._activation_target: str | None = None
@@ -946,11 +971,29 @@ class BackendController:
                     or prior_state["phase"] != "active"
                     or restart_current
                 )
+                lingering: set[str] = set()
                 if prior_id is not None and target_requires_activation:
                     if commit_callback is not None:
                         commit_callback()
                     commit_called = True
-                    self._stop(prior_id)
+                    if prior_id == profile_id:
+                        self._stop(prior_id)
+                    else:
+                        # Broker telemetry must observe the same CUDA namespace
+                        # as both units; otherwise a rise could belong to another GPU.
+                        selectors = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "LLAMA_BROKER_GPU_DEVICE")
+                        namespaces_match = all(
+                            str(self._profile(unit_profile).environment.get(key, os.environ.get(key, "")))
+                            == os.environ.get(key, "")
+                            for unit_profile in (prior_id, profile_id)
+                            for key in selectors
+                        )
+                        if namespaces_match:
+                            self._release_unit(self.unit_name(prior_id))
+                            lingering = self._await_handoff(stage=f"pre_start:{profile_id}")
+                        else:
+                            self._emit("backend_handoff", decision="device_namespace_mismatch")
+                            self._stop(prior_id)
                 pre_start_snapshot = self._admit_pre_start(target)
                 if not commit_called and commit_callback is not None:
                     commit_callback()
@@ -963,7 +1006,8 @@ class BackendController:
                     generation=generation,
                 )
                 target_start_attempted = True
-                self._start(profile_id)
+                self._start(profile_id, lingering=lingering)
+                self._finish_handoff(lingering, target_profile=profile_id)
                 self._probe_owned(profile_id, target)
                 self._admit_post_ready(target, pre_start_snapshot)
                 self._emit(
@@ -1426,6 +1470,11 @@ class BackendController:
         cleanup_target: bool,
     ) -> None:
         cleanup_error: BaseException | None = None
+        if self._released_units:
+            try:
+                self._finish_handoff(self._released_units, target_profile=profile_id)
+            except Exception as error:
+                cleanup_error = error
         if cleanup_target:
             try:
                 self._stop(profile_id)
@@ -1717,16 +1766,142 @@ class BackendController:
             ) from error
         return snapshot
 
-    def _start(self, profile_id: str) -> None:
+    def _start(self, profile_id: str, *, lingering: Iterable[str] = ()) -> None:
         self._profile(profile_id)
         self._require_not_cancelled(f"start:{profile_id}")
-        self._require_all_quiescent(stage=f"pre_start:{profile_id}")
+        stopping = set(lingering)
+        # Names alone are not identities: systemd may expose the outgoing unit
+        # through the compatibility alias (or another loaded alias).
+        canonical_stopping: set[str] = set()
+        if self.service_state_probe is not None:
+            for unit_name in sorted(stopping & self._released_units):
+                snapshot = self.service_state_probe(unit_name)
+                if (
+                    isinstance(snapshot, ServiceStateSnapshot)
+                    and isinstance(snapshot.unit_id, str)
+                    and snapshot.unit_id.endswith(".service")
+                    and _UNIT_COMPONENT.fullmatch(snapshot.unit_id)
+                ):
+                    canonical_stopping.add(snapshot.unit_id)
+        for unit_name in sorted(self._all_backend_unit_names() - stopping):
+            if canonical_stopping and self.service_state_probe is not None:
+                # Failed or missing identity never grants an exemption; the
+                # ordinary quiescence check below still decides safety.
+                try:
+                    snapshot = self.service_state_probe(unit_name)
+                except Exception:
+                    snapshot = None
+                if (
+                    isinstance(snapshot, ServiceStateSnapshot)
+                    and snapshot.unit_id in canonical_stopping
+                    and unit_name != self.unit_name(profile_id)
+                ):
+                    self._emit(
+                        "service_quiescence", unit=unit_name,
+                        canonical_unit=snapshot.unit_id, stage=f"pre_start:{profile_id}",
+                        decision="outgoing_alias",
+                    )
+                    continue
+            self._require_unit_quiescent(unit_name, stage=f"pre_start:{profile_id}")
         self._require_endpoint_absent(stage=f"pre_start:{profile_id}")
         self._require_not_cancelled(f"pre_command_start:{profile_id}")
         self._run("systemctl", "--user", "start", self.unit_name(profile_id))
 
     def _stop(self, profile_id: str) -> None:
         self._stop_unit(self.unit_name(profile_id))
+
+    def _handoff_enabled(self) -> bool:
+        return self.vram_probe is not None and self.service_state_probe is not None
+
+    def _sample_vram_free(self) -> int | None:
+        if self.vram_probe is None:
+            return None
+        try:
+            value = self.vram_probe()
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"invalid free VRAM reading: {value!r}")
+            return value
+        except Exception as error:
+            self._emit("backend_handoff", decision="vram_probe_error", error_type=type(error).__name__, error=str(error))
+            return None
+
+    def _unit_is_quiescent(self, unit_name: str) -> bool:
+        if self.service_state_probe is None:
+            return True
+        try:
+            return self.service_state_probe(unit_name).is_quiescent
+        except Exception:
+            return False
+
+    def _release_unit(self, unit_name: str) -> None:
+        if not self._handoff_enabled():
+            self._stop_unit(unit_name)
+            return
+        if not self._released_units:
+            self._handoff_baseline_mib = self._sample_vram_free()
+        if self._handoff_baseline_mib is None:
+            self._stop_unit(unit_name)
+            return
+        try:
+            self._run("systemctl", "--user", "--no-block", "stop", unit_name)
+        except Exception as error:
+            self._emit("backend_handoff", unit=unit_name, decision="no_block_stop_failed", error_type=type(error).__name__, error=str(error))
+            self._stop_unit(unit_name)
+            return
+        self._released_units.add(unit_name)
+        self._emit("backend_handoff", unit=unit_name, decision="stop_requested", baseline_vram_free_mib=self._handoff_baseline_mib)
+
+    def _await_handoff(self, *, stage: str) -> set[str]:
+        if not self._released_units:
+            return set()
+        baseline = self._handoff_baseline_mib
+        samples: list[tuple[float, int]] = []
+        deadline = time.monotonic() + self.handoff_timeout
+        while True:
+            self._require_not_cancelled(stage)
+            self._released_units = {unit for unit in self._released_units if not self._unit_is_quiescent(unit)}
+            if not self._released_units:
+                self._handoff_baseline_mib = None
+                self._emit("backend_handoff", stage=stage, decision="prior_exited")
+                return set()
+            reading = self._sample_vram_free()
+            now = time.monotonic()
+            if reading is None:
+                samples.clear()
+            if reading is not None and baseline is not None:
+                samples.append((now, reading))
+                samples = samples[-self.handoff_window_samples:]
+                if len(samples) >= self.handoff_window_samples:
+                    sustained = all(samples[i][1] >= samples[i - 1][1] for i in range(1, len(samples)))
+                    material = samples[-1][1] - baseline >= self.handoff_min_vram_rise_mib
+                    if sustained and material and self._endpoint_is_absent():
+                        self._emit("backend_handoff", stage=stage, decision="early_start", units=sorted(self._released_units), baseline_vram_free_mib=baseline, vram_free_mib=samples[-1][1], window_samples=len(samples), observed_duration_sec=samples[-1][0] - samples[0][0])
+                        return set(self._released_units)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.handoff_poll_interval)
+        self._emit("backend_handoff", stage=stage, decision="wait_for_exit", units=sorted(self._released_units))
+        for unit_name in sorted(self._released_units):
+            self._stop_unit(unit_name)
+        self._released_units.clear()
+        self._handoff_baseline_mib = None
+        return set()
+
+    def _endpoint_is_absent(self) -> bool:
+        if self.endpoint_probe is None:
+            return False
+        try:
+            return not bool(self.endpoint_probe())
+        except Exception:
+            return False
+
+    def _finish_handoff(self, lingering: Iterable[str], *, target_profile: str) -> None:
+        for unit_name in sorted(lingering):
+            self._stop_unit(unit_name)
+            self._released_units.discard(unit_name)
+            self._emit("backend_handoff", unit=unit_name, target_profile=target_profile, decision="prior_exited_after_start")
+        if not self._released_units:
+            self._handoff_baseline_mib = None
 
     def _stop_unit(self, unit_name: str) -> None:
         try:

@@ -42,8 +42,10 @@ never preempted. The one exception is a request-driven load with no active lease
 or queued transition: when `LLAMA_BROKER_PREEMPT_IDLE_LOADS` is enabled, a request
 for another profile may cancel that idle load and reserve the next transition
 slot. The preempted request waits behind the newer one and retries without
-preempting another load. Preemption still waits for the prior backend to exit; no GPU
-memory telemetry is used to start overlapping backends. Each caller receives a
+preempting another load. A bounded window of material, nondecreasing free-VRAM
+readings may allow the next backend to start while the old one tears down, after
+its endpoint is released. The old unit must be reaped before readiness and
+active-state publication; unavailable telemetry falls back to waiting for exit. Each caller receives a
 caller-specific `request_id` and the shared `execution_id` for a coalesced
 target; `request_id` addresses status and cancellation, and status exposes the
 linked execution. A caller may stop waiting or cancel its own queued request

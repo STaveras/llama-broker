@@ -87,9 +87,10 @@ class ProductionManifestTests(unittest.TestCase):
 
         self.assertFalse(hasattr(self.registry, "default_profile"))
 
-    def test_production_controller_has_no_mandatory_resource_probe(self) -> None:
+    def test_production_controller_keeps_admission_optional_and_handoff_enabled(self) -> None:
         controller = create_production_controller(self.registry)
         self.assertIsNone(controller.resource_probe)
+        self.assertIsNotNone(controller.vram_probe)
 
     def test_secure_backend_defaults_to_lan_binding_unless_explicitly_overridden(
         self,
@@ -128,7 +129,10 @@ class ProductionManifestTests(unittest.TestCase):
                 "SwapFree:            8327168 kB\n",
                 encoding="utf-8",
             )
-            with patch("llama_broker.backend_controller.subprocess.run") as run:
+            with (
+                patch("llama_broker.backend_controller.probe_gpu_memory", return_value=None),
+                patch("llama_broker.backend_controller.subprocess.run") as run,
+            ):
                 snapshot = linux_resource_snapshot(meminfo)
 
             self.assertEqual(

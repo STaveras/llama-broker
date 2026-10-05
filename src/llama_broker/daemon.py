@@ -40,6 +40,7 @@ from .backend_controller import (
     systemd_service_inventory_probe,
     systemd_service_state_probe,
 )
+from .gpu_memory import GpuTelemetryError, probe_gpu_memory
 from .broker_security import (
     SecurityConfig,
     SecurityError,
@@ -209,6 +210,8 @@ MAX_OUTPUT_TOKENS = _optional_env_int(
     "LLAMA_BROKER_MAX_OUTPUT_TOKENS", "LLM_BROKER_MAX_OUTPUT_TOKENS"
 )
 PREEMPT_IDLE_LOADS = os.environ.get("LLAMA_BROKER_PREEMPT_IDLE_LOADS", "1") != "0"
+HANDOFF_MIN_VRAM_RISE_MIB = int(_env_value("LLAMA_BROKER_HANDOFF_MIN_VRAM_RISE_MIB", "LLM_BROKER_HANDOFF_MIN_VRAM_RISE_MIB", "256"))
+HANDOFF_WINDOW_SAMPLES = int(_env_value("LLAMA_BROKER_HANDOFF_WINDOW_SAMPLES", "LLM_BROKER_HANDOFF_WINDOW_SAMPLES", "3"))
 
 
 HOP_BY_HOP_REQUEST_HEADERS = {
@@ -3968,6 +3971,12 @@ def create_production_controller(
     setattr(readiness_probe, "replace_profiles", replace_readiness_profiles)
     replace_readiness_profiles({profile.id: profile for profile in registry.profiles})
 
+    def gpu_free_probe() -> int:
+        reading = probe_gpu_memory()
+        if reading is None:
+            raise GpuTelemetryError("GPU memory telemetry is unavailable")
+        return reading[1]
+
     return BackendController(
         profiles={profile.id: profile for profile in registry.profiles},
         state_path=STATE_PATH,
@@ -3975,8 +3984,9 @@ def create_production_controller(
         service_prefix=SERVICE_PREFIX,
         command_runner=subprocess_command_runner,
         readiness_probe=readiness_probe,
-        # Production leaves resource admission unconfigured; GPU capacity is not guessed.
+        # Keep qualification admission opt-in; handoff telemetry is advisory.
         resource_probe=None,
+        vram_probe=gpu_free_probe,
         event_logger=_controller_event_logger,
         service_inventory_probe=systemd_service_inventory_probe,
         service_state_probe=systemd_service_state_probe,
@@ -3994,6 +4004,8 @@ def create_production_controller(
         # Hash artifacts only to diagnose a failed backend activation.
         artifact_verifier=lambda profile: _verify_profile_artifacts(profile, force=True),
         preemption_event=preemption_event,
+        handoff_min_vram_rise_mib=HANDOFF_MIN_VRAM_RISE_MIB,
+        handoff_window_samples=HANDOFF_WINDOW_SAMPLES,
         verify_command=lambda profile: (
             sys.executable,
             str(ROOT / "brokerctl.py"),
