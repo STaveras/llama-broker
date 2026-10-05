@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 
 
@@ -74,6 +75,12 @@ def package_launcher(
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
+    shared_source = Path(__file__).resolve().parents[1] / "src" / "llama_broker" / "gpu_memory.py"
+    shared_destination = root / "bin" / "gpu_memory.py"
+    if not shared_source.is_file() or shared_source.is_symlink():
+        raise PackageError("shared GPU telemetry module is missing")
+    shutil.copyfile(shared_source, shared_destination)
+    os.chmod(shared_destination, 0o644)
     return {
         "path": str(destination),
         "sha256": _sha256(destination),

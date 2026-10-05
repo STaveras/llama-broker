@@ -1972,6 +1972,121 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(transitions, ["vision", "admin"])
         self.assertEqual(coordinator.active_profile, "admin")
 
+    def test_request_preempts_idle_in_flight_load_then_original_reloads(self) -> None:
+        loading = threading.Event()
+        preempted = threading.Event()
+        transitions: list[str] = []
+        preempt_calls: list[bool] = []
+        served: list[str] = []
+
+        def switch(profile: str) -> None:
+            transitions.append(profile)
+            if profile == "slow" and transitions.count("slow") == 1:
+                loading.set()
+                if preempted.wait(timeout=2):
+                    raise BackendControllerError("activation preempted")
+
+        def preempt() -> bool:
+            preempt_calls.append(True)
+            preempted.set()
+            return True
+
+        coordinator = ProfileCoordinator(
+            "primary",
+            switch,
+            drain_timeout=2,
+            transition_timeout=5,
+            preempt_activation=preempt,
+        )
+        errors: list[BaseException] = []
+
+        def slow_request() -> None:
+            try:
+                with coordinator.lease("slow"):
+                    served.append("slow")
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=slow_request)
+        thread.start()
+        self.assertTrue(loading.wait(timeout=2))
+
+        with coordinator.lease("vision"):
+            served.append("vision")
+        thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(preempt_calls, [True])
+        self.assertEqual(transitions, ["slow", "vision", "slow"])
+        self.assertEqual(served, ["vision", "slow"])
+        self.assertEqual(coordinator.active_profile, "slow")
+        self.assertEqual(coordinator.active_requests, 0)
+
+    def test_administrative_load_is_not_preempted(self) -> None:
+        loading = threading.Event()
+        release = threading.Event()
+        transitions: list[str] = []
+        preempt_calls: list[bool] = []
+
+        def switch(profile: str) -> None:
+            transitions.append(profile)
+            if profile == "admin":
+                loading.set()
+                release.wait(timeout=2)
+
+        coordinator = ProfileCoordinator(
+            "primary",
+            switch,
+            drain_timeout=2,
+            transition_timeout=5,
+            preempt_activation=lambda: preempt_calls.append(True) or True,
+        )
+        coordinator.switch_when_idle_async("admin")
+        self.assertTrue(loading.wait(timeout=2))
+
+        def finish_admin_load() -> None:
+            time.sleep(0.05)
+            release.set()
+
+        threading.Thread(target=finish_admin_load).start()
+        with coordinator.lease("vision"):
+            pass
+
+        self.assertEqual(preempt_calls, [])
+        self.assertEqual(transitions, ["admin", "vision"])
+
+    def test_load_with_active_lease_is_not_preempted(self) -> None:
+        preempt_calls: list[bool] = []
+        coordinator = ProfileCoordinator(
+            "primary",
+            lambda profile: None,
+            drain_timeout=0.05,
+            preempt_activation=lambda: preempt_calls.append(True) or True,
+        )
+        with coordinator.lease("primary"):
+            with self.assertRaises(llama_broker.BrokerDrainTimeoutError):
+                with coordinator.lease("vision"):
+                    self.fail("switch admitted while a slot was in use")
+
+        self.assertEqual(preempt_calls, [])
+
+    def test_readiness_probe_stops_waiting_once_preempted(self) -> None:
+        preempted = threading.Event()
+        preempted.set()
+        started = time.monotonic()
+
+        ready = llama_broker._readiness_probe(
+            "vision",
+            30,
+            security=SecurityConfig(),
+            backend_url="http://127.0.0.1:9",
+            preempted=preempted,
+        )
+
+        self.assertFalse(ready)
+        self.assertLess(time.monotonic() - started, 1)
+
     def test_failed_temporary_restore_clears_cleanup_state(self) -> None:
         transitions: list[str] = []
 

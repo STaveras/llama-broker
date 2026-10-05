@@ -191,21 +191,9 @@ def collect_faults(
     return faults
 
 
-def gpu_state() -> str:
-    if shutil.which("nvidia-smi") is None:
-        return "nvidia-smi unavailable"
-    result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=memory.used,utilization.gpu,temperature.gpu,power.draw",
-            "--format=csv,noheader",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    return result.stdout.strip()
+def gpu_state() -> None:
+    """GPU memory and utilization are unknown without a portable provider."""
+    return None
 
 
 def backend_pid(profile_id: str) -> int:
