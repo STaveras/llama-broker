@@ -51,6 +51,8 @@ MAX_STRATA_MEMORY_MAX_MIB = 57_344
 MIN_STRATA_MEMORY_MAX_MIB = 8_192
 MIN_STRATA_RAM_AVAILABLE_MIB = 6_144
 MIN_STRATA_KV_RESIDENT_CELLS = 20_480
+# KV formats that support --kv-resident streaming (k8v4 cannot stream)
+STRATA_KV_FORMATS = frozenset({"fp16", "int8", "q4_0"})
 STRATA_RUNTIME_ENVIRONMENT_FIELDS = frozenset(
     {"LD_LIBRARY_PATH", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OMP_NUM_THREADS"}
 )
@@ -1353,7 +1355,7 @@ def _parse_strata_artifacts(
     seen: set[str] = set()
     boolean_flags = {"--mmap-experts"}
     # optional: RAM (MiB) for parking the active conversation while another prompt runs
-    optional_value_flags = {"--conversation-cache-mib", "--resident-budget-gib"}
+    optional_value_flags = {"--conversation-cache-mib", "--resident-budget-gib", "--kv"}
     uses_mmap_experts = False
     index = 0
     while index < len(raw_args):
@@ -1382,6 +1384,9 @@ def _parse_strata_artifacts(
         elif flag == "--resident-budget-gib":
             if not value.isdecimal() or not 0 < int(value) <= 64:
                 raise ProfileError(f"Strata resident budget must be 1-64 GiB for {profile_id!r}")
+        elif flag == "--kv":
+            if value not in STRATA_KV_FORMATS:
+                raise ProfileError(f"Strata KV format must be fp16, int8 or q4_0 for {profile_id!r}")
         elif flag in allowed_values and value != allowed_values[flag]:
             raise ProfileError(f"Strata engine argument does not match pinned profile data for {profile_id!r}: {flag}")
         if flag == "--expert-profile":
