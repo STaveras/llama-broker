@@ -227,9 +227,19 @@ directly.
   a client budget use the inverse-parallel default
   (`slot_context_window // parallel`); `LLAMA_BROKER_MAX_OUTPUT_TOKENS` may set
   an explicit operator ceiling.
-- **No GPU-telemetry dependency for normal switching.** Resource bounds come
-  from systemd cgroups; `nvidia-smi`-based admission is only used in explicit
-  qualification experiments.
+- **GPU telemetry without vendor CLIs.** The shared capability probe reads AMD
+  VRAM from DRM sysfs and NVIDIA/WSL VRAM through the CUDA driver API via ctypes;
+  it never invokes `nvidia-smi` or treats host RAM as VRAM. Unsupported or
+  ambiguous device selection remains unknown. Set `LLAMA_BROKER_GPU_DEVICE` to
+  a visible ordinal when more than one device is exposed; with
+  `CUDA_VISIBLE_DEVICES`, ordinals refer to the restricted visible list.
+- **Bounded early handoff.** When one selected GPU reports a sustained, monotonic
+  free-memory rise across the configured sample window after an asynchronous
+  stop, the next backend may start before the old process exits. The endpoint
+  must be absent and unrelated broker units quiescent; the old unit is reaped
+  before readiness/commit. This advisory heuristic does not prove target fit;
+  normal resource admission still applies. Set `LLAMA_BROKER_HANDOFF_MIN_VRAM_RISE_MIB`
+  and `LLAMA_BROKER_HANDOFF_WINDOW_SAMPLES` to tune it.
 - **Lifecycle failure handling.** Successful transient requests retain the
   current restore behavior. Failed transitions stop/quarantine the failed
   target, clear the active alias, and do not automatically restore or restart

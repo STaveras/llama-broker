@@ -11,14 +11,18 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from types import ModuleType
 from typing import Sequence
+
+
+try:
+    from llama_broker.gpu_memory import GpuTelemetryError, probe_gpu_memory
+except ModuleNotFoundError:  # packaged bridge: shared module is bundled beside the launcher
+    from gpu_memory import GpuTelemetryError, probe_gpu_memory
 
 
 class StrataBridgeError(ValueError):
@@ -119,45 +123,10 @@ def _system_resource_mib() -> tuple[int, int, int]:
     return total_kib // 1024, available_kib // 1024, max(0, swap_used_kib // 1024)
 
 
-def _gpu_memory_mib() -> tuple[int, int]:
-    """Return first visible NVIDIA GPU (total, free) MiB from nvidia-smi."""
-    search_path = os.defpath + os.pathsep + "/usr/lib/wsl/lib" + os.pathsep + "/usr/local/cuda/bin"
-    executable = shutil.which("nvidia-smi", path=search_path)
-    if executable is None:
-        raise StrataBridgeError("nvidia-smi is unavailable; cannot verify Strata VRAM budget")
-    command = [
-        executable,
-        "--query-gpu=memory.total,memory.free",
-        "--format=csv,noheader,nounits",
-    ]
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if visible and visible != "-1":
-        command[1:1] = ["--id", visible.split(",", 1)[0].strip()]
-    try:
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=10,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise StrataBridgeError(f"cannot query NVIDIA VRAM: {error}") from error
-    if result.returncode != 0:
-        raise StrataBridgeError("nvidia-smi failed while checking Strata VRAM admission")
-    try:
-        total_text, free_text = result.stdout.strip().splitlines()[0].split(",", 1)
-        return int(total_text.strip()), int(free_text.strip())
-    except (IndexError, ValueError) as error:
-        raise StrataBridgeError("nvidia-smi returned an invalid VRAM record") from error
-
-
 def assess_strata_memory_mode(
     *,
     system_ram_mib: int,
-    gpu_vram_total_mib: int,
+    gpu_vram_total_mib: int | None,
     mmap_experts: bool,
     has_experts_bin: bool,
     resident_budget_gib: int | None = None,
@@ -166,6 +135,8 @@ def assess_strata_memory_mode(
     if mmap_experts:
         if not has_experts_bin:
             raise StrataBridgeError("Strata mmap-experts mode requires the pack's experts.bin")
+        if gpu_vram_total_mib is None:
+            raise StrataBridgeError("GPU VRAM telemetry is unavailable; cannot assess Strata mmap mode")
         ram_gib = system_ram_mib / 1024
         vram_gib = gpu_vram_total_mib / 1024
         estimated_cache_gib = (
@@ -202,19 +173,24 @@ def assess_strata_memory_mode(
 
 def enforce_gpu_floor(
     *,
-    gpu_total_mib: int,
-    gpu_free_mib: int,
+    gpu_total_mib: int | None,
+    gpu_free_mib: int | None,
     min_total_vram_mib: int,
     min_free_vram_mib: int,
-) -> None:
+) -> tuple[int, int]:
     if min_total_vram_mib < STRATA_TOTAL_VRAM_MIN_MIB:
         raise StrataBridgeError("Strata minimum total-VRAM gate cannot be weakened")
     if min_free_vram_mib < STRATA_FREE_VRAM_MIN_MIB:
         raise StrataBridgeError("Strata minimum free-VRAM gate cannot be weakened")
+    if gpu_total_mib is None or gpu_free_mib is None:
+        raise StrataBridgeError(
+            "GPU VRAM telemetry is unavailable; refusing Strata admission"
+        )
     if gpu_total_mib < min_total_vram_mib:
         raise StrataBridgeError(f"total VRAM is {gpu_total_mib} MiB; Strata profile requires {min_total_vram_mib} MiB")
     if gpu_free_mib < min_free_vram_mib:
         raise StrataBridgeError(f"free VRAM is {gpu_free_mib} MiB; Strata profile requires {min_free_vram_mib} MiB")
+    return gpu_total_mib, gpu_free_mib
 
 
 def enforce_cgroup_budget(
@@ -626,7 +602,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     has_experts_bin = (Path(pack_arg) / "experts.bin").is_file()
     try:
         total_ram_mib, available_ram_mib, swap_used_mib = _system_resource_mib()
-        gpu_total_mib, gpu_free_mib = _gpu_memory_mib()
+        gpu_total_mib = gpu_free_mib = None
+        try:
+            gpu_reading = probe_gpu_memory()
+        except GpuTelemetryError as error:
+            raise StrataBridgeError(f"GPU telemetry failed: {error}") from error
+        if gpu_reading is not None:
+            gpu_total_mib, gpu_free_mib = gpu_reading
         swap_warning = enforce_resource_floor(
             available_ram_mib=available_ram_mib,
             min_available_ram_mib=args.min_available_ram_mib,
@@ -644,7 +626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if memory_warning:
             print(f"[strata] WARNING: {memory_warning}", file=sys.stderr, flush=True)
-        enforce_gpu_floor(
+        gpu_total_mib, gpu_free_mib = enforce_gpu_floor(
             gpu_total_mib=gpu_total_mib,
             gpu_free_mib=gpu_free_mib,
             min_total_vram_mib=args.min_total_vram_mib,

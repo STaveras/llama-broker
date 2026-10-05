@@ -37,12 +37,19 @@ when the catalog changes.
 Operation state persists across broker restarts. Post-commit target failure is
 fail-closed with no automatic restoration; pre-commit validation failure
 preserves the proven prior backend. Duplicate queued targets coalesce; distinct
-queued targets remain strict FIFO, and an in-flight transition is never
-superseded. Each caller receives a caller-specific `request_id` and the shared
-`execution_id` for a coalesced target; `request_id` addresses status and
-cancellation, and status exposes the linked execution. A caller may stop waiting
-or cancel its own queued request without cancelling shared work another caller
-still wants.
+queued targets remain strict FIFO. Explicit operations and transient restores are
+never preempted. The one exception is a request-driven load with no active leases
+or queued transition: when `LLAMA_BROKER_PREEMPT_IDLE_LOADS` is enabled, a request
+for another profile may cancel that idle load and reserve the next transition
+slot. The preempted request waits behind the newer one and retries without
+preempting another load. A bounded window of material, nondecreasing free-VRAM
+readings may allow the next backend to start while the old one tears down, after
+its endpoint is released. The old unit must be reaped before readiness and
+active-state publication; unavailable telemetry falls back to waiting for exit. Each caller receives a
+caller-specific `request_id` and the shared `execution_id` for a coalesced
+target; `request_id` addresses status and cancellation, and status exposes the
+linked execution. A caller may stop waiting or cancel its own queued request
+without cancelling shared work another caller still wants.
 Cancellation is allowed while queued and, at most, before destructive work
 begins. Once draining commits to stopping or starting a backend, the transition
 finishes safely and publishes a terminal result. After a broker restart, safe
