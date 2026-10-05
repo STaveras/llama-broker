@@ -37,6 +37,8 @@ STRATA_LOW_RAM_VRAM_RESERVE_GIB = 5.0
 STRATA_TOTAL_VRAM_MIN_MIB = 12_000
 STRATA_FREE_VRAM_MIN_MIB = 8_192
 STRATA_MIN_KV_RESIDENT_CELLS = 20_480
+# KV formats that support --kv-resident streaming (k8v4 cannot stream)
+STRATA_KV_FORMATS = frozenset({"fp16", "int8", "q4_0"})
 
 def _is_loopback(host: str) -> bool:
     value = str(host).strip().lower()
@@ -439,7 +441,7 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
     }
     boolean_flags = {"--mmap-experts"}
     # Optional: parks the active conversation in RAM while another prompt runs
-    optional_value_flags = {"--conversation-cache-mib", "--resident-budget-gib"}
+    optional_value_flags = {"--conversation-cache-mib", "--resident-budget-gib", "--kv"}
     if not isinstance(args, list) or not all(isinstance(arg, str) and arg for arg in args):
         raise StrataBridgeError("Strata engine_args must be a string list")
     seen: set[str] = set()
@@ -473,6 +475,8 @@ def _load_launch_config(path: Path, expected_sha256: str) -> dict:
             raise StrataBridgeError("Strata profile must pin the supported MTP acceptance threshold")
         elif flag == "--conversation-cache-mib" and not value.isdecimal():
             raise StrataBridgeError("Strata conversation cache size must be a whole number of MiB")
+        elif flag == "--kv" and value not in STRATA_KV_FORMATS:
+            raise StrataBridgeError("Strata KV format must be fp16, int8 or q4_0 with KV streaming")
         elif flag == "--kv-resident" and (
             not value.isdecimal() or int(value) < STRATA_MIN_KV_RESIDENT_CELLS
         ):

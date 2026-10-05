@@ -377,6 +377,18 @@ class StrataProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "does not match pinned profile data.*--max-context"):
             ProfileRegistry.from_path(self._write_profiles(self._profile()))
 
+    def test_strata_profile_accepts_streaming_kv_format_and_rejects_others(self) -> None:
+        base_args = list(self.launch_config["engine_args"])
+        self.launch_config["engine_args"] = [*base_args, "--kv", "int8"]
+        self.launch_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+        profile = ProfileRegistry.from_path(self._write_profiles(self._profile())).get(self.profile_id)
+        self.assertEqual(profile.strata_launch_config_path, self.launch_path)
+
+        self.launch_config["engine_args"] = [*base_args, "--kv", "k8v4"]
+        self.launch_path.write_text(json.dumps(self.launch_config), encoding="utf-8")
+        with self.assertRaisesRegex(ProfileError, "KV format"):
+            ProfileRegistry.from_path(self._write_profiles(self._profile()))
+
     def test_strata_profile_rejects_kv_resident_below_floor(self) -> None:
         args = list(self.launch_config["engine_args"])
         args[args.index("--kv-resident") + 1] = "20479"
