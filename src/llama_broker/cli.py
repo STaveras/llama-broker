@@ -4139,8 +4139,7 @@ def main(argv: list[str] | None = None) -> int:
             phase = state.get("phase", "unknown")
             profile_id = state.get("profile")
             # Durable state is useful when the broker is stopped, but the live
-            # health snapshot is the source of truth for leases and transitions
-            # only when the private backend is reachable.
+            # health snapshot is the source of truth for leases and transitions.
             backend_parts = urlsplit(effective_backend_url(load_security_config()))
             backend_host = backend_parts.hostname or "127.0.0.1"
             backend_port = backend_parts.port or 10000
@@ -4153,7 +4152,13 @@ def main(argv: list[str] | None = None) -> int:
             except BackendControllerError:
                 pass
             live_backend = live_state.get("backend")
-            if isinstance(live_backend, dict) and backend_ready:
+            live_leases = live_state.get("leases")
+            if isinstance(live_leases, dict) and live_leases.get("transitioning"):
+                # Older daemons cache the last completed backend phase while
+                # loading; an open TCP port does not make that phase current.
+                phase = "switching"
+                backend_ready = False
+            elif isinstance(live_backend, dict) and backend_ready:
                 profile_id = live_backend.get("profile", profile_id)
                 phase = live_backend.get("phase", phase)
                 if "ready" in live_backend:

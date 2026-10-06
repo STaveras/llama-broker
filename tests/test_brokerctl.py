@@ -77,6 +77,41 @@ class BrokerctlStatusTests(unittest.TestCase):
         self.assertIn("Backend:   unavailable", output.getvalue())
         self.assertIn("persisted profile: example-9b", output.getvalue())
 
+    def test_status_preserves_switching_while_live_backend_snapshot_is_inactive(self) -> None:
+        controller = Mock()
+        controller.state.return_value = {
+            "generation": 11,
+            "profile": None,
+            "phase": "switching",
+            "target_profile": "main",
+        }
+        live_state = {
+            "status": "ok",
+            "backend": {"profile": None, "phase": "inactive", "ready": False},
+            "leases": {"transitioning": True, "transition_target": "main"},
+        }
+
+        for json_output in (False, True):
+            with self.subTest(json_output=json_output):
+                output = io.StringIO()
+                with (
+                    patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+                    patch.object(brokerctl, "create_production_controller", return_value=controller),
+                    patch.object(brokerctl, "_broker_admin_get", return_value=live_state),
+                    patch.object(brokerctl, "backend_endpoint_ready", return_value=True),
+                    redirect_stdout(output),
+                ):
+                    result = brokerctl.main(["status", "--json"] if json_output else ["status"])
+
+                self.assertEqual(result, 1)
+                if json_output:
+                    detail = json.loads(output.getvalue())
+                    self.assertEqual(detail["observed_phase"], "switching")
+                    self.assertFalse(detail["backend_ready"])
+                else:
+                    self.assertIn("Broker:    switching", output.getvalue())
+                    self.assertIn("Backend:   switching", output.getvalue())
+
     def test_status_includes_live_context_and_slot_utilisation(self) -> None:
         controller = Mock()
         controller.state.return_value = {
