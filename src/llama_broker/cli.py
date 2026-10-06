@@ -3559,6 +3559,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--raw", action="store_true", help="output raw JSON")
     restart = subparsers.add_parser("restart", help="reload active model or start a new one")
     restart.add_argument("model", nargs="?")
+    restart.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
 
     unload = subparsers.add_parser("unload", help="unload the active model (stop the backend)")
     unload.add_argument("--raw", action="store_true", help="output raw JSON")
@@ -3920,6 +3921,31 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
         print(f"Endpoint:  {backend['host']}:{backend['port']}")
 
 
+def _human_restart_summary(state: dict[str, object]) -> str:
+    """One human-readable line per aspect of a restart request response."""
+    operation = state.get("operation")
+    target = None
+    if isinstance(operation, dict):
+        candidate = operation.get("target")
+        if isinstance(candidate, str) and candidate:
+            target = candidate
+    backend = state.get("backend")
+    if not isinstance(backend, dict):
+        backend = {}
+    profile = backend.get("profile")
+    current = profile if isinstance(profile, str) else None
+    if target is None and current is not None:
+        target = current
+    target_text = target if isinstance(target, str) else "(none)"
+    phase = backend.get("phase")
+    phase_text = phase if isinstance(phase, str) else "unknown"
+    return (
+        f"Requested: restart {target_text}\n"
+        f"Target:    {target_text}\n"
+        f"Phase:     {phase_text}"
+    )
+
+
 def _cmd_operation(args: argparse.Namespace) -> int:
     """Inspect, cancel, or explicitly wait for broker operation requests."""
     if args.operation_command == "list":
@@ -4215,7 +4241,10 @@ def main(argv: list[str] | None = None) -> int:
                 if args.model is not None:
                     payload["model"] = registry.resolve(args.model).id
                 state = _broker_admin("/admin/restart", payload)
-                print(json.dumps(state, indent=2, sort_keys=True))
+                if args.json:
+                    print(json.dumps(state, indent=2, sort_keys=True))
+                else:
+                    print(_human_restart_summary(state))
                 return 0
             profile = registry.resolve(args.model)
             state = _broker_admin(
