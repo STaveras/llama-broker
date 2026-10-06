@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Callable
 
 from llama_broker.broker_profiles import ProfileRegistry
-from llama_broker.backend_controller import BackendControllerError, LifecycleCancelledError
+from llama_broker.backend_controller import (
+    BackendControllerError,
+    BackendExit,
+    LifecycleCancelledError,
+)
+from llama_broker.crash_loop import CrashLoopGuard
 import llama_broker.daemon as llama_broker
 from llama_broker.broker_security import SecurityConfig, write_api_keys
 from llama_broker.profile_config import sha256_file
@@ -123,6 +128,13 @@ class BackendHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            self.close_connection = True
+            return
+        if payload and payload.get("_test_reset_before_headers"):
+            self.connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+            )
+            self.connection.close()
             self.close_connection = True
             return
         if payload and payload.get("_test_reset_stream"):
@@ -1506,6 +1518,101 @@ class BrokerHttpTests(unittest.TestCase):
         handle_error.assert_not_called()
         messages = [call.args[0] for call in log.call_args_list]
         self.assertTrue(any("backend proxy failure for main" in m for m in messages), messages)
+
+    def _crash_main_backend(self) -> tuple[int, dict[str, object]]:
+        connection = self._open_chat(
+            {"model": "main", "messages": [], "_test_reset_before_headers": True}
+        )
+        try:
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_backend_exit_during_request_is_logged_with_its_cause(self) -> None:
+        self.controller.describe_exit = lambda _profile: BackendExit(  # type: ignore[attr-defined]
+            result="signal",
+            exit_status="SIGABRT",
+            detail=("CUDA error: device not ready",),
+        )
+        with patch.object(llama_broker, "_log") as log:
+            status, body = self._crash_main_backend()
+
+        self.assertEqual(status, 502)
+        self.assertEqual(
+            body["error"]["message"],
+            "backend exited during the request: signal (SIGABRT): CUDA error: device not ready",
+        )
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(
+            any(
+                m.startswith("[broker] backend main exited during request ")
+                and m.endswith(": signal (SIGABRT): CUDA error: device not ready")
+                for m in messages
+            ),
+            messages,
+        )
+        self.assertEqual(self.broker.application.crash_loops.snapshot()["main"]["crashes"], 1)
+
+    def test_proxy_failure_with_backend_still_running_is_not_a_crash(self) -> None:
+        self.controller.describe_exit = lambda _profile: None  # type: ignore[attr-defined]
+        with patch.object(llama_broker, "_log"):
+            status, body = self._crash_main_backend()
+
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"]["message"], "backend request failed")
+        self.assertEqual(self.broker.application.crash_loops.snapshot(), {})
+
+    def test_repeated_backend_crashes_refuse_the_profile_instead_of_restarting_it(self) -> None:
+        application = self.broker.application
+        application.crash_loops = CrashLoopGuard(threshold=2, window=600, cooldown=300)
+        self.controller.describe_exit = lambda _profile: BackendExit(  # type: ignore[attr-defined]
+            result="signal", exit_status="SIGABRT", detail=("CUDA error: device not ready",)
+        )
+        with patch.object(llama_broker, "_log") as log:
+            self.assertEqual(self._crash_main_backend()[0], 502)
+            # The first crash restarts the backend for the next request as before.
+            self.assertEqual(self._crash_main_backend()[0], 502)
+            self.assertEqual(self.controller.transitions, ["main"])
+            seen = len(self.backend.seen_payloads)  # type: ignore[attr-defined]
+
+            connection = self._open_chat({"model": "main", "messages": []})
+            try:
+                response = connection.getresponse()
+                status = response.status
+                retry_after = response.getheader("Retry-After")
+                error = json.loads(response.read())["error"]
+            finally:
+                connection.close()
+
+        self.assertEqual(status, 503)
+        self.assertEqual(retry_after, "300")
+        self.assertEqual(error["type"], "backend_crash_loop")
+        self.assertIn("crashed 2 times", error["message"])
+        self.assertIn("CUDA error: device not ready", error["message"])
+        self.assertEqual(self.controller.transitions, ["main"])
+        self.assertEqual(len(self.backend.seen_payloads), seen)  # type: ignore[attr-defined]
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertTrue(any("is crash-looping" in m for m in messages), messages)
+
+        health = application.health()
+        self.assertEqual(health["status"], "degraded")
+        self.assertTrue(health["crash_loops"]["main"]["tripped"])
+
+        application.submit_switch_operation("main")
+        self.assertEqual(application.crash_loops.snapshot(), {})
+
+    def test_completed_response_clears_crash_history(self) -> None:
+        self.controller.describe_exit = lambda _profile: BackendExit(  # type: ignore[attr-defined]
+            result="signal", exit_status="SIGABRT"
+        )
+        with patch.object(llama_broker, "_log"):
+            self._crash_main_backend()
+            self.assertIn("main", self.broker.application.crash_loops.snapshot())
+            status, _ = self._post({"model": "main", "messages": []})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self.broker.application.crash_loops.snapshot(), {})
 
     def test_saturated_streams_cannot_block_health_or_emergency_stop(self) -> None:
         self._replace_broker(

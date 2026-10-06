@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -178,8 +179,142 @@ class ServiceStateSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class BackendExit:
+    """How a backend unit's last main process ended, for crash diagnostics."""
+
+    result: str
+    exit_status: str
+    detail: tuple[str, ...] = ()
+
+    @property
+    def crashed(self) -> bool:
+        return self.result != "success"
+
+    def summary(self) -> str:
+        text = f"{self.result} ({self.exit_status})"
+        if self.detail:
+            text += ": " + "; ".join(self.detail)
+        return text
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "result": self.result,
+            "exit_status": self.exit_status,
+            "detail": list(self.detail),
+        }
+
+
 ServiceStateProbe = Callable[[str], ServiceStateSnapshot]
 ServiceInventoryProbe = Callable[[str], Sequence[str]]
+# Returns None while the unit is still running or stopping.
+BackendExitProbe = Callable[[str], "BackendExit | None"]
+
+_LOG_LEVEL_PREFIX = re.compile(r"^\d+(?:\.\d+)+ ([A-Z]) ")
+_ERROR_WORDS = re.compile(
+    # No leading boundary on error/exception, so RuntimeError: and the like match.
+    r"(?:error|exception)\b|\b(?:fatal|out of memory|assert(?:ion)?|abort(?:ed)?|"
+    r"segmentation fault|terminate called|traceback)\b",
+    re.IGNORECASE,
+)
+_MAX_EXIT_DETAIL_LINES = 3
+_MAX_EXIT_DETAIL_CHARS = 240
+
+
+def backend_error_lines(lines: Iterable[str]) -> tuple[str, ...]:
+    """Pick the first few error lines a backend printed before it died.
+
+    llama.cpp tags its own log lines with a level letter, so ``E`` lines win;
+    otherwise fall back to generic error words, skipping gdb backtrace noise.
+    """
+
+    tagged: list[str] = []
+    worded: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(("#", "[New LWP", "[Thread", "[Inferior")):
+            continue
+        match = _LOG_LEVEL_PREFIX.match(line)
+        if match is not None:
+            if match.group(1) == "E":
+                tagged.append(line[match.end():].strip())
+            continue
+        if _ERROR_WORDS.search(line) and "warning:" not in line:
+            worded.append(line)
+    picked = tagged or worded
+    return tuple(
+        line[: _MAX_EXIT_DETAIL_CHARS - 3] + "..." if len(line) > _MAX_EXIT_DETAIL_CHARS else line
+        for line in picked[:_MAX_EXIT_DETAIL_LINES]
+    )
+
+
+def _exit_status_text(code: str, status: str) -> str:
+    # ExecMainCode is the CLD_* code from waitid(): 1 exited, 2 killed, 3 dumped.
+    if code in {"2", "3"}:
+        try:
+            name = signal.Signals(int(status)).name
+        except ValueError:
+            name = f"signal {status}"
+        return f"{name}, core dumped" if code == "3" else name
+    return f"exit {status}"
+
+
+def systemd_backend_exit_probe(unit_name: str) -> BackendExit | None:
+    """Describe a stopped unit's last exit and the errors it logged."""
+
+    result = subprocess.run(
+        (
+            "systemctl",
+            "--user",
+            "show",
+            unit_name,
+            "--no-pager",
+            "--property=ActiveState",
+            "--property=Result",
+            "--property=ExecMainCode",
+            "--property=ExecMainStatus",
+            "--property=InvocationID",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    if values.get("ActiveState") not in {"inactive", "failed"}:
+        return None
+    detail: tuple[str, ...] = ()
+    invocation = values.get("InvocationID", "")
+    if re.fullmatch(r"[0-9a-f]{32}", invocation):
+        try:
+            journal = subprocess.run(
+                (
+                    "journalctl",
+                    "--user",
+                    f"_SYSTEMD_INVOCATION_ID={invocation}",
+                    "--no-pager",
+                    "--output=cat",
+                    "--lines=400",
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            detail = backend_error_lines(journal.stdout.splitlines())
+        except (OSError, subprocess.SubprocessError):
+            detail = ()
+    return BackendExit(
+        result=values.get("Result") or "unknown",
+        exit_status=_exit_status_text(
+            values.get("ExecMainCode", ""), values.get("ExecMainStatus", "")
+        ),
+        detail=detail,
+    )
 
 
 def systemd_service_state_probe(unit_name: str) -> ServiceStateSnapshot:
@@ -418,6 +553,7 @@ class BackendController:
         event_logger: EventLogger,
         service_state_probe: ServiceStateProbe | None = None,
         service_inventory_probe: ServiceInventoryProbe | None = None,
+        exit_probe: BackendExitProbe | None = None,
         cancellation_probe: CancellationProbe | None = None,
         endpoint_probe: EndpointProbe | None = None,
         backend_listen_host: str | None = None,
@@ -450,6 +586,7 @@ class BackendController:
         self.event_logger = event_logger
         self.service_state_probe = service_state_probe
         self.service_inventory_probe = service_inventory_probe
+        self.exit_probe = exit_probe
         self.cancellation_probe = cancellation_probe
         self.endpoint_probe = endpoint_probe
         if backend_listen_port is not None and backend_listen_port <= 0:
@@ -1141,6 +1278,30 @@ class BackendController:
                 error=str(error),
             )
             return failure_state
+
+    def describe_exit(
+        self,
+        profile_id: str,
+        *,
+        settle_timeout: float = 3.0,
+        poll_interval: float = 0.1,
+    ) -> BackendExit | None:
+        """Report how a profile's backend exited, or None if it is still running.
+
+        A crashing llama-server can close its socket before systemd records the
+        exit (a backtrace dump runs in between), so this waits briefly for the
+        unit to settle. It takes no controller lock: it only reads systemd.
+        """
+
+        if self.exit_probe is None:
+            return None
+        unit_name = self.unit_name(profile_id)
+        deadline = time.monotonic() + max(0.0, settle_timeout)
+        while True:
+            backend_exit = self.exit_probe(unit_name)
+            if backend_exit is not None or time.monotonic() >= deadline:
+                return backend_exit
+            time.sleep(poll_interval)
 
     def stop_all(
         self, *, commit_callback: Callable[[], None] | None = None
@@ -2139,6 +2300,8 @@ class BackendController:
             )
 
     def _probe_owned(self, profile_id: str, profile: Profile) -> None:
+        # A crashed process cannot become ready without being started again.
+        self._require_running(profile_id, stage="pre_readiness")
         self._probe(profile)
         self._require_running(profile_id, stage="post_readiness")
 

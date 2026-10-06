@@ -13,6 +13,7 @@ from llama_broker.backend_controller import (
     ActivationPreemptedError,
     AdmissionError,
     BackendController,
+    BackendExit,
     CommandError,
     ConfigurationError,
     LifecycleCancelledError,
@@ -22,6 +23,8 @@ from llama_broker.backend_controller import (
     ServiceStateSnapshot,
     ServiceOwnershipError,
     SwitchError,
+    backend_error_lines,
+    systemd_backend_exit_probe,
     systemd_service_inventory_probe,
     systemd_service_state_probe,
 )
@@ -506,6 +509,117 @@ class BackendControllerTest(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["check"])
         self.assertEqual(run.call_args.kwargs["timeout"], 5)
 
+    def test_backend_error_lines_prefers_llama_cpp_error_records(self) -> None:
+        journal = [
+            "0.03.327.665 I srv  llama_server: listening on https://0.0.0.0:10000",
+            "/src/ggml/src/ggml-cuda/ggml-cuda.cu:109: CUDA error",
+            "1.18.294.224 E CUDA error: device not ready",
+            "1.18.294.242 E   current device: 0, in function alloc at /src/ggml-cuda.cu:652",
+            "1.18.294.243 E   cuMemSetAccess(start_ptr, reserve_size, &access, 1)",
+            "1.18.294.250 E   one line too many",
+            "[New LWP 565863]",
+            "#5  0x000071d6af142b2b in ggml_abort () from libggml-base.so.0",
+        ]
+
+        self.assertEqual(
+            backend_error_lines(journal),
+            (
+                "CUDA error: device not ready",
+                "current device: 0, in function alloc at /src/ggml-cuda.cu:652",
+                "cuMemSetAccess(start_ptr, reserve_size, &access, 1)",
+            ),
+        )
+
+    def test_backend_error_lines_falls_back_to_error_words_and_truncates(self) -> None:
+        journal = [
+            "Loading model",
+            "Traceback (most recent call last):",
+            "warning: ignore this error",
+            "#0 abort () in libc",
+            "RuntimeError: " + "x" * 400,
+        ]
+
+        lines = backend_error_lines(journal)
+
+        self.assertEqual(lines[0], "Traceback (most recent call last):")
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines[1]), 240)
+        self.assertTrue(lines[1].endswith("..."))
+
+    def test_systemd_backend_exit_probe_reports_signal_and_journal_errors(self) -> None:
+        show = SimpleNamespace(stdout=(
+            "ActiveState=failed\nResult=signal\nExecMainCode=2\nExecMainStatus=6\n"
+            "InvocationID=c95ff89c149b4de194f7f50333225b56\n"
+        ))
+        journal = SimpleNamespace(stdout="1.18.294.224 E CUDA error: device not ready\n")
+        with patch.object(
+            backend_controller.subprocess, "run", side_effect=[show, journal]
+        ) as run:
+            backend_exit = systemd_backend_exit_probe("llama-broker-profile-main.service")
+
+        self.assertEqual(
+            backend_exit,
+            BackendExit(
+                result="signal",
+                exit_status="SIGABRT",
+                detail=("CUDA error: device not ready",),
+            ),
+        )
+        assert backend_exit is not None
+        self.assertTrue(backend_exit.crashed)
+        self.assertEqual(
+            backend_exit.summary(), "signal (SIGABRT): CUDA error: device not ready"
+        )
+        journal_command = run.call_args_list[1].args[0]
+        self.assertEqual(journal_command[:2], ("journalctl", "--user"))
+        self.assertIn("_SYSTEMD_INVOCATION_ID=c95ff89c149b4de194f7f50333225b56", journal_command)
+
+    def test_systemd_backend_exit_probe_waits_for_running_units(self) -> None:
+        show = SimpleNamespace(stdout="ActiveState=deactivating\nResult=success\n")
+        with patch.object(backend_controller.subprocess, "run", return_value=show) as run:
+            self.assertIsNone(systemd_backend_exit_probe("llama-broker-profile-main.service"))
+        run.assert_called_once()
+
+    def test_systemd_backend_exit_probe_describes_exit_codes_without_journal(self) -> None:
+        show = SimpleNamespace(stdout=(
+            "ActiveState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1\n"
+            "InvocationID=\n"
+        ))
+        with patch.object(backend_controller.subprocess, "run", return_value=show) as run:
+            backend_exit = systemd_backend_exit_probe("llama-broker-profile-main.service")
+
+        self.assertEqual(backend_exit, BackendExit(result="exit-code", exit_status="exit 1"))
+        run.assert_called_once()
+
+    def test_clean_stop_is_not_a_crash(self) -> None:
+        self.assertFalse(BackendExit(result="success", exit_status="exit 0").crashed)
+
+    def test_describe_exit_waits_for_the_unit_to_settle(self) -> None:
+        backend_exit = BackendExit(result="signal", exit_status="SIGABRT")
+        answers = [None, None, backend_exit]
+        units: list[str] = []
+
+        def probe(unit_name: str) -> BackendExit | None:
+            units.append(unit_name)
+            return answers.pop(0)
+
+        self.controller.exit_probe = probe
+
+        self.assertEqual(
+            self.controller.describe_exit("main-27b", settle_timeout=5, poll_interval=0.001),
+            backend_exit,
+        )
+        self.assertEqual(units, [self.controller.unit_name("main-27b")] * 3)
+
+    def test_describe_exit_gives_up_while_the_unit_keeps_running(self) -> None:
+        self.controller.exit_probe = lambda _unit: None
+        self.assertIsNone(
+            self.controller.describe_exit("main-27b", settle_timeout=0.01, poll_interval=0.001)
+        )
+
+    def test_describe_exit_without_a_probe_reports_nothing(self) -> None:
+        self.assertIsNone(self.controller.describe_exit("main-27b"))
+
     def test_systemd_alias_probe_reports_canonical_id(self) -> None:
         completed = SimpleNamespace(stdout=(
             "Id=llama-broker-profile-main.service\n"
@@ -976,6 +1090,33 @@ class BackendControllerTest(unittest.TestCase):
         self.assertEqual(state, initial)
         self.assertEqual(self.harness.commands, [])
         self.assertEqual(self.harness.probes, [("main-27b", 90.0)])
+
+    def test_load_crashed_current_profile_restarts_before_waiting_for_readiness(self) -> None:
+        self.controller.switch("main-27b")
+        unit = self.controller.unit_name("main-27b")
+        self.harness.service_states[unit] = ServiceStateSnapshot(
+            active_state="failed", sub_state="failed", main_pid=0, control_pid=0,
+        )
+        self.harness.commands.clear()
+        self.harness.probes.clear()
+
+        def probe(alias: str, timeout: float) -> bool:
+            self.assertEqual(
+                self.harness.service_state(unit).active_state,
+                "active",
+                "a crashed unit must restart before spending its startup timeout",
+            )
+            return self.harness.probe(alias, timeout)
+
+        self.controller.readiness_probe = probe
+        state = self.controller.switch("main-27b")
+
+        self.assertEqual(self.harness.commands, [
+            ("systemctl", "--user", "stop", unit),
+            ("systemctl", "--user", "start", unit),
+        ])
+        self.assertEqual(self.harness.probes, [("main-27b", 90.0)])
+        self.assertEqual(state, {"generation": 2, "profile": "main-27b", "phase": "active"})
 
     def test_stop_all_stops_every_profile_and_marks_inactive(self) -> None:
         self.controller.switch("main-27b")

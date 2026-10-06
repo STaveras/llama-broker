@@ -3921,6 +3921,27 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
         print(f"Endpoint:  {backend['host']}:{backend['port']}")
 
 
+def _crash_loop_lines(live_state: dict[str, object]) -> list[str]:
+    """Describe profiles the broker's crash-loop guard is refusing or watching."""
+    crash_loops = live_state.get("crash_loops")
+    if not isinstance(crash_loops, dict):
+        return []
+    lines = []
+    for profile_id, entry in sorted(crash_loops.items()):
+        if not isinstance(entry, dict):
+            continue
+        cause = entry.get("last_cause") or "unknown cause"
+        crashes = entry.get("crashes", 0)
+        if entry.get("tripped"):
+            lines.append(
+                f"Crash loop: {profile_id} refused for {entry.get('retry_after', 0)}s "
+                f"after {crashes} crashes (`brokerctl restart` retries now); last: {cause}"
+            )
+        elif entry.get("probation"):
+            lines.append(f"Crash loop: {profile_id} on probation; last: {cause}")
+    return lines
+
+
 def _human_restart_summary(state: dict[str, object]) -> str:
     """One human-readable line per aspect of a restart request response."""
     operation = state.get("operation")
@@ -4171,6 +4192,8 @@ def main(argv: list[str] | None = None) -> int:
             observed_phase = "stale" if stale_active else phase
             broker_health = live_state.get("status", "unavailable")
             print(f"Broker:    {observed_phase} (port 11434; health: {broker_health})")
+            for line in _crash_loop_lines(live_state):
+                print(line)
 
             # Backend status
             if stale_active:
