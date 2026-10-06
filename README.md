@@ -134,7 +134,7 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 | `brokerctl status` | show durable/live backend state (`--json` for schema-versioned JSON) |
 | `brokerctl profile render <model>` | render a profile unit without installing |
 | `brokerctl load <model>` | queue a profile load (`start` is an alias) |
-| `brokerctl restart` | reload the active model or start a new one |
+| `brokerctl restart` | reload the active model or start a new one (`--json` for the full machine-readable response) |
 | `brokerctl unload` | stop the current backing backend |
 | `brokerctl verify` | verify pinned runtime/model/projector SHA-256 |
 | `brokerctl clean [models\|runtimes\|backups\|caches]` | list unused models, orphaned runtime bundles and old manifest backups, then ask before cleaning them (scripts and `--json` only get the list); `--apply` cleans without asking. Cleaning deletes; with `--archive-dir DIR` (or `LLAMA_BROKER_ARCHIVE_DIR`) models and backups are copied there and SHA-256 verified first. Package caches are included only when `caches` is named. Paths in `~/.config/llama-broker/clean-keep` (or `--keep`) are never touched |
