@@ -1565,7 +1565,7 @@ def run_tui(
                     model.manifest = pending_manifest
                     model.base_manifest = copy.deepcopy(pending_manifest)
                     model.dirty = False
-                    status = "Saved successfully; loaded model keeps running."
+                    status = "Saved profile configuration."
                 apply_finished = None
                 pending_manifest = None
             if apply_finished is not None:
@@ -1612,7 +1612,7 @@ def run_tui(
             footer = (
                 "Apply is running; wait here for its result."
                 if apply_finished is not None
-                else "s saves profile config and refreshes aliases; the loaded model keeps running."
+                else "Press s to save config and refresh aliases."
             )
             stdscr.addnstr(max(height - 2, 0), 0, footer, max(width - 1, 1))
             stdscr.timeout(250 if apply_finished is not None else -1)
