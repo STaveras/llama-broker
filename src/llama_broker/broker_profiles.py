@@ -41,7 +41,6 @@ ALLOWED_CACHE_TYPES = frozenset(
 # Profiles may request the full trained window, but the fail-closed single-slot,
 # fit, and memory controls below still apply.
 MAX_CONTEXT_SIZE = 262_144
-MAX_PARALLEL = 2
 MAX_BATCH_SIZE = 512
 MAX_UBATCH_SIZE = 128
 MAX_FIT_TARGET_MIB = 8_192
@@ -1657,8 +1656,6 @@ def _parse_profile(
     parallel = _positive_int(record, "parallel")
     if runtime == "strata" and parallel != 1:
         raise ProfileError(f"Strata currently serves one request at a time; parallel must be 1 for {profile_id!r}")
-    if runtime == "llamacpp" and parallel > MAX_PARALLEL:
-        raise ProfileError(f"parallel slots for {profile_id!r} exceed safe limit {MAX_PARALLEL}")
     max_output_tokens = (
         _positive_int(record, "max_output_tokens")
         if "max_output_tokens" in record
