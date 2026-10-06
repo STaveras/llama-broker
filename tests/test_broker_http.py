@@ -631,11 +631,12 @@ class BrokerHttpTests(unittest.TestCase):
         transition_timeout: float,
         stop_timeout: float,
         start_operation_worker: bool = True,
+        initial_profile: str | None = "main",
     ) -> None:
         self.broker.shutdown()
         self.broker.server_close()
         self.broker_thread.join(timeout=1)
-        self.controller = FakeController("main")
+        self.controller = FakeController(initial_profile)
         application = BrokerApplication(
             registry=self.registry,
             controller=self.controller,
@@ -1815,12 +1816,19 @@ class BrokerHttpTests(unittest.TestCase):
             stream.join(timeout=1)
 
     def test_health_uses_cached_state_while_controller_transition_lock_is_held(self) -> None:
+        self._assert_health_during_blocked_switch("main")
+
+    def test_health_reports_cold_load_while_controller_transition_lock_is_held(self) -> None:
+        self._assert_health_during_blocked_switch(None)
+
+    def _assert_health_during_blocked_switch(self, initial_profile: str | None) -> None:
         self._replace_broker(
             max_workers=2,
             control_workers=2,
             drain_timeout=0.1,
             transition_timeout=0.2,
             stop_timeout=1,
+            initial_profile=initial_profile,
         )
         transition_started = threading.Event()
         allow_transition = threading.Event()
@@ -1852,6 +1860,9 @@ class BrokerHttpTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 0.5)
             self.assertEqual(status, 200)
             self.assertTrue(health["leases"]["transitioning"])  # type: ignore[index]
+            self.assertEqual(health["backend"]["phase"], "switching")  # type: ignore[index]
+            self.assertEqual(health["backend"]["target_profile"], "vision")  # type: ignore[index]
+            self.assertFalse(health["backend"]["ready"])  # type: ignore[index]
 
             request.join(timeout=1)
             self.assertFalse(request.is_alive())
@@ -1863,13 +1874,23 @@ class BrokerHttpTests(unittest.TestCase):
             status, health = self._get("/admin/status")
             self.assertEqual(status, 200)
             self.assertTrue(health["leases"]["quiescing"])  # type: ignore[index]
+            self.assertEqual(health["backend"]["phase"], "switching")  # type: ignore[index]
+            self.assertEqual(health["backend"]["target_profile"], "vision")  # type: ignore[index]
+            self.assertFalse(health["backend"]["ready"])  # type: ignore[index]
         finally:
             allow_transition.set()
+            request.join(timeout=1)
 
         deadline = time.monotonic() + 1
         while self.broker.application.coordinator.quiescing:  # type: ignore[attr-defined]
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.005)
+        status, health = self._get("/admin/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(health["backend"]["phase"], "active")  # type: ignore[index]
+        self.assertEqual(health["backend"]["profile"], "vision")  # type: ignore[index]
+        self.assertTrue(health["backend"]["ready"])  # type: ignore[index]
+        self.assertNotIn("target_profile", health["backend"])
 
 
 class CoordinatorTests(unittest.TestCase):
