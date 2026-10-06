@@ -2673,6 +2673,12 @@ class BrokerApplication:
         # Controller transitions can hold their own lock for minutes.  Health
         # reads the last completed state instead of joining that lock convoy.
         state = self._controller_state_snapshot()
+        leases = self.coordinator.snapshot()
+        if leases["transitioning"]:
+            # The completed state can be inactive or belong to the old model
+            # while the coordinator is still loading the requested backend.
+            state["phase"] = "switching"
+            state["target_profile"] = leases["transition_target"]
         phase = state.get("phase")
         profile_id = state.get("profile")
         ready = False
@@ -2731,7 +2737,7 @@ class BrokerApplication:
                 "deployment_revision": deployment_revision,
             },
             "backend": backend_state,
-            "leases": self.coordinator.snapshot(),
+            "leases": leases,
             "crash_loops": crash_loops,
             "maintenance": {
                 "autotune": self._autotune_lease.status(),
