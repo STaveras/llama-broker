@@ -213,6 +213,41 @@ class StrataBridgeTests(unittest.TestCase):
         self.assertFalse(handler_type("older-key").parse_request())
         self.assertTrue(handler_type("new-key").parse_request())
 
+    def test_bridge_auth_bypasses_a_strata_parse_request_override(self) -> None:
+        self.key_file.write_text("current-key\n", encoding="utf-8")
+        self.key_file.chmod(0o600)
+        overridden = []
+
+        class FakeHandler(BaseHTTPRequestHandler):
+            def __init__(self, token: str) -> None:
+                self.raw_requestline = b"GET /v1/models HTTP/1.1\r\n"
+                self.rfile = io.BytesIO(
+                    f"Host: evil.example\r\nAuthorization: Bearer {token}\r\n\r\n".encode()
+                )
+                self.wfile = io.BytesIO()
+                self.auth_responses = []
+                self.close_connection = False
+
+            def parse_request(self):  # Strata 0.1.39's Host check
+                overridden.append(True)
+                return False
+
+            def _json(self, status, payload):
+                self.auth_responses.append((status, payload))
+
+        module = SimpleNamespace(
+            serve=lambda *_args, **_kwargs: None,
+            make_handler=lambda _service: FakeHandler,
+        )
+        install_private_loopback_serve(module, self.key_file)
+        handler_type = module.make_handler(SimpleNamespace(api_key=""))
+
+        self.assertTrue(handler_type("current-key").parse_request())
+        rejected = handler_type("wrong-key")
+        self.assertFalse(rejected.parse_request())
+        self.assertEqual(rejected.auth_responses[0][0], 401)
+        self.assertEqual(overridden, [])
+
     def test_rejects_insecure_or_empty_key_files(self) -> None:
         self.key_file.chmod(0o644)
         with self.assertRaisesRegex(StrataBridgeError, "permissions"):
