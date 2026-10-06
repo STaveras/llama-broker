@@ -302,17 +302,30 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), state)
 
     def test_restart_without_model_requests_admin_restart(self) -> None:
-        admin = Mock(return_value={"status": "ok"})
+        state = {
+            "status": "ok",
+            "operation": {"request_id": "request-1", "status": "queued"},
+            "backend": {"profile": "main", "phase": "inactive"},
+        }
+        admin = Mock(return_value=state)
+        output = io.StringIO()
+
         with (
             patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
             patch.object(brokerctl, "create_production_controller", return_value=Mock()),
             patch.object(brokerctl, "_broker_admin", admin),
-            redirect_stdout(io.StringIO()),
+            redirect_stdout(output),
         ):
             result = brokerctl.main(["restart"])
 
         self.assertEqual(result, 0)
         admin.assert_called_once_with("/admin/restart", {"wait": False})
+        self.assertEqual(
+            output.getvalue(),
+            "Requested: restart main\n"
+            "Target:    main\n"
+            "Phase:     inactive\n",
+        )
 
     def test_restart_with_model_requests_admin_restart_for_target(self) -> None:
         admin = Mock(return_value={"status": "ok"})
@@ -328,6 +341,57 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         admin.assert_called_once_with("/admin/restart", {"model": "vision", "wait": False})
+
+    def test_crash_loop_lines_describe_refused_and_probation_profiles(self) -> None:
+        live_state = {
+            "crash_loops": {
+                "main": {
+                    "crashes": 3,
+                    "last_cause": "signal (SIGABRT): CUDA error: device not ready",
+                    "tripped": True,
+                    "retry_after": 240,
+                    "probation": False,
+                },
+                "vision": {
+                    "crashes": 1,
+                    "last_cause": "signal (SIGSEGV)",
+                    "tripped": False,
+                    "retry_after": 0,
+                    "probation": True,
+                },
+                "quiet": {"crashes": 1, "tripped": False, "probation": False},
+            }
+        }
+
+        self.assertEqual(
+            brokerctl._crash_loop_lines(live_state),
+            [
+                "Crash loop: main refused for 240s after 3 crashes "
+                "(`brokerctl restart` retries now); last: signal (SIGABRT): CUDA error: device not ready",
+                "Crash loop: vision on probation; last: signal (SIGSEGV)",
+            ],
+        )
+        self.assertEqual(brokerctl._crash_loop_lines({}), [])
+
+    def test_restart_json_emits_full_state(self) -> None:
+        state = {
+            "status": "ok",
+            "operation": {"request_id": "request-1", "status": "queued"},
+            "backend": {"profile": "main", "phase": "inactive"},
+        }
+        admin = Mock(return_value=state)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "create_production_controller", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin", admin),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["restart", "--json"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), state)
 
     def test_operation_status_reads_one_request_from_admin_api(self) -> None:
         state = {

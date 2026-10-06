@@ -34,12 +34,15 @@ from urllib.parse import unquote, urlsplit
 from .backend_controller import (
     BackendController,
     BackendControllerError,
+    BackendExit,
     LifecycleCancelledError,
     SwitchError,
     subprocess_command_runner,
+    systemd_backend_exit_probe,
     systemd_service_inventory_probe,
     systemd_service_state_probe,
 )
+from .crash_loop import CrashLoopGuard
 from .gpu_memory import GpuTelemetryError, probe_gpu_memory
 from .broker_security import (
     SecurityConfig,
@@ -198,6 +201,17 @@ RECOVERY_INTERVAL = float(
 )
 RECOVERY_MAX_BACKOFF = float(
     _env_value("LLAMA_BROKER_RECOVERY_MAX_BACKOFF", "LLM_BROKER_RECOVERY_MAX_BACKOFF", "60")
+)
+# Request-time backend crashes tolerated per profile inside the window before
+# its requests are refused for the cooldown instead of restarting it; 0 disables.
+CRASH_LOOP_THRESHOLD = int(
+    _env_value("LLAMA_BROKER_CRASH_LOOP_THRESHOLD", "LLM_BROKER_CRASH_LOOP_THRESHOLD", "3")
+)
+CRASH_LOOP_WINDOW = float(
+    _env_value("LLAMA_BROKER_CRASH_LOOP_WINDOW", "LLM_BROKER_CRASH_LOOP_WINDOW", "600")
+)
+CRASH_LOOP_COOLDOWN = float(
+    _env_value("LLAMA_BROKER_CRASH_LOOP_COOLDOWN", "LLM_BROKER_CRASH_LOOP_COOLDOWN", "300")
 )
 MAX_BODY_BYTES = int(
     _env_value(
@@ -1706,6 +1720,11 @@ class BrokerApplication:
         self._recovery_profile: str | None = None
         self._autotune_lease = MaintenanceLease(AUTOTUNE_LEASE_PATH)
         self._autotune_degraded_reason: str | None = None
+        self.crash_loops = CrashLoopGuard(
+            threshold=CRASH_LOOP_THRESHOLD,
+            window=CRASH_LOOP_WINDOW,
+            cooldown=CRASH_LOOP_COOLDOWN,
+        )
         state = dict(controller.state())
         self._controller_state = state
 
@@ -2001,6 +2020,7 @@ class BrokerApplication:
             except BaseException:
                 self.coordinator.set_external_queued_transitions(previous_depth)
                 raise
+            self.crash_loops.clear(profile.id)
             self.coordinator.cancel_temporary_restore_for_queued_operation()
             self.coordinator.set_external_queued_transitions(
                 self.operation_queue.pending_transition_count
@@ -2031,6 +2051,7 @@ class BrokerApplication:
             except BaseException:
                 self.coordinator.set_external_queued_transitions(previous)
                 raise
+            self.crash_loops.clear(profile.id)
             self.coordinator.cancel_temporary_restore_for_queued_operation()
             self.coordinator.set_external_queued_transitions(
                 self.operation_queue.pending_transition_count
@@ -2048,6 +2069,7 @@ class BrokerApplication:
             except BaseException:
                 self.coordinator.set_external_queued_transitions(previous)
                 raise
+            self.crash_loops.clear()
             self.coordinator.cancel_temporary_restore_for_queued_operation()
             self.coordinator.set_external_queued_transitions(
                 self.operation_queue.pending_transition_count
@@ -2071,6 +2093,8 @@ class BrokerApplication:
             except BaseException:
                 self.coordinator.set_external_queued_transitions(previous)
                 raise
+            # A reload may change the crashing profile's configuration.
+            self.crash_loops.clear()
             self.coordinator.cancel_temporary_restore_for_queued_operation()
             self.coordinator.set_external_queued_transitions(
                 self.operation_queue.pending_transition_count
@@ -2665,9 +2689,11 @@ class BrokerApplication:
             state["declared_phase"] = "active"
             state["phase"] = "stale"
             state["stale_profile"] = profile_id
+        crash_loops = self.crash_loops.snapshot()
         health_status = (
             "degraded"
             if self._autotune_degraded_reason
+            or any(entry["tripped"] for entry in crash_loops.values())
             else (
                 "ok"
                 if state.get("phase") == "inactive" or (phase == "active" and ready)
@@ -2706,6 +2732,7 @@ class BrokerApplication:
             },
             "backend": backend_state,
             "leases": self.coordinator.snapshot(),
+            "crash_loops": crash_loops,
             "maintenance": {
                 "autotune": self._autotune_lease.status(),
                 "degraded_reason": self._autotune_degraded_reason,
@@ -2797,6 +2824,25 @@ class BrokerApplication:
         self._autotune_degraded_reason = None
         self._remember_controller_state(dict(self.controller.state()))
         return self.health()
+
+    def diagnose_backend_failure(self, profile_id: str) -> BackendExit | None:
+        """Ask the controller whether a failed request's backend actually exited."""
+
+        describe_exit = getattr(self.controller, "describe_exit", None)
+        if describe_exit is None:
+            return None
+        try:
+            return describe_exit(profile_id)
+        except Exception as error:
+            _log(f"[broker] backend exit diagnosis failed for {profile_id!r}: {error}")
+            return None
+
+    def record_backend_crash(self, profile_id: str, cause: str) -> None:
+        if self.crash_loops.record_crash(profile_id, cause):
+            _log(
+                f"[broker] backend {profile_id!r} is crash-looping; refusing its "
+                f"requests for {self.crash_loops.cooldown:g}s instead of restarting it"
+            )
 
     def mark_autotune_degraded(self, reason: str) -> None:
         """Fail closed after autotune compensation cannot restore the registry."""
@@ -3194,12 +3240,28 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
 
+        crash_loop = self.application.crash_loops.check(profile.id)
+        if crash_loop is not None:
+            _log(
+                f"[broker] rejected {self.command} {path} "
+                f"(request {self._request_id()}, HTTP 503): {crash_loop.message()}"
+            )
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": {"message": crash_loop.message(), "type": "backend_crash_loop"}},
+                extra_headers={"Retry-After": str(crash_loop.retry_after)},
+            )
+            return
+
         self._proxy_response_started = False
+        self._proxy_completed = False
         try:
             with self.application.coordinator.lease(
                 profile.id, transient=profile.is_transient
             ):
                 self._proxy(body, proxy_payload, profile)
+            if self._proxy_completed:
+                self.application.crash_loops.record_success(profile.id)
         except BrokerCoordinationError as error:
             self._send_coordination_error(error)
             return
@@ -3225,6 +3287,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 f"(request {self._request_id()}): {error}"
             )
             self.application.coordinator.invalidate_when_idle(profile.id)
+            backend_exit = self.application.diagnose_backend_failure(profile.id)
+            message = "backend request failed"
+            if backend_exit is not None and backend_exit.crashed:
+                cause = backend_exit.summary()
+                message = f"backend exited during the request: {cause}"
+                _log(
+                    f"[broker] backend {profile.id} exited during request "
+                    f"{self._request_id()}: {cause}"
+                )
+                self.application.record_backend_crash(profile.id, cause)
             if self._proxy_response_started:
                 # The backend status line is already on the wire; appending a
                 # JSON error would corrupt the response. Closing ends it.
@@ -3234,7 +3306,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     HTTPStatus.BAD_GATEWAY,
                     {
                         "error": {
-                            "message": "backend request failed",
+                            "message": message,
                             "type": "broker_proxy_error",
                         }
                     },
@@ -3432,6 +3504,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
             "/api/tags",
         } or path.startswith("/admin/operations/")
         if using_reserve and not control_path:
+            _log(
+                f"[broker] rejected {self.command} {path} "
+                f"(request {self._request_id()}, HTTP 503): data-plane workers are saturated"
+            )
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
@@ -3520,6 +3596,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         )
         response: http.client.HTTPResponse | None = None
         self._proxy_response_started = False
+        self._proxy_completed = False
         try:
             connection.request(
                 self.command,
@@ -3559,6 +3636,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 data = response.read()
                 if data:
                     self._write_client(data)
+            self._proxy_completed = True
         except _ClientDisconnectedError as error:
             # Client-side failures (including TLS EOF, which is an SSLError rather
             # than a ConnectionError) say nothing about backend health.
@@ -3990,6 +4068,7 @@ def create_production_controller(
         event_logger=_controller_event_logger,
         service_inventory_probe=systemd_service_inventory_probe,
         service_state_probe=systemd_service_state_probe,
+        exit_probe=systemd_backend_exit_probe,
         cancellation_probe=(
             shutdown_requested.is_set if shutdown_requested is not None else None
         ),
