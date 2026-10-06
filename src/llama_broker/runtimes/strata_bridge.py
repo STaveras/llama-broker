@@ -284,10 +284,11 @@ def install_private_loopback_serve(
 
     def private_handler(service):
         handler_class = original_make_handler(service)
-        original_parse_request = getattr(handler_class, "parse_request", None)
+        # Always parse with the audited standard-library parser. Strata 0.1.39 overrides parse_request only to add a
+        # DNS-rebinding Host check that it skips whenever an API key is set, which the bridge always does; requests
+        # are authenticated below either way, so that override is bypassed rather than trusted.
+        original_parse_request = BaseHTTPRequestHandler.parse_request
         original_expect_100 = getattr(handler_class, "handle_expect_100", None)
-        if original_parse_request is not BaseHTTPRequestHandler.parse_request:
-            raise StrataBridgeError("Strata request parser differs from the audited standard-library parser")
         if not callable(original_expect_100):
             raise StrataBridgeError("Strata request handler has no Expect/Continue hook")
         assert callable(original_expect_100)
