@@ -5,6 +5,32 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 
+def _replace_extra_arg(extra_args: Sequence[str], flag: str, value: str | None) -> list[str]:
+    """Replace or remove one flag/value pair without depending on the TUI."""
+    if not isinstance(extra_args, (list, tuple)) or not all(
+        isinstance(item, str) and item for item in extra_args
+    ):
+        raise ValueError("extra_args must be a JSON string list")
+    updated: list[str] = []
+    replaced = False
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token != flag:
+            updated.append(token)
+            index += 1
+            continue
+        if value is not None and not replaced:
+            updated.extend((flag, value))
+            replaced = True
+        index += 1
+        if index < len(extra_args) and not extra_args[index].startswith("--"):
+            index += 1
+    if value is not None and not replaced:
+        updated.extend((flag, value))
+    return updated
+
+
 def _without_endpoint_args(args: Sequence[str]) -> tuple[str, ...]:
     result: list[str] = []
     index = 0
@@ -23,11 +49,10 @@ class LlamaCppRuntime:
 
     name = "llamacpp"
     binaries = ("llama-server",)
-    capabilities = ("text", "vision", "tools", "fit", "speculative")
+    capabilities = ("text", "vision", "tools", "reasoning", "fit", "speculative")
     editable_fields = frozenset()
 
     def sync_capability_edit(self, draft, extra_args, capabilities):
-        from ..broker_tui import _replace_extra_arg
         return _replace_extra_arg(extra_args, "--reasoning", "on" if "reasoning" in capabilities else None)
 
     def build_args(
