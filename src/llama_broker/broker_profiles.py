@@ -609,6 +609,7 @@ class Profile:
     source_commit: str | None = None
     dirty: bool | None = None
     selected_profile_ids: tuple[str, ...] = ()
+    builtin_tools_available: bool = True
     warnings: tuple[str, ...] = ()
     degraded_features: tuple[str, ...] = ()
     declared_extra_args: tuple[str, ...] = ()
@@ -2100,6 +2101,7 @@ def _parse_profile(
         source_commit=build.source_commit if build is not None else None,
         dirty=build.dirty if build is not None else None,
         selected_profile_ids=(build.selected_profile_ids if build is not None else ()),
+        builtin_tools_available=(build is None or build.build_options.get("LLAMA_SUBPROCESS") is not False),
         warnings=tuple(dict.fromkeys(warnings)),
         degraded_features=tuple(dict.fromkeys(degraded_features)),
         declared_extra_args=declared_extra_args,
