@@ -154,7 +154,7 @@ class ProfileRegistryTests(unittest.TestCase):
     def test_llamampere_catalog_qualification_is_exact(self) -> None:
         self.assertEqual(
             broker_profiles.QUALIFIED_LLAMPAMPERE_BUILD,
-            "llamampere-v051-tls-sm120-2c8c475e22e3",
+            "llamampere-v051-sm120-147ea4f6438b",
         )
 
     def test_unqualified_large_batch_is_rejected(self) -> None:
