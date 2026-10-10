@@ -852,7 +852,9 @@ class TUIModel:
             else:
                 capabilities = [item.strip() for item in raw_caps.split(",") if item.strip()]
             runtime = get_runtime_info(str(draft.get("runtime", "llamacpp")))
-            draft["extra_args"] = runtime.sync_capability_edit(draft, draft.get("extra_args", []), capabilities)
+            synced_extra_args = runtime.sync_capability_edit(draft, draft.get("extra_args", []), capabilities)
+            if "extra_args" in draft or str(draft.get("runtime", "llamacpp")) != "strata":
+                draft["extra_args"] = synced_extra_args
             draft["capabilities"] = capabilities
         elif key in SIMPLE_FIELDS:
             draft = apply_simple_fields(draft, {key: value})
@@ -1248,7 +1250,11 @@ def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
     if field.kind == "select":
         value, cancelled = _curses_select(stdscr, field.label, value, field.options)
     elif field.kind == "multi":
-        value, cancelled = _curses_checklist(stdscr, field.label, current.get(field.key, []), field.options)
+        options = field.options
+        if field.key == "capabilities":
+            runtime = get_runtime_info(str(current.get("runtime", "llamacpp")))
+            options = tuple(option for option in field.options if option in runtime.capabilities)
+        value, cancelled = _curses_checklist(stdscr, field.label, current.get(field.key, []), options)
     elif field.kind == "toggle":
         value = not bool(value)
     else:
