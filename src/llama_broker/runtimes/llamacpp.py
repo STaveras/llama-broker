@@ -96,7 +96,8 @@ class LlamaCppRuntime:
                 arg for arg in effective_extra_args if arg != "--jinja"
             ]
         args.extend(effective_extra_args)
-        if "tools" in profile.capabilities:
+        # Function-call support does not imply built-in server tools are compiled in.
+        if "tools" in profile.capabilities and getattr(profile, "builtin_tools_available", True):
             args.extend(["--tools", "all"])
 
         args.extend(["--host", host, "--port", str(port)])

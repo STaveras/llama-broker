@@ -115,7 +115,8 @@ class ProfileRegistryTests(unittest.TestCase):
         build = {"id": broker_profiles.QUALIFIED_LLAMPAMPERE_BUILD, "runtime": "llamacpp",
             "display_name": "qualified test fixture", "server_binary": str(self.server),
             "server_sha256": broker_profiles.QUALIFIED_LLAMPAMPERE_SHA256,
-            "source_commit": broker_profiles.QUALIFIED_LLAMPAMPERE_COMMIT}
+            "source_commit": broker_profiles.QUALIFIED_LLAMPAMPERE_COMMIT,
+            "build_options": {"LLAMA_SUBPROCESS": False}}
         build.update(build_changes or {})
         path = self.root / "ampere-profiles.json"
         path.write_text(json.dumps({"schema_version": 1, "runtime_builds": [build], "profiles": [record]}))
@@ -145,6 +146,14 @@ class ProfileRegistryTests(unittest.TestCase):
                     broker_profiles._parse_extra_args([flag, value], "test", runtime="llamacpp")
         with self.assertRaises(ProfileError):
             broker_profiles._parse_extra_args(["--api-key", "secret"], "test", runtime="llamacpp", qualified_ampere=True)
+
+    def test_ampere_function_calls_do_not_enable_subprocess_builtin_tools(self):
+        profile = self._ampere_registry({"capabilities": ["text", "tools"]}).get("ampere")
+        self.assertIn("tools", profile.capabilities)
+        self.assertNotIn("--tools", profile.server_args(host="127.0.0.1", port=10000))
+        normal = self._ampere_registry({"capabilities": ["text", "tools"]},
+            {"build_options": {"LLAMA_SUBPROCESS": True}}).get("ampere")
+        self.assertIn("--tools", normal.server_args(host="127.0.0.1", port=10000))
 
     def test_ampere_registry_rejects_generic_operational_flags(self):
         for args in (["--api-key", "secret"], ["--host", "0.0.0.0"], ["--port", "1"], ["--threads-http", "99"], ["--jinja"], ["--draft-max", "9"], ["--moe-cache-slots", "1"]):
