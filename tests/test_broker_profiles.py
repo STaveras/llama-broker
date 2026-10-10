@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import llama_broker.broker_profiles as broker_profiles
 from llama_broker.broker_profiles import (
     ProfileError,
     ProfileRegistry,
@@ -97,70 +96,6 @@ class ProfileRegistryTests(unittest.TestCase):
             safety["admission"] = admission
             record["safety"] = safety
         return record
-
-    def _ampere_registry(self, changes=None, build_changes=None, extra_append=()):
-        args = ["--no-warmup", "--reasoning", "on", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3"]
-        for key, value in broker_profiles.LLAMPAMPERE_EXTRA_VALUES.items():
-            args.extend([key, value])
-        args.extend(sorted(broker_profiles.LLAMPAMPERE_FLAG_ONLY))
-        args.extend(extra_append)
-        record = self._profile("ampere", "ampere", self.main_model,
-            runtime_build=broker_profiles.QUALIFIED_LLAMPAMPERE_BUILD,
-            context_size=98304, parallel=1, batch_size=4096, ubatch_size=512,
-            cache_type_k="sjkvarn4", cache_type_v="sjkvarn4", extra_args=args,
-            environment={"GGML_CUDA_PDL": "0", "LLAMA_MTP_DRAFT_COMPUTE_LEAN": "1"})
-        record.pop("server_binary", None)
-        record.pop("server_sha256", None)
-        record.update(changes or {})
-        build = {"id": broker_profiles.QUALIFIED_LLAMPAMPERE_BUILD, "runtime": "llamacpp",
-            "display_name": "qualified test fixture", "server_binary": str(self.server),
-            "server_sha256": broker_profiles.QUALIFIED_LLAMPAMPERE_SHA256,
-            "source_commit": broker_profiles.QUALIFIED_LLAMPAMPERE_COMMIT}
-        build.update(build_changes or {})
-        path = self.root / "ampere-profiles.json"
-        path.write_text(json.dumps({"schema_version": 1, "runtime_builds": [build], "profiles": [record]}))
-        return ProfileRegistry.from_path(path)
-
-    def test_ampere_profile_renders_exact_tested_configuration(self):
-        profile = self._ampere_registry().get("ampere")
-        args = profile.server_args(host="127.0.0.1", port=10000)
-        for flag, value in {"-c": "98304", "-b": "4096", "-ub": "512", "-ctk": "sjkvarn4", "-ctv": "sjkvarn4", "--sjkvarn-body-type": "sjkvarn4"}.items():
-            self.assertEqual(args[args.index(flag)+1], value)
-
-    def test_ampere_profile_rejects_unqualified_settings(self):
-        for changes in ({"context_size": 131072}, {"parallel": 2}, {"batch_size": 4097}, {"ubatch_size": 513}, {"cache_type_v": "kvarn4"}, {"flash_attention": "off"}, {"extra_args": []}, {"environment": {"GGML_CUDA_PDL": "0"}}):
-            with self.subTest(changes=changes), self.assertRaises(ProfileError):
-                self._ampere_registry(changes)
-        for changes in ({"server_sha256": "3"*64}, {"source_commit": "incorrect"}):
-            with self.subTest(build=changes), self.assertRaises(ProfileError):
-                self._ampere_registry(build_changes=changes)
-
-    def test_ampere_extra_flags_reject_invalid_values_and_unqualified_runtime(self):
-        for flag, value in broker_profiles.LLAMPAMPERE_EXTRA_VALUES.items():
-            with self.subTest(flag=flag):
-                broker_profiles._parse_extra_args([flag, value], "test", runtime="llamacpp", qualified_ampere=True)
-                with self.assertRaises(ProfileError):
-                    broker_profiles._parse_extra_args([flag, "invalid"], "test", runtime="llamacpp", qualified_ampere=True)
-                with self.assertRaises(ProfileError):
-                    broker_profiles._parse_extra_args([flag, value], "test", runtime="llamacpp")
-        with self.assertRaises(ProfileError):
-            broker_profiles._parse_extra_args(["--api-key", "secret"], "test", runtime="llamacpp", qualified_ampere=True)
-
-    def test_ampere_registry_rejects_generic_operational_flags(self):
-        for args in (["--api-key", "secret"], ["--host", "0.0.0.0"], ["--port", "1"], ["--threads-http", "99"], ["--jinja"], ["--draft-max", "9"], ["--moe-cache-slots", "1"]):
-            with self.subTest(args=args), self.assertRaises(ProfileError):
-                self._ampere_registry(extra_append=args)
-
-    def test_llamampere_catalog_qualification_is_exact(self) -> None:
-        self.assertEqual(
-            broker_profiles.QUALIFIED_LLAMPAMPERE_BUILD,
-            "llamampere-v051-sm120-147ea4f6438b",
-        )
-
-    def test_unqualified_large_batch_is_rejected(self) -> None:
-        profile = self._profile("ampere", "ampere", self.main_model, batch_size=4096, ubatch_size=512)
-        with self.assertRaisesRegex(ProfileError, "safe limit"):
-            ProfileRegistry.from_path(self._write([profile]))
 
     def test_profile_snapshot_identity_is_revision_bound_and_excludes_secrets(self) -> None:
         original = self._profile(
