@@ -43,6 +43,19 @@ ALLOWED_CACHE_TYPES = frozenset(
 MAX_CONTEXT_SIZE = 262_144
 MAX_BATCH_SIZE = 512
 MAX_UBATCH_SIZE = 128
+QUALIFIED_LLAMPAMPERE_BUILD = "llamampere-v051-sm120-147ea4f6438b"
+QUALIFIED_LLAMPAMPERE_SHA256 = "147ea4f6438bd42aad7ba30e55785ec1ba35fe3fbcc5426f212075523547f029"
+QUALIFIED_LLAMPAMPERE_COMMIT = "a33924026b682abe22d5b804350c698bcabe8549"
+LLAMPAMPERE_EXTRA_VALUES = {
+    "--cache-type-s": "q8_0",
+    "--spec-draft-type-k": "q8_0",
+    "--spec-draft-type-v": "q8_0",
+    "--spec-draft-window": "8192",
+    "--cache-ram": "0",
+    "--fit": "off",
+    "--sjkvarn-body-type": "sjkvarn4",
+}
+LLAMPAMPERE_FLAG_ONLY = frozenset({"--no-cache-disk", "--no-webui", "--offline", "--no-context-shift"})
 MAX_FIT_TARGET_MIB = 8_192
 MAX_TASKS_MAX = 512
 MAX_MEMORY_MAX_MIB = 20_480
@@ -250,6 +263,7 @@ def _parse_extra_args(
     *,
     runtime: str,
     moe_cache_slots_limit: int = MAX_MOE_CACHE_SLOTS,
+    qualified_ampere: bool = False,
 ) -> tuple[tuple[str, ...], frozenset[str]]:
     if not isinstance(raw, list) or not all(
         isinstance(item, str) and item for item in raw
@@ -270,9 +284,14 @@ def _parse_extra_args(
     i = 0
     while i < len(args):
         flag = args[i]
+        if qualified_ampere and flag not in (
+            set(LLAMPAMPERE_EXTRA_VALUES) | set(LLAMPAMPERE_FLAG_ONLY)
+            | {"--no-warmup", "--reasoning", "--spec-type", "--spec-draft-n-max"}
+        ):
+            raise ProfileError(f"unsupported qualified llamAmpere flag: {flag!r}")
         if flag in seen_flags:
             raise ProfileError(f"duplicate extra_args flag for {profile_id!r}: {flag}")
-        if flag in FLAG_ONLY_EXTRA_ARGS:
+        if flag in FLAG_ONLY_EXTRA_ARGS or (qualified_ampere and flag in LLAMPAMPERE_FLAG_ONLY):
             seen_flags.add(flag)
             i += 1
             continue
@@ -281,6 +300,7 @@ def _parse_extra_args(
             "--spec-type",
             *SPECULATIVE_COUNT_FLAGS,
             *MOE_CACHE_VALUE_FLAGS,
+            *(LLAMPAMPERE_EXTRA_VALUES if qualified_ampere else ()),
         }:
             raise ProfileError(
                 f"extra_args for {profile_id!r} contain unsupported token: {flag!r}"
@@ -292,7 +312,14 @@ def _parse_extra_args(
 
         value = args[i + 1]
         seen_flags.add(flag)
-        if flag == "--moe-cache-profile":
+        if qualified_ampere and flag in {"--reasoning", "--spec-type", "--spec-draft-n-max"}:
+            expected = {"--reasoning": "on", "--spec-type": "draft-mtp", "--spec-draft-n-max": "3"}[flag]
+            if value != expected:
+                raise ProfileError(f"unqualified llamAmpere value for {flag}: {value!r}")
+        if qualified_ampere and flag in LLAMPAMPERE_EXTRA_VALUES:
+            if value != LLAMPAMPERE_EXTRA_VALUES[flag]:
+                raise ProfileError(f"unqualified llamAmpere value for {flag}: {value!r}")
+        elif flag == "--moe-cache-profile":
             path = Path(value).expanduser()
             if not path.is_absolute() or not path.is_file():
                 raise ProfileError(
@@ -1696,10 +1723,21 @@ def _parse_profile(
             raise ProfileError(f"chat_template must not be empty for {profile_id!r}")
         chat_template = str(Path(raw_template_path).expanduser())
 
+    qualified_ampere = (
+        build is not None
+        and build.id == QUALIFIED_LLAMPAMPERE_BUILD
+        and build.server_sha256 == QUALIFIED_LLAMPAMPERE_SHA256
+        and build.source_commit == QUALIFIED_LLAMPAMPERE_COMMIT
+    )
+    if qualified_ampere and (context_size != 98304 or parallel != 1):
+        raise ProfileError("qualified llamAmpere requires context_size=98304 and parallel=1")
     if runtime == "llamacpp":
         batch_size = _positive_int(record, "batch_size")
         ubatch_size = _positive_int(record, "ubatch_size")
-        if batch_size > MAX_BATCH_SIZE or ubatch_size > MAX_UBATCH_SIZE:
+        if qualified_ampere:
+            if batch_size > 4096 or ubatch_size > 512:
+                raise ProfileError(f"batch/ubatch exceeds qualified llamAmpere limits for {profile_id!r}")
+        elif batch_size > MAX_BATCH_SIZE or ubatch_size > MAX_UBATCH_SIZE:
             raise ProfileError(f"batch/ubatch exceeds safe limit for {profile_id!r}")
         if ubatch_size > batch_size:
             raise ProfileError(f"ubatch_size cannot exceed batch_size for {profile_id!r}")
@@ -1710,12 +1748,16 @@ def _parse_profile(
             ("cache_type_k", cache_type_k),
             ("cache_type_v", cache_type_v),
         ):
-            if cache_type not in ALLOWED_CACHE_TYPES:
+            if cache_type not in ALLOWED_CACHE_TYPES and not (qualified_ampere and cache_type == "sjkvarn4"):
                 raise ProfileError(
                     f"invalid {cache_field} for {profile_id!r}: {cache_type!r}; "
                     f"supported cache types: {', '.join(sorted(ALLOWED_CACHE_TYPES))}"
                 )
+        if qualified_ampere and (cache_type_k, cache_type_v) != ("sjkvarn4", "sjkvarn4"):
+            raise ProfileError("qualified llamAmpere requires scalar SJ-KVaRN4 K/V")
         flash_attention = str(record.get("flash_attention", "auto")).strip().lower()
+        if qualified_ampere and flash_attention != "on":
+            raise ProfileError("qualified llamAmpere requires flash_attention=on")
         if flash_attention not in {"on", "off", "auto"}:
             raise ProfileError(f"invalid flash_attention for {profile_id!r}")
         if (cache_type_k.startswith("turbo") or cache_type_v.startswith("turbo")) and (
@@ -1915,7 +1957,7 @@ def _parse_profile(
         else ()
     )
     effective_raw_extra_args: object = raw_extra_args
-    if runtime == "llamacpp":
+    if runtime == "llamacpp" and not qualified_ampere:
         effective_raw_extra_args, cache_warnings, cache_degraded = _degrade_optional_moe_args(
             raw_extra_args,
             profile_id,
@@ -1928,7 +1970,14 @@ def _parse_profile(
         profile_id,
         runtime=runtime,
         moe_cache_slots_limit=moe_cache_slots_limit,
+        qualified_ampere=qualified_ampere,
     )
+    if qualified_ampere:
+        required_flags = set(LLAMPAMPERE_EXTRA_VALUES) | set(LLAMPAMPERE_FLAG_ONLY)
+        if not required_flags <= set(extra_args):
+            raise ProfileError("qualified llamAmpere requires all validated memory/offline/scalar flags")
+        if environment.get("LLAMA_MTP_DRAFT_COMPUTE_LEAN") != "1":
+            raise ProfileError("qualified llamAmpere requires LLAMA_MTP_DRAFT_COMPUTE_LEAN=1")
     if "reasoning" in capabilities:
         if reasoning_mode in (None, "off"):
             raise ProfileError(
