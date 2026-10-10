@@ -27,6 +27,11 @@ class VllmRuntime:
     capabilities = ("text", "vision", "tools", "tensor-parallel", "kv-cache-dtype")
     editable_fields = frozenset()
 
+    def sync_capability_edit(self, draft, extra_args, capabilities):
+        if "reasoning" in capabilities:
+            raise ValueError("vllm does not support the reasoning capability")
+        return list(extra_args)
+
     def build_args(
         self,
         profile: Any,

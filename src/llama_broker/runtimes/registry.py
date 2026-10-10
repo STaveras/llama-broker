@@ -24,6 +24,9 @@ class RuntimeAdapterProtocol(Protocol):
     capabilities: tuple[str, ...]
     editable_fields: frozenset[str]
 
+    def sync_capability_edit(self, draft: Mapping[str, Any], extra_args: list[str], capabilities: list[str]) -> list[str]:
+        raise NotImplementedError
+
     def build_args(
         self,
         profile: Any,
@@ -56,6 +59,9 @@ class RuntimeInfo:
     capabilities: tuple[str, ...]
     editable_fields: frozenset[str]
     adapter: RuntimeAdapterProtocol
+
+    def sync_capability_edit(self, draft: Mapping[str, Any], extra_args: list[str], capabilities: list[str]) -> list[str]:
+        return self.adapter.sync_capability_edit(draft, extra_args, capabilities)
 
 
 _BASE_FIELDS = frozenset(
