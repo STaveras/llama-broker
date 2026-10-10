@@ -168,7 +168,7 @@ RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
     "llamacpp": RuntimeInfo(
         name="llamacpp",
         binaries=("llama-server",),
-        capabilities=("text", "vision", "tools", "fit", "speculative"),
+        capabilities=_LLAMACPP.capabilities,
         editable_fields=_LLAMACPP_FIELDS,
         adapter=_LLAMACPP,
     ),

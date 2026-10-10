@@ -853,7 +853,7 @@ class TUIModel:
                 capabilities = [item.strip() for item in raw_caps.split(",") if item.strip()]
             runtime = get_runtime_info(str(draft.get("runtime", "llamacpp")))
             synced_extra_args = runtime.sync_capability_edit(draft, draft.get("extra_args", []), capabilities)
-            if "extra_args" in draft or str(draft.get("runtime", "llamacpp")) != "strata":
+            if "extra_args" in runtime.editable_fields:
                 draft["extra_args"] = synced_extra_args
             draft["capabilities"] = capabilities
         elif key in SIMPLE_FIELDS:

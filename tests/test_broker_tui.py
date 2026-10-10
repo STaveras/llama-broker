@@ -640,6 +640,16 @@ class BrokerTUIModelTests(unittest.TestCase):
         self.assertEqual(profile["context_size"], 131072)
         self.assertEqual(conflicts, ["profiles[one].context_size"])
 
+    def test_runtime_capability_choices_keep_llamacpp_reasoning(self) -> None:
+        from llama_broker.runtimes.registry import get_runtime_info
+        self.assertIn("reasoning", get_runtime_info("llamacpp").capabilities)
+        self.assertEqual(get_runtime_info("strata").capabilities, ("text",))
+
+    def test_strata_supported_capability_edit_does_not_create_extra_args(self) -> None:
+        model = TUIModel({"profiles": [{"id": "one", "alias": "one", "runtime": "strata", "capabilities": ["text"]}]})
+        model.set_field("capabilities", ["text"])
+        self.assertNotIn("extra_args", model.current)
+
     def test_capabilities_editor_exposes_tools(self) -> None:
         field = next(item for item in EDITOR_FIELDS if item.key == "capabilities")
         self.assertIn("tools", field.options)
