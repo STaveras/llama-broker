@@ -27,6 +27,11 @@ class StrataRuntime:
     capabilities: tuple[str, ...] = ("text",)
     editable_fields: frozenset[str] = frozenset()
 
+    def sync_capability_edit(self, draft, extra_args, capabilities):
+        if "reasoning" in capabilities:
+            raise ValueError("strata does not support the reasoning capability")
+        return list(extra_args)
+
     def build_args(
         self,
         profile: Any,

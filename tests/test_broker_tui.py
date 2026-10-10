@@ -663,6 +663,20 @@ class BrokerTUIModelTests(unittest.TestCase):
             model.current["extra_args"], ["--no-warmup", "--reasoning", "on"]
         )
 
+    def test_strata_rejects_reasoning_without_dirtying_draft(self) -> None:
+        model = TUIModel({"profiles": [{"id": "one", "alias": "one", "runtime": "strata", "capabilities": ["text"]}]})
+        before = model.current
+        with self.assertRaisesRegex(ValueError, "reasoning.*strata|strata.*reasoning"):
+            model.set_field("capabilities", ["text", "reasoning"])
+        self.assertEqual(model.current, before)
+        self.assertNotIn("extra_args", model.current)
+
+    def test_vllm_reasoning_does_not_gain_llamacpp_flag(self) -> None:
+        model = TUIModel({"profiles": [{"id": "one", "alias": "one", "runtime": "vllm", "capabilities": ["text"]}]})
+        with self.assertRaisesRegex(ValueError, "reasoning.*vllm|vllm.*reasoning"):
+            model.set_field("capabilities", ["text", "reasoning"])
+        self.assertNotIn("extra_args", model.current)
+
     def test_disabling_reasoning_capability_drops_launch_flag(self) -> None:
         model = TUIModel(
             {

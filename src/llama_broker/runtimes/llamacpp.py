@@ -26,6 +26,10 @@ class LlamaCppRuntime:
     capabilities = ("text", "vision", "tools", "fit", "speculative")
     editable_fields = frozenset()
 
+    def sync_capability_edit(self, draft, extra_args, capabilities):
+        from ..broker_tui import _replace_extra_arg
+        return _replace_extra_arg(extra_args, "--reasoning", "on" if "reasoning" in capabilities else None)
+
     def build_args(
         self,
         profile: Any,

@@ -427,22 +427,6 @@ def _without_managed_args(extra_args: Any) -> list[str]:
     return result
 
 
-def _sync_reasoning_flag(
-    draft: dict[str, Any], extra_args: list[str], capabilities: list[str]
-) -> list[str]:
-    """Derive the --reasoning launch flag from the reasoning capability.
-
-    The flag is managed state: it is owned by the capability toggle, so the
-    user cannot enable the capability while leaving the launch argument off
-    (and vice versa).
-    """
-
-    enabled = "reasoning" in capabilities
-    return _replace_extra_arg(
-        extra_args, "--reasoning", "on" if enabled else None
-    )
-
-
 def _replace_extra_arg(
     extra_args: Any,
     flag: str,
@@ -785,10 +769,9 @@ class TUIModel:
                         preserved.append(current_args[index + 1])
             raw_args = _without_managed_args(raw_args)
             capabilities = draft.get("capabilities", [])
-            draft["extra_args"] = _sync_reasoning_flag(
-                draft,
-                [*raw_args, *preserved],
-                capabilities if isinstance(capabilities, list) else [],
+            runtime = get_runtime_info(str(draft.get("runtime", "llamacpp")))
+            draft["extra_args"] = runtime.sync_capability_edit(
+                draft, [*raw_args, *preserved], capabilities if isinstance(capabilities, list) else []
             )
         elif key == "runtime_family":
             selected = self._family_for_value(value)
@@ -868,8 +851,9 @@ class TUIModel:
                 capabilities = [str(item).strip() for item in raw_caps if str(item).strip()]
             else:
                 capabilities = [item.strip() for item in raw_caps.split(",") if item.strip()]
+            runtime = get_runtime_info(str(draft.get("runtime", "llamacpp")))
+            draft["extra_args"] = runtime.sync_capability_edit(draft, draft.get("extra_args", []), capabilities)
             draft["capabilities"] = capabilities
-            draft["extra_args"] = _sync_reasoning_flag(draft, draft.get("extra_args", []), capabilities)
         elif key in SIMPLE_FIELDS:
             draft = apply_simple_fields(draft, {key: value})
             if key == "alias":
