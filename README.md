@@ -85,19 +85,104 @@ shown there.
 
 ## Connection reliability
 
-The broker retains saturated inference connections in a FIFO queue rather than
-immediately returning worker-capacity 503 responses. Queue admission is bounded
-by `LLAMA_BROKER_INFERENCE_QUEUE_MAX_SOCKETS` (default `16`) and
-`LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES` (default `67108864` bytes), with a
-per-request wait limit from `LLAMA_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT`
-(default `360` seconds). Requests that exceed body limits, queue limits, or the
-wait limit are rejected; these settings cannot override a client's own deadline.
+Authenticated inference requests wait in FIFO order when inference workers are
+occupied or a model transition is temporarily blocking admission. Waiting
+requests hold no model lease, so they cannot prevent draining or restoration of
+a temporary profile. Administration retains its own worker reserve. A newer
+inference request cannot bypass an accepted waiter, including while the head
+request's body is being validated or its profile is activating.
+Requests for a different profile also wait for existing generations to finish
+before starting activation, using the inference queue deadline.
+Later HTTP requests wait for an earlier activation to settle; the coordinator's
+optional idle-load preemption for direct lease callers does not override HTTP
+FIFO admission.
 
-For SSE responses, the broker emits protocol comment heartbeats while an
-upstream stream is idle. Heartbeats are never added to JSON or binary responses.
-Once response headers are committed, an upstream failure terminates the stream
-rather than appending incompatible JSON; diagnostics remain correlated by
-`X-Request-ID` in broker logs.
+| Setting | Default | Bound |
+| --- | --- | --- |
+| `LLAMA_BROKER_MAX_WORKERS` | `2` | Inference worker reservations, including response writers, closing transports and committed activations finishing after cancellation |
+| `LLAMA_BROKER_CONTROL_WORKERS` | `2` | Separate administrative workers |
+| `LLAMA_BROKER_INFERENCE_QUEUE_MAX_SOCKETS` | `16` | Additional waiting inference connections; `0` disables extra waiting slots |
+| `LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES` | `67108864` | Aggregate declared body bytes for queued requests, reserved before body reads |
+| `LLAMA_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT` | `360` seconds | Time from authenticated body admission through validation, queue waiting and profile activation |
+| `LLAMA_BROKER_MAX_BODY_BYTES` | `33554432` | Maximum body bytes per request, including active requests |
+| `LLAMA_BROKER_CONTROL_CLIENT_TIMEOUT` | `2` seconds | TLS handshake, total header-read and body-read deadlines; downstream writes also have this finite timeout |
+| `LLAMA_BROKER_SSE_HEARTBEAT_INTERVAL` | `15` seconds | Interval between SSE comment heartbeats during quiet periods |
+| `LLAMA_BROKER_BACKEND_TIMEOUT` | `1800` seconds | Finite total inference proxy deadline after acquiring a lease, including connect, headers, prefill and response delivery |
+
+Each connection serves one request. At most 16 additional connections can be
+parsing headers, handshaking or delivering/draining a rejection. Once that
+pre-admission capacity is exhausted, further connections close without an HTTP
+response; no credentials or request ID have been parsed yet. Otherwise queue
+capacity errors return HTTP 503 with `broker_queue_full`, and queue expiry
+returns HTTP 504 with `broker_queue_expired`. Raw queued bodies and active bodies
+have the bounds above; JSON objects and rewritten payloads add bounded Python
+allocation overhead. Slow uploads and downstream readers can hit their I/O
+deadline independently of the queue deadline. These settings cannot extend a
+client's own deadline.
+Retained client transports, including connections still closing, have a hard
+limit of inference workers + queue slots + control workers + 16 (36 by default).
+Clients must keep the request transport open until the response finishes;
+send-side EOF after the complete body is treated as cancellation. A committed
+activation can retain its bounded worker reservation until the lifecycle worker
+settles, even after the caller's wait deadline has expired.
+If a catalog reload changes or removes a request's validated profile while it
+waits, admission fails closed with `broker_request_stale` (409); the client must
+resubmit against the new profile facts.
+
+Only `POST /v1/chat/completions` and `POST /v1/completions` with JSON
+`stream: true` receive broker SSE heartbeats. After authentication, body and
+model validation, and bounded admission, the broker commits HTTP 200 with
+`Content-Type: text/event-stream` immediately. It writes `: heartbeat` comments
+while waiting in the queue, activating a profile, waiting for upstream headers,
+prefilling, or receiving an idle/fragmented stream. Comments are inserted between
+complete SSE events. JSON, audio and other endpoints never receive comments.
+One handler writes downstream; a separate reader owns all upstream HTTP reads
+and passes data through a bounded buffer. SSE events are limited to 262144 bytes;
+the supported completion streams must finish with upstream `data: [DONE]`.
+
+**HTTP 200 acknowledges an accepted stream, not successful generation.** An
+upstream non-success status, incompatible response type, truncated stream,
+backend failure/timeout, queue expiry, or activation failure after these headers
+produces a terminal SSE error, then closes the connection:
+
+```text
+event: error
+data: {"error":{"message":"backend request failed","type":"broker_proxy_error","code":"broker_proxy_error"},"request_id":"example-request","status":502}
+
+```
+
+Clients must inspect these error events; the broker does not synthesize `[DONE]`
+after an error. Delivering a terminal error requires a writable client transport;
+disconnected or stalled writers may only observe the connection closing.
+Early validation and admission rejection still use ordinary
+HTTP errors with JSON bodies. Non-streaming upstream responses retain their
+status and content type; failures after their headers close the response.
+Dispatched generation is never retried. Disconnects cancel waiting work and
+interrupt upstream I/O; an already committed profile activation finishes under
+its lifecycle deadline, releases any late lease, and does not dispatch generation
+for the cancelled caller. Lifecycle deadlines bound waiting; controller work that
+outlives its deadline remains quarantined by the coordinator.
+Shutdown rejects new admission, wakes waiters and
+interrupts client transports while preserving the existing backend handoff
+policy.
+
+Structured `[broker-event]` records distinguish `queue_wait`, `queue_full`,
+`queue_expired`, `backend_failure`, `backend_timeout`, `client_disconnect`, and
+`server_shutdown`, correlated with the response's `X-Request-ID`. IDs generated
+for clients without one are also forwarded upstream. Request bodies and backend
+error bodies are not included in these diagnostics. Unparsed capacity rejection
+uses `connection_full` with a broker-generated ID.
+Client I/O expiry and changed profile facts use `request_timeout` and
+`request_stale` respectively.
+
+The disposable HTTP/TLS reliability fixtures need loopback socket access and
+`openssl` for temporary test certificates; they never start a model or operate
+on services or live configuration:
+
+```bash
+uv run --extra dev pytest -q tests/test_connection_reliability.py tests/test_connection_reliability_wire.py
+uv run --extra dev pytest -q
+```
 
 ## Quick start (0.1.0)
 
