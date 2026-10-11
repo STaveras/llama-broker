@@ -83,6 +83,22 @@ shown there.
   and a private API-key file. Keys are generated at runtime, never printed,
   never committed.
 
+## Connection reliability
+
+The broker retains saturated inference connections in a FIFO queue rather than
+immediately returning worker-capacity 503 responses. Queue admission is bounded
+by `LLAMA_BROKER_INFERENCE_QUEUE_MAX_SOCKETS` (default `16`) and
+`LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES` (default `67108864` bytes), with a
+per-request wait limit from `LLAMA_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT`
+(default `360` seconds). Requests that exceed body limits, queue limits, or the
+wait limit are rejected; these settings cannot override a client's own deadline.
+
+For SSE responses, the broker emits protocol comment heartbeats while an
+upstream stream is idle. Heartbeats are never added to JSON or binary responses.
+Once response headers are committed, an upstream failure terminates the stream
+rather than appending incompatible JSON; diagnostics remain correlated by
+`X-Request-ID` in broker logs.
+
 ## Quick start (0.1.0)
 
 ```bash
