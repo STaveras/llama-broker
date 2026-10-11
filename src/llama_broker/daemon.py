@@ -183,7 +183,7 @@ INFERENCE_QUEUE_MAX_SOCKETS = int(
     _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_SOCKETS", "LLM_BROKER_INFERENCE_QUEUE_MAX_SOCKETS", "16")
 )
 INFERENCE_QUEUE_MAX_BODY_BYTES = int(
-    _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "LLM_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "67108864")
+    _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "LLM_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "524288")
 )
 INFERENCE_QUEUE_WAIT_TIMEOUT = float(
     _env_value("LLAMA_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT", "LLM_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT", "360")
@@ -3642,18 +3642,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._proxy_response_started = True
 
             if streaming:
-                if connection.sock is not None:
-                    connection.sock.settimeout(15.0)
                 reader = getattr(response, "read1", response.read)
                 heartbeat_at = time.monotonic() + 15.0
                 while True:
-                    try:
-                        chunk = reader(8192)
-                    except (socket.timeout, TimeoutError):
-                        if time.monotonic() >= heartbeat_at:
+                    backend_socket = connection.sock
+                    if backend_socket is not None:
+                        readable, _, _ = select.select(
+                            [backend_socket], [], [], max(0.0, heartbeat_at - time.monotonic())
+                        )
+                        if not readable:
                             self._write_client(b": heartbeat\n\n")
                             heartbeat_at = time.monotonic() + 15.0
-                        continue
+                            continue
+                    chunk = reader(8192)
                     if not chunk:
                         break
                     self._write_client(chunk)
@@ -3851,12 +3852,19 @@ class BrokerServer(ThreadingHTTPServer):
                 if self._inference_queue_stop:
                     return
                 request, address, body_bytes, deadline = self._inference_queue[0]
-                if deadline > time.monotonic() and not self._data_worker_slots.acquire(blocking=False):
-                    self._inference_queue_condition.wait(timeout=0.1)
+                now = time.monotonic()
+                if deadline > now and not self._data_worker_slots.acquire(blocking=False):
+                    self._inference_queue_condition.wait(timeout=min(0.1, deadline - now))
                     continue
-                self._inference_queue.popleft()
-                self._inference_queue_bytes -= body_bytes
-            if deadline <= time.monotonic():
+                if deadline <= time.monotonic():
+                    self._inference_queue.popleft()
+                    self._inference_queue_bytes -= body_bytes
+                    expired = True
+                else:
+                    self._inference_queue.popleft()
+                    self._inference_queue_bytes -= body_bytes
+                    expired = False
+            if expired:
                 self._reject_over_capacity(request)
                 continue
             with self._request_lanes_lock:
@@ -3875,6 +3883,8 @@ class BrokerServer(ThreadingHTTPServer):
             lane = self._request_lanes.pop(id(request))
         self._request_context.control_reserve = lane == "control"
         try:
+            if lane == "data":
+                request.settimeout(None)
             if lane == "control":
                 request.settimeout(self._control_client_timeout)
             super().process_request_thread(request, client_address)
@@ -3947,6 +3957,17 @@ class BrokerServer(ThreadingHTTPServer):
         self.close_request(request)
 
     def server_close(self) -> None:
+        with self._inference_queue_condition:
+            self._inference_queue_stop = True
+            queued = list(self._inference_queue)
+            self._inference_queue.clear()
+            self._inference_queue_bytes = 0
+            self._inference_queue_condition.notify_all()
+        for request, _address, _body_bytes, _deadline in queued:
+            try:
+                self.close_request(request)
+            except OSError:
+                pass
         try:
             self.application.shutdown()
         finally:
