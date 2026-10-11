@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -177,6 +178,15 @@ CONTROL_CLIENT_TIMEOUT = float(
         "LLM_BROKER_CONTROL_CLIENT_TIMEOUT",
         "2",
     )
+)
+INFERENCE_QUEUE_MAX_SOCKETS = int(
+    _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_SOCKETS", "LLM_BROKER_INFERENCE_QUEUE_MAX_SOCKETS", "16")
+)
+INFERENCE_QUEUE_MAX_BODY_BYTES = int(
+    _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "LLM_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "67108864")
+)
+INFERENCE_QUEUE_WAIT_TIMEOUT = float(
+    _env_value("LLAMA_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT", "LLM_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT", "360")
 )
 # Bounds for draining request bodies the broker rejected without reading.
 REJECTED_BODY_DRAIN_TIMEOUT = 2.0
@@ -3632,12 +3642,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._proxy_response_started = True
 
             if streaming:
+                if connection.sock is not None:
+                    connection.sock.settimeout(15.0)
                 reader = getattr(response, "read1", response.read)
+                heartbeat_at = time.monotonic() + 15.0
                 while True:
-                    chunk = reader(8192)
+                    try:
+                        chunk = reader(8192)
+                    except (socket.timeout, TimeoutError):
+                        if time.monotonic() >= heartbeat_at:
+                            self._write_client(b": heartbeat\n\n")
+                            heartbeat_at = time.monotonic() + 15.0
+                        continue
                     if not chunk:
                         break
                     self._write_client(chunk)
+                    heartbeat_at = time.monotonic() + 15.0
             else:
                 data = response.read()
                 if data:
@@ -3767,7 +3787,13 @@ class BrokerServer(ThreadingHTTPServer):
         self._request_lanes: dict[int, str] = {}
         self._request_lanes_lock = threading.Lock()
         self._request_context = threading.local()
+        self._inference_queue: deque[tuple[socket.socket, tuple[str, int], int, float]] = deque()
+        self._inference_queue_bytes = 0
+        self._inference_queue_condition = threading.Condition()
+        self._inference_queue_stop = False
         super().__init__(server_address, BrokerHandler)
+        self._inference_dispatcher = threading.Thread(target=self._dispatch_inference_queue, name="broker-inference-queue", daemon=True)
+        self._inference_dispatcher.start()
         if ssl_context is not None:
             self.socket = ssl_context.wrap_socket(self.socket, server_side=True)
 
@@ -3777,6 +3803,8 @@ class BrokerServer(ThreadingHTTPServer):
         elif self._control_worker_slots.acquire(blocking=False):
             lane = "control"
         else:
+            if self._queue_inference_request(request, client_address):
+                return
             self._reject_over_capacity(request)
             return
         with self._request_lanes_lock:
@@ -3788,6 +3816,57 @@ class BrokerServer(ThreadingHTTPServer):
                 self._request_lanes.pop(id(request), None)
             self._release_lane(lane)
             raise
+
+    def _queue_inference_request(self, request: socket.socket, client_address: tuple[str, int]) -> bool:
+        try:
+            request.settimeout(self._control_client_timeout)
+            header = request.recv(65536, socket.MSG_PEEK)
+            line = header.split(b"\r\n", 1)[0].upper()
+            if not (line.startswith(b"POST /V1/") or line.startswith(b"GET /V1/")):
+                return False
+            length = 0
+            for item in header.split(b"\r\n"):
+                if item.lower().startswith(b"content-length:"):
+                    length = int(item.split(b":", 1)[1].strip())
+                    break
+            if length > self.application.max_body_bytes or length > INFERENCE_QUEUE_MAX_BODY_BYTES:
+                return False
+            with self._inference_queue_condition:
+                if self._inference_queue_stop or len(self._inference_queue) >= INFERENCE_QUEUE_MAX_SOCKETS:
+                    return False
+                if self._inference_queue_bytes + length > INFERENCE_QUEUE_MAX_BODY_BYTES:
+                    return False
+                self._inference_queue.append((request, client_address, length, time.monotonic() + INFERENCE_QUEUE_WAIT_TIMEOUT))
+                self._inference_queue_bytes += length
+                self._inference_queue_condition.notify()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _dispatch_inference_queue(self) -> None:
+        while True:
+            with self._inference_queue_condition:
+                while not self._inference_queue and not self._inference_queue_stop:
+                    self._inference_queue_condition.wait()
+                if self._inference_queue_stop:
+                    return
+                request, address, body_bytes, deadline = self._inference_queue[0]
+                if deadline > time.monotonic() and not self._data_worker_slots.acquire(blocking=False):
+                    self._inference_queue_condition.wait(timeout=0.1)
+                    continue
+                self._inference_queue.popleft()
+                self._inference_queue_bytes -= body_bytes
+            if deadline <= time.monotonic():
+                self._reject_over_capacity(request)
+                continue
+            with self._request_lanes_lock:
+                self._request_lanes[id(request)] = "data"
+            try:
+                super().process_request(request, address)
+            except BaseException:
+                with self._request_lanes_lock:
+                    self._request_lanes.pop(id(request), None)
+                self._data_worker_slots.release()
 
     def process_request_thread(
         self, request: socket.socket, client_address: tuple[str, int]
@@ -3811,6 +3890,8 @@ class BrokerServer(ThreadingHTTPServer):
             self._control_worker_slots.release()
         else:
             self._data_worker_slots.release()
+            with self._inference_queue_condition:
+                self._inference_queue_condition.notify()
 
     def _reject_over_capacity(self, request: socket.socket) -> None:
         body = _json_bytes(
