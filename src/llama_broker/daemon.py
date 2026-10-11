@@ -13,7 +13,9 @@ import fcntl
 import http.client
 import ipaddress
 import json
+import math
 import os
+import queue
 import re
 import secrets
 import select
@@ -24,7 +26,6 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +45,7 @@ from .backend_controller import (
     systemd_service_state_probe,
 )
 from .crash_loop import CrashLoopGuard
+from .connection_reliability import AdmissionError, BackendPipe, InferenceAdmission
 from .gpu_memory import GpuTelemetryError, probe_gpu_memory
 from .broker_security import (
     SecurityConfig,
@@ -183,14 +185,17 @@ INFERENCE_QUEUE_MAX_SOCKETS = int(
     _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_SOCKETS", "LLM_BROKER_INFERENCE_QUEUE_MAX_SOCKETS", "16")
 )
 INFERENCE_QUEUE_MAX_BODY_BYTES = int(
-    _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "LLM_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "524288")
+    _env_value("LLAMA_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "LLM_BROKER_INFERENCE_QUEUE_MAX_BODY_BYTES", "67108864")
 )
 INFERENCE_QUEUE_WAIT_TIMEOUT = float(
     _env_value("LLAMA_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT", "LLM_BROKER_INFERENCE_QUEUE_WAIT_TIMEOUT", "360")
 )
+SSE_HEARTBEAT_INTERVAL = float(
+    _env_value("LLAMA_BROKER_SSE_HEARTBEAT_INTERVAL", "LLM_BROKER_SSE_HEARTBEAT_INTERVAL", "15")
+)
 # Bounds for draining request bodies the broker rejected without reading.
 REJECTED_BODY_DRAIN_TIMEOUT = 2.0
-REJECTION_DRAIN_WORKERS = 16
+HEADER_WORKERS = 16
 DRAIN_TIMEOUT = float(
     _env_value("LLAMA_BROKER_DRAIN_TIMEOUT", "LLM_BROKER_DRAIN_TIMEOUT", "10")
 )
@@ -420,6 +425,11 @@ class BrokerLifecycleError(BrokerCoordinationError):
 
 class BrokerStateUnknownError(BrokerCoordinationError):
     error_type = "broker_state_unknown"
+
+
+class BrokerRequestStaleError(BrokerCoordinationError):
+    error_type = "broker_request_stale"
+    http_status = HTTPStatus.CONFLICT
 
 
 class StaleOperationSnapshotError(LifecycleCancelledError):
@@ -1173,6 +1183,7 @@ class ProfileCoordinator:
         profile_id: str,
         *,
         transient: bool = False,
+        admission_only: bool = False,
     ) -> tuple[object, str, str | None] | None:
         may_preempt = not transient
         while True:
@@ -1181,6 +1192,7 @@ class ProfileCoordinator:
                     profile_id,
                     transient=transient,
                     may_preempt=may_preempt,
+                    admission_only=admission_only,
                 )
             except BrokerPreemptedError:
                 if transient:
@@ -1197,11 +1209,14 @@ class ProfileCoordinator:
         *,
         transient: bool,
         may_preempt: bool,
+        admission_only: bool = False,
     ) -> tuple[object, str, str | None] | None:
         temporary_restore: tuple[object, str, str | None] | None = None
         reservation: object | None = None
         preempted: str | None = None
         with self._condition:
+            if admission_only and not self._inference_ready_unlocked(profile_id):
+                raise self._quiescing_error_unlocked()
             if self._active_profile == profile_id:
                 if self._quiescing_unlocked():
                     raise self._quiescing_error_unlocked()
@@ -1280,14 +1295,35 @@ class ProfileCoordinator:
                 self._condition.notify_all()
 
     @contextmanager
-    def lease(self, profile_id: str, transient: bool = False) -> Iterator[None]:
-        temporary_restore = self._acquire(profile_id, transient=transient)
+    def lease(
+        self, profile_id: str, transient: bool = False, *, admission_only: bool = False
+    ) -> Iterator[None]:
+        temporary_restore = self._acquire(
+            profile_id, transient=transient, admission_only=admission_only
+        )
         try:
             yield
         finally:
             self._release()
             if temporary_restore is not None:
                 self._complete_temporary_restore(temporary_restore)
+
+    def _inference_ready_unlocked(self, profile_id: str) -> bool:
+        return not self._quiescing_unlocked() and (
+            self._temporary_restore is None or self._temporary_restore[1] == profile_id
+        ) and (
+            self._active_profile == profile_id or self._active_requests == 0
+        )
+
+    def inference_ready(self, profile_id: str) -> bool:
+        with self._condition:
+            return self._inference_ready_unlocked(profile_id)
+
+    def request_shutdown(self) -> None:
+        with self._condition:
+            self._shutdown_requested = True
+            self._cancel_temporary_restore_unlocked()
+            self._condition.notify_all()
 
     def _complete_temporary_restore(
         self,
@@ -1707,6 +1743,8 @@ class BrokerApplication:
         profiles_path: Path | str | None = None,
         preempt_idle_loads: bool = PREEMPT_IDLE_LOADS,
     ) -> None:
+        if not math.isfinite(backend_timeout) or backend_timeout <= 0:
+            raise ValueError("backend_timeout must be finite and positive")
         if max_output_tokens is not None and max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
         self.registry = registry
@@ -2878,6 +2916,7 @@ class BrokerApplication:
                     raise self._shutdown_error
                 return
             try:
+                self.coordinator.request_shutdown()
                 self._stop_operation_worker()
                 self._stop_recovery_watchdog()
                 self.coordinator.handoff_for_process_shutdown()
@@ -2896,31 +2935,49 @@ class _ClientDisconnectedError(Exception):
     """The downstream client went away while the broker was writing to it."""
 
 
-def _discard_until_eof(request: socket.socket, *, timeout: float, limit: int) -> None:
-    """Read and drop what the client is still sending, then return.
+class _BackendResponseError(http.client.HTTPException):
+    """An upstream status or stream contract cannot follow early SSE headers."""
 
-    Closing a socket with unread bytes in its receive buffer makes the kernel
-    send a TCP RST, and the client sees "connection reset" instead of the
-    response that was already written. Callers drain first, bounded by time
-    and bytes, so a slow or hostile client cannot pin the thread.
-    """
 
-    deadline = time.monotonic() + timeout
-    drained = 0
-    try:
-        while drained < limit:
-            remaining = deadline - time.monotonic()
+class _HeaderDeadlineReader:
+    def __init__(self, reader: Any, connection: socket.socket, timeout: float):
+        self.reader = reader
+        self.connection = connection
+        self.deadline = time.monotonic() + timeout
+        self.pending = bytearray()
+
+    def readline(self, limit: int = -1) -> bytes:
+        limit = 65537 if limit < 0 else limit
+        while True:
+            remaining = self.deadline - time.monotonic()
             if remaining <= 0:
-                return
-            readable, _, _ = select.select([request], [], [], remaining)
-            if not readable:
-                return
-            chunk = request.recv(min(65536, limit - drained))
+                raise TimeoutError("request headers timed out")
+            newline = self.pending.find(b"\n", 0, limit)
+            if newline >= 0 or len(self.pending) >= limit:
+                end = newline + 1 if newline >= 0 else limit
+                line = bytes(self.pending[:end])
+                del self.pending[:end]
+                return line
+            self.connection.settimeout(remaining)
+            # read1 performs at most one underlying read. Buffered readline
+            # can keep accepting trickled bytes indefinitely on one timeout.
+            chunk = self.reader.read1(min(8192, limit - len(self.pending)))
             if not chunk:
-                return
-            drained += len(chunk)
-    except (OSError, ValueError):
-        return
+                line = bytes(self.pending)
+                self.pending.clear()
+                return line
+            self.pending.extend(chunk)
+
+    def read1(self, limit: int = -1) -> bytes:
+        if self.pending:
+            end = len(self.pending) if limit < 0 else min(limit, len(self.pending))
+            data = bytes(self.pending[:end])
+            del self.pending[:end]
+            return data
+        return self.reader.read1(limit)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.reader, name)
 
 
 class BrokerHandler(BaseHTTPRequestHandler):
@@ -2930,6 +2987,22 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self._request_body_consumed = False
+        self._proxy_response_started = False
+        self._sse_started = False
+        self._inference_ticket = None
+        self._control_slot = False
+        self._get_data_slot = False
+        self.rfile = _HeaderDeadlineReader(
+            self.rfile, self.connection, self.server._control_client_timeout
+        )
+        self.server._request_context.handler = self
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        finally:
+            # Each bounded connection serves exactly one request.
+            self.close_connection = True
 
     def finish(self) -> None:
         # rfile is closed by super().finish(); the response is already on the
@@ -2938,6 +3011,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._discard_unread_body()
         finally:
             super().finish()
+
+    def _release_admission(self) -> None:
+        # The server calls this after transport close, so finishing inference
+        # cannot consume the connections reserved for administrative workers.
+        if self._inference_ticket is not None:
+            self.server.admission.finish_writer(self._inference_ticket)
+        if self._control_slot:
+            self.server._control_worker_slots.release()
+        if self._get_data_slot:
+            self.server._data_worker_slots.release()
 
     def _discard_unread_body(self) -> None:
         """Drain a request body that was rejected before it was read."""
@@ -3112,6 +3195,23 @@ class BrokerHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._do_POST()
+        except AdmissionError as error:
+            self._send_admission_error(error)
+        except TimeoutError:
+            self._diagnostic("request_timeout", phase="request_io")
+            try:
+                self._send_json(HTTPStatus.REQUEST_TIMEOUT, {"error": {
+                    "message": "client request I/O timed out", "type": "broker_request_timeout",
+                }})
+            except (_ClientDisconnectedError, OSError):
+                self._diagnostic("client_disconnect", phase="request_timeout")
+        except (_ClientDisconnectedError, OSError) as error:
+            self._diagnostic("server_shutdown" if self.server._closing.is_set() else "client_disconnect",
+                             phase="request", detail=type(error).__name__)
+
+    def _do_POST(self) -> None:
         path = urlsplit(self.path).path
         if not self._admit_control_reserve(path):
             return
@@ -3199,6 +3299,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                             {
                                 "decision": "rejected",
                                 "event": "reasoning_policy",
+                                "request_id": self._request_id(),
                                 "profile": profile.id,
                                 **rejected_metadata,
                             }
@@ -3211,6 +3312,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     _controller_event_logger(
                         {
                             "event": "reasoning_policy",
+                            "request_id": self._request_id(),
                             "profile": profile.id,
                             **reasoning_metadata,
                         }
@@ -3272,19 +3374,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self._proxy_response_started = False
         self._proxy_completed = False
         try:
-            with self.application.coordinator.lease(
-                profile.id, transient=profile.is_transient
-            ):
-                self._proxy(body, proxy_payload, profile)
+            self._proxy(body, proxy_payload, profile)
             if self._proxy_completed:
                 self.application.crash_loops.record_success(profile.id)
         except BrokerCoordinationError as error:
             self._send_coordination_error(error)
             return
         except BackendControllerError as error:
+            self._diagnostic("backend_failure", profile=profile.id, phase="activation",
+                             detail=type(error).__name__)
             _log(
                 f"[broker] profile switch failed for {profile.id} "
-                f"(request {self._request_id()}): {error}"
+                f"(request {self._request_id()}): {type(error).__name__}"
             )
             if not self.wfile.closed:
                 self._send_json(
@@ -3298,11 +3399,15 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 )
             return
         except (OSError, TimeoutError, http.client.HTTPException) as error:
+            timed_out = isinstance(error, TimeoutError)
+            self._diagnostic("backend_timeout" if timed_out else "backend_failure", profile=profile.id,
+                             detail=type(error).__name__)
             _log(
                 f"[broker] backend proxy failure for {profile.id} "
-                f"(request {self._request_id()}): {error}"
+                f"(request {self._request_id()}): {type(error).__name__}"
             )
-            self.application.coordinator.invalidate_when_idle(profile.id)
+            if not isinstance(error, _BackendResponseError):
+                self.application.coordinator.invalidate_when_idle(profile.id)
             backend_exit = self.application.diagnose_backend_failure(profile.id)
             message = "backend request failed"
             if backend_exit is not None and backend_exit.crashed:
@@ -3313,17 +3418,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     f"{self._request_id()}: {cause}"
                 )
                 self.application.record_backend_crash(profile.id, cause)
-            if self._proxy_response_started:
+            if self._proxy_response_started and not self._sse_started:
                 # The backend status line is already on the wire; appending a
                 # JSON error would corrupt the response. Closing ends it.
                 return
             try:
                 self._send_json(
-                    HTTPStatus.BAD_GATEWAY,
+                    HTTPStatus.GATEWAY_TIMEOUT if timed_out else HTTPStatus.BAD_GATEWAY,
                     {
                         "error": {
                             "message": message,
-                            "type": "broker_proxy_error",
+                            "type": "broker_backend_timeout" if timed_out else "broker_proxy_error",
                         }
                     },
                 )
@@ -3501,9 +3606,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_coordination_error(error)
 
     def _admit_control_reserve(self, path: str) -> bool:
-        using_reserve = bool(
-            getattr(self.server, "request_uses_control_reserve", lambda: False)()
-        )
         control_path = path in {
             "/health",
             "/healthz",
@@ -3518,17 +3620,28 @@ class BrokerHandler(BaseHTTPRequestHandler):
             "/admin/credentials/revoke",
             "/v1/models",
             "/api/tags",
-        } or path.startswith("/admin/operations/")
-        if using_reserve and not control_path:
-            _log(
-                f"[broker] rejected {self.command} {path} "
-                f"(request {self._request_id()}, HTTP 503): data-plane workers are saturated"
-            )
+        } or path.startswith(("/admin/operations/", "/v1/models/"))
+        if control_path:
+            self._control_slot = self.server._control_worker_slots.acquire(False)
+            if self._control_slot:
+                self.server.release_header_slot()
+                return True
+        elif self.command == "POST":
+            # Inference authentication, length validation and admission occur
+            # before any body allocation. It never borrows a control worker.
+            return True
+        else:
+            self._get_data_slot = self.server._data_worker_slots.acquire(False)
+            if self._get_data_slot:
+                self.server.release_header_slot()
+                return True
+        if not self._control_slot and not self._get_data_slot:
+            self._diagnostic("control_full" if control_path else "worker_full")
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
                     "error": {
-                        "message": "data-plane workers are saturated",
+                        "message": "broker worker capacity is exhausted",
                         "type": "broker_overloaded",
                     }
                 },
@@ -3537,6 +3650,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
         return True
 
     def _send_coordination_error(self, error: BrokerCoordinationError) -> None:
+        self._diagnostic("request_stale" if isinstance(error, BrokerRequestStaleError) else "coordination_failure",
+                         detail=error.error_type)
         _log(
             f"[broker] rejected {self.command} {urlsplit(self.path).path} "
             f"(request {self._request_id()}, HTTP {error.http_status}): {error}"
@@ -3547,6 +3662,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         )
 
     def _read_raw_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding") is not None:
+            raise ValueError("Transfer-Encoding is not supported")
+        if len(self.headers.get_all("Content-Length", [])) > 1:
+            raise ValueError("multiple Content-Length headers are not supported")
         length_header = self.headers.get("Content-Length")
         if length_header is None:
             raise ValueError("Content-Length is required")
@@ -3560,8 +3679,37 @@ class BrokerHandler(BaseHTTPRequestHandler):
             raise ValueError(
                 f"request body exceeds broker limit {self.application.max_body_bytes} bytes"
             )
+        if urlsplit(self.path).path.startswith("/v1/"):
+            self._inference_ticket = self.server.admission.reserve(
+                length, quiescing=self.application.coordinator.quiescing
+            )
+            if not self._inference_ticket.worker:
+                self._diagnostic("queue_wait")
+            self.server.release_header_slot()
         self._request_body_consumed = True
-        body = self.rfile.read(length)
+        deadline = time.monotonic() + self.server._control_client_timeout
+        if self._inference_ticket is not None:
+            deadline = min(deadline, self._inference_ticket.deadline)
+        chunks = bytearray()
+        while len(chunks) < length:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if self._inference_ticket is not None and time.monotonic() >= self._inference_ticket.deadline:
+                    raise AdmissionError("queue_expired")
+                raise TimeoutError("request body timed out")
+            self.connection.settimeout(remaining)
+            try:
+                chunk = self.rfile.read1(min(65536, length - len(chunks)))
+            except TimeoutError as error:
+                if self._inference_ticket is not None and time.monotonic() >= self._inference_ticket.deadline:
+                    raise AdmissionError("queue_expired") from error
+                raise
+            if not chunk:
+                self._diagnostic("server_shutdown" if self.server._closing.is_set() else "client_disconnect",
+                                 phase="request_body")
+                break
+            chunks.extend(chunk)
+        body = bytes(chunks)
         if len(body) != length:
             raise ValueError("request body is incomplete")
         return body
@@ -3593,10 +3741,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
         headers = {
             key: value
             for key, value in self.headers.items()
-            if key.lower() not in HOP_BY_HOP_REQUEST_HEADERS
+            if key.lower() not in HOP_BY_HOP_REQUEST_HEADERS | {"x-request-id"}
         }
         headers["Content-Length"] = str(len(body))
         headers["Connection"] = "close"
+        headers["X-Request-ID"] = self._request_id()
         return headers
 
     def _proxy(
@@ -3605,83 +3754,280 @@ class BrokerHandler(BaseHTTPRequestHandler):
         payload: Mapping[str, Any] | None,
         profile: Profile,
     ) -> None:
-        connection = make_connection(
-            self.application.backend_url,
-            timeout=self.application.backend_timeout,
-            ca_file=self.application.security.backend_tls_ca_file,
+        ticket = self._inference_ticket
+        assert ticket is not None
+        streaming = (
+            urlsplit(self.path).path in {"/v1/chat/completions", "/v1/completions"}
+            and payload is not None and payload.get("stream") is True
         )
-        response: http.client.HTTPResponse | None = None
-        self._proxy_response_started = False
+        pipe = BackendPipe(ticket)
+        self._proxy_pipe = pipe
         self._proxy_completed = False
+        self.connection.settimeout(self.server._control_client_timeout)
+
+        def read_backend() -> None:
+            connection = None
+            response = None
+            lease = None
+            try:
+                while True:
+                    self.server.admission.wait_turn(
+                        ticket, lambda: self.application.coordinator.inference_ready(profile.id)
+                    )
+                    self._require_current_profile(profile)
+                    lease = self.application.coordinator.lease(
+                        profile.id, transient=profile.is_transient, admission_only=True
+                    )
+                    try:
+                        lease.__enter__()
+                        break
+                    except BrokerQuiescingError:
+                        # An admin operation may win between readiness and lease
+                        # acquisition. Nothing has been dispatched; retain FIFO.
+                        lease = None
+                try:
+                    self._require_current_profile(profile)
+                    self.server.admission.started(ticket)
+                    if ticket.cancelled.is_set():
+                        return
+                    pipe.deadline = time.monotonic() + self.application.backend_timeout
+                    connection = make_connection(
+                        self.application.backend_url, timeout=self.application.backend_timeout,
+                        ca_file=self.application.security.backend_tls_ca_file,
+                    )
+                    connection.connect()
+                    pipe.attach(connection.sock)
+                    if ticket.cancelled.is_set():
+                        return
+                    if time.monotonic() >= pipe.deadline:
+                        raise TimeoutError("backend connect deadline expired")
+                    connection.request(self.command, self.path, body=body,
+                                       headers=self._request_headers(body))
+                    # getresponse() can detach connection.sock for Connection:
+                    # close. Retain the transport solely to interrupt a read.
+                    response = connection.getresponse()
+                    if streaming and not (
+                        200 <= response.status < 300
+                        and response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
+                        == "text/event-stream"
+                    ):
+                        raise _BackendResponseError(f"backend returned incompatible SSE response (HTTP {response.status})")
+                    pipe.put("headers", (
+                        response.status, response.reason, response.getheaders(),
+                        getattr(response, "length", None) == 0,
+                    ))
+                    pending = bytearray()
+                    completed = False
+                    while not ticket.cancelled.is_set():
+                        chunk = response.read1(8192)
+                        if not chunk:
+                            if getattr(response, "length", 0) not in (None, 0):
+                                raise http.client.IncompleteRead(b"", response.length)
+                            if streaming and not completed:
+                                raise _BackendResponseError("backend SSE ended before [DONE]")
+                            break
+                        if not streaming:
+                            finished = getattr(response, "length", None) == 0
+                            pipe.put("last_data" if finished else "data", chunk)
+                            if finished:
+                                break
+                            continue
+                        pending.extend(chunk)
+                        while True:
+                            boundary = re.search(rb"\r\n\r\n|\n\n|\r\r", pending)
+                            if boundary is None:
+                                break
+                            if boundary.end() > 262144:
+                                raise _BackendResponseError("backend SSE event exceeds 262144 bytes")
+                            event = bytes(pending[:boundary.end()])
+                            del pending[:boundary.end()]
+                            data_lines = [
+                                line.partition(b":")[2].strip()
+                                for line in event.splitlines() if line.startswith(b"data:")
+                            ]
+                            completed = data_lines == [b"[DONE]"]
+                            pipe.put("terminal" if completed else "data", event)
+                            if completed:
+                                break
+                        if completed:
+                            break
+                        if len(pending) > 262144:
+                            raise _BackendResponseError("backend SSE event exceeds 262144 bytes")
+                    if not ticket.cancelled.is_set():
+                        pipe.put("done", 200 <= response.status < 300)
+                        # The lease covers delivery as well as upstream reads.
+                        # The handler signals completion/disconnect in finally.
+                        ticket.cancelled.wait()
+                finally:
+                    if response is not None:
+                        response.close()
+                    if connection is not None:
+                        connection.close()
+                    lease.__exit__(None, None, None)
+            except Exception as error:
+                pipe.put("error", error)
+            finally:
+                self.server.admission.finish_reader(ticket)
+
+        thread = threading.Thread(target=read_backend, name="broker-backend-reader", daemon=True)
         try:
-            connection.request(
-                self.command,
-                self.path,
-                body=body,
-                headers=self._request_headers(body),
-            )
-            response = connection.getresponse()
-            streaming = bool(payload and payload.get("stream")) or (
-                response.getheader("Content-Type", "").startswith("text/event-stream")
-            )
-            self.send_response(response.status, response.reason)
-            for key, value in response.getheaders():
-                lower = key.lower()
-                if lower in HOP_BY_HOP_RESPONSE_HEADERS:
+            if streaming:
+                self._start_sse(profile)
+            ticket.reader_started = True
+            try:
+                thread.start()
+            except BaseException as error:
+                ticket.reader_started = False
+                if isinstance(error, Exception):
+                    raise _BackendResponseError("backend reader could not start") from error
+                raise
+            heartbeat_at = time.monotonic() + SSE_HEARTBEAT_INTERVAL
+            upstream_success = False
+            while True:
+                if self.server._closing.is_set():
+                    raise AdmissionError("server_shutdown")
+                if self._client_disconnected():
+                    raise _ClientDisconnectedError("downstream EOF")
+                if pipe.deadline is not None and time.monotonic() >= pipe.deadline:
+                    raise TimeoutError("backend request deadline expired")
+                if pipe.deadline is None and time.monotonic() >= ticket.deadline:
+                    raise AdmissionError("queue_expired")
+                try:
+                    kind, value = pipe.messages.get(timeout=0.02)
+                except queue.Empty:
+                    if streaming and time.monotonic() >= heartbeat_at:
+                        self._write_client(b": heartbeat\n\n")
+                        heartbeat_at = time.monotonic() + SSE_HEARTBEAT_INTERVAL
                     continue
-                if streaming and lower == "content-length":
-                    continue
-                self.send_header(key, value)
+                if kind == "error":
+                    if not isinstance(value, (AdmissionError, BrokerCoordinationError,
+                                              BackendControllerError, OSError, http.client.HTTPException)):
+                        raise _BackendResponseError(
+                            f"backend reader failed ({type(value).__name__})"
+                        ) from value
+                    raise value
+                if kind == "headers":
+                    status, reason, headers, empty_body = value
+                    upstream_success = 200 <= status < 300
+                    if status >= 400:
+                        self._diagnostic("backend_failure", profile=profile.id, upstream_status=status)
+                    if not streaming:
+                        self._send_proxy_headers(status, reason, headers, profile)
+                        if empty_body:
+                            self._proxy_completed = upstream_success
+                            break
+                elif kind in {"data", "last_data", "terminal"}:
+                    self._write_client(value)
+                    heartbeat_at = time.monotonic() + SSE_HEARTBEAT_INTERVAL
+                    if kind != "data":
+                        self._proxy_completed = upstream_success
+                        break
+                elif kind == "done":
+                    self._proxy_completed = value
+                    break
+        except _ClientDisconnectedError as error:
+            if self.server._closing.is_set():
+                self._diagnostic("server_shutdown", profile=profile.id, phase="response")
+            else:
+                self._diagnostic("client_disconnect", profile=profile.id,
+                                 phase="queue" if pipe.deadline is None else "response")
+                _log(f"[broker] client disconnected during {profile.id} response "
+                     f"(request {self._request_id()}): {error}")
+        finally:
+            pipe.abort()
+            # Socket shutdown wakes HTTPResponse without concurrent buffered
+            # reads/closes. A committed activation finishes under its existing
+            # lifecycle deadline and releases any late lease without dispatch.
+            if thread.ident is not None:
+                thread.join(timeout=0.1)
+            self._proxy_pipe = None
+            self.close_connection = True
+
+    def _client_disconnected(self) -> bool:
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            previous = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(0.001)
+                return self.connection.recv(1) == b""
+            finally:
+                self.connection.settimeout(previous)
+        except (BlockingIOError, TimeoutError, ssl.SSLWantReadError):
+            return False
+        except OSError:
+            return True
+
+    def _require_current_profile(self, profile: Profile) -> None:
+        try:
+            current = self.application.registry.get(profile.id)
+        except ProfileError:
+            current = None
+        if current != profile:
+            raise BrokerRequestStaleError("profile changed while the request waited; resubmit it")
+
+    def _start_sse(self, profile: Profile) -> None:
+        self._send_proxy_headers(200, None, [
+            ("Content-Type", "text/event-stream"), ("Cache-Control", "no-cache"),
+            ("X-Accel-Buffering", "no"),
+        ], profile)
+        self._sse_started = True
+        self._write_client(b": heartbeat\n\n")
+
+    def _send_proxy_headers(self, status, reason, headers, profile) -> None:
+        self._client_write_timeout()
+        try:
+            self.send_response(status, reason)
+            for key, value in headers:
+                if key.lower() not in HOP_BY_HOP_RESPONSE_HEADERS | {"x-request-id", "x-llama-broker-profile"}:
+                    self.send_header(key, value)
             self.send_header("X-Llama-Broker-Profile", profile.id)
             self.send_header("X-Request-ID", self._request_id())
             self.send_header("Connection", "close")
-            try:
-                self.end_headers()
-            except OSError as error:
-                raise _ClientDisconnectedError(str(error)) from error
+            self.end_headers()
             self._proxy_response_started = True
+        except OSError as error:
+            if isinstance(error, TimeoutError):
+                self._client_write_timeout()
+            raise _ClientDisconnectedError(str(error)) from error
 
-            if streaming:
-                reader = getattr(response, "read1", response.read)
-                heartbeat_at = time.monotonic() + 15.0
-                while True:
-                    backend_socket = connection.sock
-                    if backend_socket is not None:
-                        readable, _, _ = select.select(
-                            [backend_socket], [], [], max(0.0, heartbeat_at - time.monotonic())
-                        )
-                        if not readable:
-                            self._write_client(b": heartbeat\n\n")
-                            heartbeat_at = time.monotonic() + 15.0
-                            continue
-                    chunk = reader(8192)
-                    if not chunk:
-                        break
-                    self._write_client(chunk)
-                    heartbeat_at = time.monotonic() + 15.0
-            else:
-                data = response.read()
-                if data:
-                    self._write_client(data)
-            self._proxy_completed = True
-        except _ClientDisconnectedError as error:
-            # Client-side failures (including TLS EOF, which is an SSLError rather
-            # than a ConnectionError) say nothing about backend health.
-            _log(
-                f"[broker] client disconnected during {profile.id} response "
-                f"(request {self._request_id()}): {error}"
-            )
-        finally:
-            if response is not None:
-                response.close()
-            connection.close()
-            self.close_connection = True
+    def _diagnostic(self, event: str, **metadata: Any) -> None:
+        _controller_event_logger({"event": event, "request_id": self._request_id(), **metadata})
+
+    def _send_admission_error(self, error: AdmissionError) -> None:
+        self._diagnostic(error.event)
+        status = HTTPStatus.GATEWAY_TIMEOUT if error.event == "queue_expired" else HTTPStatus.SERVICE_UNAVAILABLE
+        try:
+            self._send_json(status, {"error": {
+                "message": str(error), "type": f"broker_{error.event}",
+                "code": f"broker_{error.event}",
+            }})
+        except (_ClientDisconnectedError, OSError):
+            if not self.server._closing.is_set():
+                self._diagnostic("client_disconnect", phase="admission_error")
+
+    def _client_write_timeout(self) -> None:
+        timeout = self.server._control_client_timeout
+        pipe = getattr(self, "_proxy_pipe", None)
+        if pipe is not None:
+            deadline = pipe.deadline if pipe.deadline is not None else pipe.ticket.deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if pipe.deadline is None:
+                    raise AdmissionError("queue_expired")
+                raise TimeoutError("backend request deadline expired")
+            timeout = min(timeout, remaining)
+        self.connection.settimeout(timeout)
 
     def _write_client(self, data: bytes) -> None:
+        self._client_write_timeout()
         try:
             self.wfile.write(data)
             self.wfile.flush()
         except OSError as error:
+            if isinstance(error, TimeoutError):
+                self._client_write_timeout()
             raise _ClientDisconnectedError(str(error)) from error
 
     def _model_not_found(self, alias: str, *, message: str | None = None) -> None:
@@ -3714,6 +4060,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         *,
         extra_headers: Mapping[str, str] | None = None,
     ) -> None:
+        if self._sse_started:
+            error = dict(payload.get("error", {}))
+            error.setdefault("code", error.get("type", "broker_proxy_error"))
+            terminal = {"error": error, "request_id": self._request_id(), "status": int(status)}
+            self._write_client(b"event: error\ndata: " + _json_bytes(terminal) + b"\n\n")
+            self.close_connection = True
+            return
         body = _json_bytes(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -3774,211 +4127,121 @@ class BrokerServer(ThreadingHTTPServer):
         control_client_timeout: float = CONTROL_CLIENT_TIMEOUT,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
-        if max_workers <= 0:
-            raise ValueError("max_workers must be positive")
-        if control_workers <= 0:
-            raise ValueError("control_workers must be positive")
-        if control_client_timeout <= 0:
-            raise ValueError("control_client_timeout must be positive")
+        for name, value in (("max_workers", max_workers), ("control_workers", control_workers),
+                            ("header_workers", HEADER_WORKERS)):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+        for name, value in (("control_client_timeout", control_client_timeout),
+                            ("queue_wait_timeout", INFERENCE_QUEUE_WAIT_TIMEOUT),
+                            ("heartbeat_interval", SSE_HEARTBEAT_INTERVAL)):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if INFERENCE_QUEUE_MAX_SOCKETS < 0 or INFERENCE_QUEUE_MAX_BODY_BYTES <= 0:
+            raise ValueError("inference queue limits must be non-negative sockets and positive bytes")
         self.application = application
-        self._data_worker_slots = threading.BoundedSemaphore(max_workers)
+        self.admission = InferenceAdmission(max_workers, INFERENCE_QUEUE_MAX_SOCKETS,
+                                            INFERENCE_QUEUE_MAX_BODY_BYTES,
+                                            INFERENCE_QUEUE_WAIT_TIMEOUT)
+        self._data_worker_slots = self.admission.slots
         self._control_worker_slots = threading.BoundedSemaphore(control_workers)
+        self._header_slots = threading.BoundedSemaphore(HEADER_WORKERS)
+        self._connection_slots = threading.BoundedSemaphore(
+            max_workers + INFERENCE_QUEUE_MAX_SOCKETS + control_workers + HEADER_WORKERS
+        )
         self._control_client_timeout = control_client_timeout
-        self._rejection_drains = threading.BoundedSemaphore(REJECTION_DRAIN_WORKERS)
-        self._request_lanes: dict[int, str] = {}
-        self._request_lanes_lock = threading.Lock()
+        self._ssl_context = ssl_context
         self._request_context = threading.local()
-        self._inference_queue: deque[tuple[socket.socket, tuple[str, int], int, float]] = deque()
-        self._inference_queue_bytes = 0
-        self._inference_queue_condition = threading.Condition()
-        self._inference_queue_stop = False
+        self._clients: set[socket.socket] = set()
+        self._clients_lock = threading.Lock()
+        self._closing = threading.Event()
         super().__init__(server_address, BrokerHandler)
-        self._inference_dispatcher = threading.Thread(target=self._dispatch_inference_queue, name="broker-inference-queue", daemon=True)
-        self._inference_dispatcher.start()
-        if ssl_context is not None:
-            self.socket = ssl_context.wrap_socket(self.socket, server_side=True)
 
     def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
-        if self._data_worker_slots.acquire(blocking=False):
-            lane = "data"
-        elif self._control_worker_slots.acquire(blocking=False):
-            lane = "control"
-        else:
-            if self._queue_inference_request(request, client_address):
-                return
-            self._reject_over_capacity(request)
+        # Unparsed peers have a separate short-lived bound. Inference cannot
+        # occupy admin workers, and TLS handshakes never block the accept loop.
+        if self._closing.is_set() or not self._connection_slots.acquire(False):
+            _controller_event_logger({
+                "event": "server_shutdown" if self._closing.is_set() else "connection_full",
+                "request_id": uuid.uuid4().hex,
+            })
+            self.shutdown_request(request)
             return
-        with self._request_lanes_lock:
-            self._request_lanes[id(request)] = lane
+        if not self._header_slots.acquire(False):
+            try:
+                _controller_event_logger({"event": "connection_full", "request_id": uuid.uuid4().hex})
+                self.shutdown_request(request)
+            finally:
+                self._connection_slots.release()
+            return
+        with self._clients_lock:
+            self._clients.add(request)
         try:
             super().process_request(request, client_address)
         except BaseException:
-            with self._request_lanes_lock:
-                self._request_lanes.pop(id(request), None)
-            self._release_lane(lane)
+            try:
+                self.shutdown_request(request)
+            finally:
+                with self._clients_lock:
+                    self._clients.discard(request)
+                self._header_slots.release()
+                self._connection_slots.release()
             raise
 
-    def _queue_inference_request(self, request: socket.socket, client_address: tuple[str, int]) -> bool:
-        try:
-            request.settimeout(self._control_client_timeout)
-            header = request.recv(65536, socket.MSG_PEEK)
-            line = header.split(b"\r\n", 1)[0].upper()
-            if not (line.startswith(b"POST /V1/") or line.startswith(b"GET /V1/")):
-                return False
-            length = 0
-            for item in header.split(b"\r\n"):
-                if item.lower().startswith(b"content-length:"):
-                    length = int(item.split(b":", 1)[1].strip())
-                    break
-            if length > self.application.max_body_bytes or length > INFERENCE_QUEUE_MAX_BODY_BYTES:
-                return False
-            with self._inference_queue_condition:
-                if self._inference_queue_stop or len(self._inference_queue) >= INFERENCE_QUEUE_MAX_SOCKETS:
-                    return False
-                if self._inference_queue_bytes + length > INFERENCE_QUEUE_MAX_BODY_BYTES:
-                    return False
-                self._inference_queue.append((request, client_address, length, time.monotonic() + INFERENCE_QUEUE_WAIT_TIMEOUT))
-                self._inference_queue_bytes += length
-                self._inference_queue_condition.notify()
-            return True
-        except (OSError, ValueError):
-            return False
-
-    def _dispatch_inference_queue(self) -> None:
-        while True:
-            with self._inference_queue_condition:
-                while not self._inference_queue and not self._inference_queue_stop:
-                    self._inference_queue_condition.wait()
-                if self._inference_queue_stop:
-                    return
-                request, address, body_bytes, deadline = self._inference_queue[0]
-                now = time.monotonic()
-                if deadline > now and not self._data_worker_slots.acquire(blocking=False):
-                    self._inference_queue_condition.wait(timeout=min(0.1, deadline - now))
-                    continue
-                if deadline <= time.monotonic():
-                    self._inference_queue.popleft()
-                    self._inference_queue_bytes -= body_bytes
-                    expired = True
-                else:
-                    self._inference_queue.popleft()
-                    self._inference_queue_bytes -= body_bytes
-                    expired = False
-            if expired:
-                self._reject_over_capacity(request, reason="queue_expired")
-                continue
-            with self._request_lanes_lock:
-                self._request_lanes[id(request)] = "data"
-            try:
-                super().process_request(request, address)
-            except BaseException:
-                with self._request_lanes_lock:
-                    self._request_lanes.pop(id(request), None)
-                self._data_worker_slots.release()
+    def release_header_slot(self) -> None:
+        if getattr(self._request_context, "header_slot", False):
+            self._request_context.header_slot = False
+            self._header_slots.release()
 
     def process_request_thread(
         self, request: socket.socket, client_address: tuple[str, int]
     ) -> None:
-        with self._request_lanes_lock:
-            lane = self._request_lanes.pop(id(request))
-        self._request_context.control_reserve = lane == "control"
+        raw_request = request
+        self._request_context.header_slot = True
+        self._request_context.handler = None
         try:
-            if lane == "data":
-                request.settimeout(None)
-            if lane == "control":
-                request.settimeout(self._control_client_timeout)
-            super().process_request_thread(request, client_address)
-        finally:
-            self._request_context.control_reserve = False
-            self._release_lane(lane)
-
-    def request_uses_control_reserve(self) -> bool:
-        return bool(getattr(self._request_context, "control_reserve", False))
-
-    def _release_lane(self, lane: str) -> None:
-        if lane == "control":
-            self._control_worker_slots.release()
-        else:
-            self._data_worker_slots.release()
-            with self._inference_queue_condition:
-                self._inference_queue_condition.notify()
-
-    def _reject_over_capacity(self, request: socket.socket, *, reason: str = "capacity_rejected") -> None:
-        body = _json_bytes(
-            {
-                "error": {
-                    "message": "broker worker capacity is exhausted",
-                    "type": "broker_overloaded",
-                }
-            }
-        )
-        response = (
-            b"HTTP/1.1 503 Service Unavailable\r\n"
-            b"Content-Type: application/json\r\n"
-            + f"Content-Length: {len(body)}\r\n".encode("ascii")
-            + b"Connection: close\r\n\r\n"
-            + body
-        )
-        try:
-            request_id = ""
-            try:
-                peek = request.recv(65536, socket.MSG_PEEK)
-                for line in peek.split(b"\r\n"):
-                    if line.lower().startswith(b"x-request-id:"):
-                        request_id = line.split(b":", 1)[1].strip().decode("ascii", "replace")
-                        break
-            except OSError:
-                pass
-            _log(
-                f"[broker] inference {reason} (request {request_id or 'unavailable'}, "
-                f"HTTP 503): worker capacity exhausted"
-            )
             request.settimeout(self._control_client_timeout)
-            request.sendall(response)
-        except OSError:
-            self.shutdown_request(request)
-            return
-        # Drain off the accept thread when possible. If all drain slots are
-        # occupied, perform this one bounded drain inline instead of closing
-        # with unread bytes and resetting the response.
-        if not self._rejection_drains.acquire(blocking=False):
-            self._drain_rejected_request(request)
-            return
-        threading.Thread(
-            target=self._drain_then_close,
-            args=(request,),
-            name="broker-reject-drain",
-            daemon=True,
-        ).start()
-
-    def _drain_then_close(self, request: socket.socket) -> None:
-        try:
-            self._drain_rejected_request(request)
-        finally:
-            self._rejection_drains.release()
-
-    def _drain_rejected_request(self, request: socket.socket) -> None:
-        try:
-            request.shutdown(socket.SHUT_WR)
-        except OSError:
+            if self._ssl_context is not None:
+                request = self._ssl_context.wrap_socket(
+                    request, server_side=True, do_handshake_on_connect=False
+                )
+                with self._clients_lock:
+                    self._clients.discard(raw_request)
+                    self._clients.add(request)
+                request.do_handshake()
+            if not self._closing.is_set():
+                self.finish_request(request, client_address)
+        except (OSError, _ClientDisconnectedError):
+            # Includes bounded handshake/header/body timeouts and TLS EOF.
             pass
-        _discard_until_eof(
-            request,
-            timeout=self._control_client_timeout,
-            limit=self.application.max_body_bytes,
-        )
-        self.close_request(request)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            try:
+                self.shutdown_request(request)
+            finally:
+                try:
+                    handler = self._request_context.handler
+                    if handler is not None:
+                        handler._release_admission()
+                finally:
+                    self._request_context.handler = None
+                    self.release_header_slot()
+                    with self._clients_lock:
+                        self._clients.discard(raw_request)
+                        self._clients.discard(request)
+                    self._connection_slots.release()
 
     def server_close(self) -> None:
-        with self._inference_queue_condition:
-            self._inference_queue_stop = True
-            queued = list(self._inference_queue)
-            self._inference_queue.clear()
-            self._inference_queue_bytes = 0
-            self._inference_queue_condition.notify_all()
-        for request, _address, _body_bytes, _deadline in queued:
+        coordinator = getattr(self.application, "coordinator", None)
+        if coordinator is not None:
+            coordinator.request_shutdown()
+        self._closing.set()
+        self.admission.stop()
+        with self._clients_lock:
+            clients = tuple(self._clients)
+        for client in clients:
             try:
-                self.close_request(request)
+                client.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
         try:

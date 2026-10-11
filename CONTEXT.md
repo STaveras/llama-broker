@@ -131,3 +131,33 @@ begins.
 
 These decisions were confirmed during the profile transition grilling
 conversation. Source transcript: `@session:default/20260906_184533_16627d`.
+
+## Inference connection admission
+
+HTTP inference has a separate, authenticated FIFO admission queue with bounded
+connections, raw body bytes, and waiting time. It waits through worker saturation
+and temporary profile transitions without holding a model lease. The coordinator
+continues to reject lease acquisition while a lifecycle operation is pending;
+the HTTP admission layer waits for that gate to open. Administrative worker
+reservations remain separate from inference.
+Admission for another profile waits for active generations to finish before
+initiating a switch, under the inference queue deadline rather than the shorter
+lifecycle drain deadline.
+
+FIFO HTTP admission retains the head request's position through profile
+activation. Later HTTP requests wait for that activation to settle; the
+coordinator's optional idle-load preemption remains available to direct lease
+callers. HTTP requests preserve their validated profile facts across waiting and
+fail closed if a reload changes those facts before dispatch. Generation is
+dispatched at most once. Disconnected or expired callers cancel their own
+waiting/transport work; committed lifecycle work finishes safely and releases a
+late lease without dispatching generation for the cancelled caller.
+
+Validated streaming completion requests receive early HTTP 200 SSE headers and
+comment heartbeats through admission, activation, upstream header wait, prefill,
+and idle streaming. A single handler owns downstream writes; a bounded reader
+handoff owns upstream HTTP reads. Later failures are terminal SSE error events,
+so HTTP 200 acknowledges admission and clients must inspect the stream's outcome.
+JSON, audio transcription, and other routes retain their ordinary response
+contracts. Disposable fixtures verify this policy without real models or service
+control; real HTTP/TLS fixture verification requires a socket-enabled test host.

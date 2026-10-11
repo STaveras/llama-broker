@@ -585,13 +585,14 @@ class BrokerHttpTests(unittest.TestCase):
             {"old-native-key", result["api_key"]},
         )
 
-    def test_broker_server_wraps_listener_when_tls_context_is_configured(self) -> None:
+    def test_broker_server_wraps_accepted_socket_when_tls_context_is_configured(self) -> None:
         class Context:
             def __init__(self) -> None:
                 self.server_side = False
 
-            def wrap_socket(self, sock: object, *, server_side: bool) -> object:
+            def wrap_socket(self, sock: object, *, server_side: bool, do_handshake_on_connect: bool) -> object:
                 self.server_side = server_side
+                self.lazy_handshake = not do_handshake_on_connect
                 return sock
 
         class Application:
@@ -606,7 +607,15 @@ class BrokerHttpTests(unittest.TestCase):
             ssl_context=context,  # type: ignore[arg-type]
         )
         try:
+            from unittest.mock import Mock
+            accepted = Mock()
+            with patch.object(server, "finish_request"), patch.object(server, "shutdown_request"):
+                server._header_slots.acquire()
+                server._connection_slots.acquire()
+                server.process_request_thread(accepted, ("127.0.0.1", 1))
             self.assertTrue(context.server_side)
+            self.assertTrue(context.lazy_handshake)
+            accepted.do_handshake.assert_called_once()
         finally:
             server.server_close()
 
@@ -1495,7 +1504,7 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertFalse(any("backend proxy failure" in m for m in messages), messages)
         self.assertEqual(coordinator.active_profile, "main")
 
-    def test_backend_reset_mid_stream_does_not_append_json_error(self) -> None:
+    def test_backend_reset_mid_stream_emits_terminal_sse_error(self) -> None:
         coordinator = self.broker.application.coordinator
         with (
             patch.object(
@@ -1513,13 +1522,17 @@ class BrokerHttpTests(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
                 first = response.readline()
+                while b"partial" not in first:
+                    self.assertTrue(first)
+                    first = response.readline()
                 self.backend.reset_stream_release.set()  # type: ignore[attr-defined]
                 rest = response.read()
             finally:
                 connection.close()
 
         self.assertIn(b"partial", first)
-        self.assertNotIn(b"broker_proxy_error", rest)
+        self.assertIn(b"event: error", rest)
+        self.assertIn(b"broker_proxy_error", rest)
         invalidate.assert_called_once_with("main")
         handle_error.assert_not_called()
         messages = [call.args[0] for call in log.call_args_list]
@@ -1693,14 +1706,7 @@ class BrokerHttpTests(unittest.TestCase):
             "broker_drain_timeout",
         )
 
-        overloaded_status, overloaded = self._post(
-            {"model": "main", "messages": []}
-        )
-        self.assertEqual(overloaded_status, 503)
-        self.assertEqual(
-            overloaded["error"]["type"],  # type: ignore[index]
-            "broker_overloaded",
-        )
+        queued = self._open_chat({"model": "main", "messages": []})
 
         stop_result: list[tuple[int, dict[str, object]]] = []
         stop = threading.Thread(
@@ -1723,6 +1729,10 @@ class BrokerHttpTests(unittest.TestCase):
             stream.join(timeout=1)
         self.assertFalse(any(stream.is_alive() for stream in streams))
         self.assertEqual(stream_errors, [])
+        response = queued.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(json.loads(response.read())["ok"])
+        queued.close()
 
     def _post_large(self, headers: dict[str, str] | None = None) -> tuple[int, dict[str, object]]:
         # Larger than the loopback socket buffers, so an unread body is still
@@ -1751,7 +1761,7 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(payload["error"]["type"], "authentication_error")  # type: ignore[index]
 
-    def test_saturated_broker_answers_large_requests_with_503_not_reset(self) -> None:
+    def test_saturated_broker_delivers_queue_body_limit_error_without_reset(self) -> None:
         self._replace_broker(
             max_workers=2,
             control_workers=1,
@@ -1760,6 +1770,7 @@ class BrokerHttpTests(unittest.TestCase):
             stop_timeout=1,
         )
         auth = {"Authorization": f"Bearer {self.auth_key}"}
+        self.broker.admission.body_limit = 524288
 
         def held_stream() -> None:
             connection = http.client.HTTPConnection(
@@ -1786,35 +1797,12 @@ class BrokerHttpTests(unittest.TestCase):
             "both data workers should be occupied by held streams",
         )
 
-        # Control lane: the handler refuses inference before reading the body.
+        # Authentication and declared body memory are checked before reading.
         status, payload = self._post_large(auth)
         self.assertEqual(status, 503)
-        self.assertEqual(payload["error"]["type"], "broker_overloaded")  # type: ignore[index]
-
-        # Occupy the only control worker with a client that never sends its
-        # request line, so the next connection is refused at accept time.
-        control_slots = self.broker._control_worker_slots  # type: ignore[attr-defined]
-
-        def wait_for_free_control_workers(expected: int) -> None:
-            deadline = time.monotonic() + 3
-            while control_slots._value != expected:  # type: ignore[attr-defined]
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.005)
-
-        wait_for_free_control_workers(1)
-        stalled = socket.create_connection(("127.0.0.1", self.broker.server_port))
-        try:
-            wait_for_free_control_workers(0)
-            # Force the accept-time rejection down the saturated-drainer fallback.
-            self.broker._rejection_drains = threading.BoundedSemaphore(  # type: ignore[attr-defined]
-                0
-            )
-            status, payload = self._post_large(auth)
-        finally:
-            stalled.close()
-        self.assertEqual(status, 503)
-        self.assertEqual(payload["error"]["type"], "broker_overloaded")  # type: ignore[index]
-        self.assertIn("capacity is exhausted", payload["error"]["message"])  # type: ignore[index]
+        self.assertEqual(payload["error"]["type"], "broker_queue_full")  # type: ignore[index]
+        status, _ = self._get("/health")
+        self.assertEqual(status, 200)
 
         self.backend.hold_stream_release.set()  # type: ignore[attr-defined]
         for stream in streams:

@@ -1,81 +1,68 @@
 #!/usr/bin/env python3
-"""Fail if a checkout still contains private release artifacts or host paths."""
-
+"""Local heuristic check; emits locations only, never matched values."""
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+from pathlib import Path
 import re
 import subprocess
-from pathlib import Path
 
 PRIVATE_PATH_PATTERNS = (
-    re.compile(r"(^|/)profiles\.json(?:\.bak-.*)?$"),
-    re.compile(r"(^|/)AGENTS\.md$"),
-    re.compile(r"(^|/)DESIGN\.md$"),
-    re.compile(r"(^|/)state\.json$"),
-    re.compile(r"(^|/)(?:security\.json|api-keys)$"),
+    re.compile(r"^candidate/(?:.*\.json|.*\.service)$"),
+    re.compile(r"(?:^|/)(?:profiles\.json(?:\.bak-.*)?|catalog\.json|security\.json|state\.json|api-keys|AGENTS\.md|DESIGN\.md|\.env(?:\..*)?)$"),
+    re.compile(r"\.(?:pem|key|p12|pfx)$"),
 )
-PUBLIC_EXCLUDED_PATH_PATTERNS = (
-    # These maintainer-only prompts/plans are excluded by MANIFEST.in and are
-    # intentionally not part of the public source distribution.
-    re.compile(r"(^|/)docs/plans(?:/|$)"),
-    re.compile(r"(^|/)docs/goals(?:/|$)"),
-    re.compile(r"(^|/)docs/broker-autotune-workstream\.md$"),
-)
-HOST_PATTERNS = (
-    re.compile(r"/home/[A-Za-z0-9_.-]+/"),
-    re.compile(r"/mnt/[A-Za-z]/Users/", re.IGNORECASE),
-    re.compile(r"[A-Za-z]:[\\/]Users[\\/]", re.IGNORECASE),
-)
-SECRET_VALUE_PATTERN = re.compile(
-    r"(?i)(?:api[-_]?key|authorization|bearer|password|token|secret)"
-    r"\s*(?:=|:)\s*[\"'](?!\[REDACTED\])[^\"']{8,}[\"']"
-)
+PATTERNS = {
+    "personal absolute path": re.compile(rb"(?:/home/(?!user(?:/|\b)|example(?:/|\b)|<)[A-Za-z0-9_.-]+/|/mnt/[a-z]/Users/(?!(?:user|example)(?:/|\b))[^/\s]+/|[A-Za-z]:[\\/]+Users[\\/]+(?!(?:user|example)(?:[\\/]|\b))[^\\/\s]+)"),
+    "private network example": re.compile(rb"\b(?:192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"),
+    "provider token": re.compile(rb"\b(?:AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{24,})\b"),
+    "private key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+}
+CREDENTIAL = re.compile(rb'''(?i)(?:api[_-]?key|access[_-]?token|secret|password)["']?\s*[:=]\s*["']([^"'\r\n]{8,})["']''')
 
 
-def tracked_files(root: Path) -> list[Path]:
-    output = subprocess.check_output(
-        ["git", "-C", str(root), "ls-files", "-z"], text=False
-    )
-    return [root / item for item in output.decode().split("\0") if item]
+def inspect_blob(rel: str, data: bytes, fixture_allowlist: dict[str, list[str]]) -> list[str]:
+    failures = []
+    if not rel.endswith((".example", ".example.json")) and any(p.search(rel) for p in PRIVATE_PATH_PATTERNS):
+        failures.append(f"private configuration: {rel}")
+    if b"\0" in data:
+        failures.append(f"binary blob requires manual review: {rel}")
+        return failures
+    for category, pattern in PATTERNS.items():
+        for match in pattern.finditer(data):
+            failures.append(f"{category}: {rel}:{data[:match.start()].count(bytes([10])) + 1}")
+    for match in CREDENTIAL.finditer(data):
+        digest = hashlib.sha256(match.group(1)).hexdigest()
+        if digest not in fixture_allowlist.get(rel, []):
+            failures.append(f"unreviewed credential literal: {rel}:{data[:match.start()].count(bytes([10])) + 1}")
+    return failures
 
 
 def check(root: Path) -> list[str]:
-    failures: list[str] = []
-    for path in tracked_files(root):
-        rel = path.relative_to(root).as_posix()
-        if any(pattern.search(rel) for pattern in PUBLIC_EXCLUDED_PATH_PATTERNS):
-            continue
-        if any(pattern.search(rel) for pattern in PRIVATE_PATH_PATTERNS):
-            failures.append(f"private path: {rel}")
-            continue
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        for pattern in HOST_PATTERNS:
-            if pattern.search(text):
-                failures.append(f"host-specific path in {rel}")
-                break
-        if SECRET_VALUE_PATTERN.search(text):
-            failures.append(f"possible raw secret in {rel}")
+    allowlist = json.loads((root / "tests/fixtures/synthetic-credential-sha256.json").read_text())
+    names = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"]).decode().split("\0")
+    failures = []
+    for rel in filter(None, names):
+        path = root / rel
+        if path.is_symlink():
+            failures.append(f"symlink requires manual review: {rel}")
+        elif not path.is_file():
+            failures.append(f"missing tracked file: {rel}")
+        else:
+            failures.extend(inspect_blob(rel, path.read_bytes(), allowlist))
     return failures
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    args = parser.parse_args()
-    failures = check(args.root.resolve())
-    if failures:
-        print("public-tree check failed:")
-        for failure in failures:
-            print(f"- {failure}")
-        return 1
-    print("public-tree check passed")
-    return 0
+    failures = check(parser.parse_args().root.resolve())
+    for failure in failures:
+        print(failure)
+    print("Public-tree heuristic check " + ("failed" if failures else "passed; external audit not implied"))
+    return int(bool(failures))
 
 
 if __name__ == "__main__":

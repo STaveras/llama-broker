@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 import llama_broker.cli as brokerctl
 from llama_broker.broker_profiles import ProfileError, ProfileRegistry
-from llama_broker.broker_security import SecurityConfig
+from llama_broker.broker_security import SecurityConfig, write_api_keys
 from llama_broker.broker_tui import TUIModel
 from llama_broker.cli import _set_scalar_field
 from llama_broker.daemon import (
@@ -504,6 +504,13 @@ class StrataProfileTests(unittest.TestCase):
         self.assertNotIn("extra_args", added)
 
     def test_cli_profile_add_registers_a_strata_build_and_validates_artifacts(self) -> None:
+        key_file = self.root / "fixture-api-keys"
+        write_api_keys(key_file, ["fixture-key"])
+        security = patch(
+            "llama_broker.daemon.load_security_config", return_value=SecurityConfig(api_key_file=key_file)
+        )
+        security.start()
+        self.addCleanup(security.stop)
         profiles_path = self._write_profiles(self._profile())
         new_alias = "qwen3.8-flash-next-iq2-xs-added"
         launch = dict(self.launch_config)
