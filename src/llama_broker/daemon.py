@@ -3865,7 +3865,7 @@ class BrokerServer(ThreadingHTTPServer):
                     self._inference_queue_bytes -= body_bytes
                     expired = False
             if expired:
-                self._reject_over_capacity(request)
+                self._reject_over_capacity(request, reason="queue_expired")
                 continue
             with self._request_lanes_lock:
                 self._request_lanes[id(request)] = "data"
@@ -3903,7 +3903,7 @@ class BrokerServer(ThreadingHTTPServer):
             with self._inference_queue_condition:
                 self._inference_queue_condition.notify()
 
-    def _reject_over_capacity(self, request: socket.socket) -> None:
+    def _reject_over_capacity(self, request: socket.socket, *, reason: str = "capacity_rejected") -> None:
         body = _json_bytes(
             {
                 "error": {
@@ -3920,6 +3920,19 @@ class BrokerServer(ThreadingHTTPServer):
             + body
         )
         try:
+            request_id = ""
+            try:
+                peek = request.recv(65536, socket.MSG_PEEK)
+                for line in peek.split(b"\r\n"):
+                    if line.lower().startswith(b"x-request-id:"):
+                        request_id = line.split(b":", 1)[1].strip().decode("ascii", "replace")
+                        break
+            except OSError:
+                pass
+            _log(
+                f"[broker] inference {reason} (request {request_id or 'unavailable'}, "
+                f"HTTP 503): worker capacity exhausted"
+            )
             request.settimeout(self._control_client_timeout)
             request.sendall(response)
         except OSError:
