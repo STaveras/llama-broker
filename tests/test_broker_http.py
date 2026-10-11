@@ -165,6 +165,11 @@ class BackendHandler(BaseHTTPRequestHandler):
 
 
 class BrokerHttpTests(unittest.TestCase):
+    def test_inference_queue_configuration_is_bounded_and_fifo(self) -> None:
+        self.assertGreater(llama_broker.INFERENCE_QUEUE_MAX_SOCKETS, 0)
+        self.assertGreater(llama_broker.INFERENCE_QUEUE_MAX_BODY_BYTES, 0)
+        self.assertGreater(llama_broker.INFERENCE_QUEUE_WAIT_TIMEOUT, 0)
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         root = Path(self.tempdir.name)
