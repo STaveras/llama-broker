@@ -6,7 +6,7 @@ bundles into a separate catalog.
 """
 from __future__ import annotations
 
-import hashlib, json, os, re, shutil, subprocess, tempfile, time, fcntl, stat
+import hashlib, json, os, re, shutil, subprocess, tempfile, time, fcntl, stat, selectors, signal
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -92,15 +92,28 @@ def _run(argv, *, cwd=None, timeout=900, env=None, log=None):
         raise RuntimeControlError("command must be an argv list")
     proc = subprocess.Popen(list(argv), cwd=str(cwd) if cwd else None, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, shell=False)
+                            text=True, bufsize=1, shell=False, start_new_session=True)
     lines=[]
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
     try:
-        for line in iter(proc.stdout.readline, ""):
-            lines.append(line.rstrip("\n"))
-            if log: log(line.rstrip("\n"))
-        code=proc.wait(timeout=timeout)
+        while sel.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0: raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in sel.select(remaining):
+                data = key.fileobj.readline()
+                if data == "": sel.unregister(key.fileobj); continue
+                line = data.rstrip("\n")
+                lines.append(line)
+                if log: log(line)
+        code = proc.wait(timeout=max(0, deadline - time.monotonic()))
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
-        proc.kill(); proc.wait(); raise RuntimeControlError("command timed out or cancelled")
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise RuntimeControlError("command timed out or cancelled")
+    finally:
+        sel.close()
     if code: raise RuntimeControlError(f"command failed ({code}): {' '.join(argv)}\n" + "\n".join(lines[-20:]))
     return "\n".join(lines)
 
@@ -141,12 +154,22 @@ def project_add(root: Path, name: str, url: str, *, default_branch: str|None=Non
 def project_list(root: Path) -> list[dict]: return load_projects(root)
 
 def _project(root,name):
-    item=next((x for x in load_projects(root) if x["name"]==name),None)
+    if not isinstance(name, str) or not SAFE_NAME.fullmatch(name):
+        raise RuntimeControlError("invalid project name")
+    root = _assert_safe_path(Path(root), Path(root).parent, directory=True)
+    item=next((x for x in load_projects(root) if isinstance(x, dict) and x.get("name")==name),None)
     if not item: raise RuntimeControlError(f"unknown project: {name}")
+    if not SAFE_NAME.fullmatch(item.get("name", "")):
+        raise RuntimeControlError("stored project has invalid name")
+    expected = _assert_safe_path(root / name, root)
+    stored = item.get("path")
+    if not isinstance(stored, str) or Path(stored).absolute() != expected.absolute():
+        raise RuntimeControlError("stored project path does not match project root")
+    _assert_safe_path(expected, root, directory=True)
     return item
 
 def project_fetch(root: Path,name: str) -> dict:
-    item=_project(root,name); path=Path(item["path"]); root.mkdir(parents=True,exist_ok=True)
+    item=_project(root,name); path=_assert_safe_path(Path(item["path"]), Path(root), directory=True); root.mkdir(parents=True,exist_ok=True)
     if not (path/".git").exists(): _run(["git","clone","--no-checkout",item["source_url"],str(path)])
     else: _run(["git","fetch","--no-tags","--prune","origin"],cwd=path)
     remote=_run(["git","symbolic-ref","refs/remotes/origin/HEAD"],cwd=path).strip()
@@ -157,7 +180,7 @@ def project_fetch(root: Path,name: str) -> dict:
     save_projects(root,items); return item
 
 def project_commits(root: Path,name: str, ref: str|None=None) -> list[dict]:
-    item=_project(root,name); path=Path(item["path"]); ref=ref or item.get("default_branch")
+    item=_project(root,name); path=_assert_safe_path(Path(item["path"]), Path(root), directory=True); ref=ref or item.get("default_branch")
     if not ref: raise RuntimeControlError("default branch is unknown; pass --ref explicitly")
     out=_run(["git","log","--format=%H%x09%s","-20",ref],cwd=path)
     return [{"hash":h,"subject":s} for h,s in (line.split("\t",1) for line in out.splitlines() if "\t" in line)]
@@ -169,7 +192,7 @@ def _sha(path):
     return h.hexdigest()
 
 def bundle_plan(root: Path,name: str, *, branch=None, commit=None, build_command=None, allow_network=False) -> dict:
-    item=_project(root,name); path=Path(item["path"])
+    item=_project(root,name); path=_assert_safe_path(Path(item["path"]), Path(root), directory=True)
     if branch and commit: raise RuntimeControlError("choose branch or commit, not both")
     if allow_network: raise RuntimeControlError("--allow-network is unsupported; builds are always offline")
     if commit and not FULL_COMMIT.fullmatch(commit): raise RuntimeControlError("--commit requires an exact 40-hex commit")
@@ -181,41 +204,105 @@ def bundle_plan(root: Path,name: str, *, branch=None, commit=None, build_command
 
 def bundle_build(root: Path,name: str, *, branch=None, commit=None, allow_network=False, jobs=2, log=None) -> dict:
     plan=bundle_plan(root,name,branch=branch,commit=commit,allow_network=allow_network)
-    item=_project(root,name); repo=Path(item["path"])
+    item=_project(root,name); repo=_assert_safe_path(Path(item["path"]), Path(root), directory=True)
     resolved=_run(["git","rev-parse","--verify","--end-of-options",plan["ref"]+"^{commit}"],cwd=repo).strip()
     if commit and resolved != commit: raise RuntimeControlError("commit does not resolve exactly")
     _run(["git","checkout","--detach","--force","--no-recurse-submodules","--end-of-options",resolved],cwd=repo)
     build=repo/".broker-build"/resolved[:12]; build.mkdir(parents=True,exist_ok=True)
-    _run(["cmake","-S",str(repo),"-B",str(build),"-DGGML_CUDA=OFF","-DCMAKE_BUILD_TYPE=Release","-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"],cwd=repo,timeout=1200,log=log)
-    _run(["cmake","--build",str(build),"--parallel",str(max(1,min(int(jobs),4)))],cwd=repo,timeout=1800,log=log)
+    bwrap = shutil.which("bwrap")
+    if not bwrap: raise RuntimeControlError("bubblewrap (bwrap) is required for sandboxed builds")
+    source = repo.resolve(); build = build.resolve()
+    sandbox_env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                   "HOME": "/nonexistent", "LANG": "C", "LC_ALL": "C",
+                   "SOURCE_DATE_EPOCH": "0"}
+    common = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
+              "--tmpfs", "/", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
+              "--ro-bind", "/sbin", "/sbin", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
+              "--ro-bind", "/etc/alternatives", "/etc/alternatives", "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
+              "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/tmp/src", "--dir", "/tmp/build",
+              "--ro-bind", str(source), "/tmp/src", "--bind", str(build), "/tmp/build",
+              "--chdir", "/tmp/build", "--clearenv"]
+    for key, value in sandbox_env.items(): common += ["--setenv", key, value]
+    _run(common + ["cmake", "-S", "/tmp/src", "-B", "/tmp/build", "-DGGML_CUDA=OFF", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"], timeout=1200, log=log)
+    _run(common + ["cmake", "--build", "/tmp/build", "--parallel", str(max(1,min(int(jobs),4)))], timeout=1800, log=log)
     binaries=sorted(p for p in build.rglob("*") if p.is_file() and os.access(p,os.X_OK) and not p.is_symlink())
     if not binaries: raise RuntimeControlError("recipe produced no executable")
     catalog=root/"bundles"; catalog.mkdir(parents=True,exist_ok=True)
     bundle=catalog/(name+"-"+resolved[:12]); tmp=Path(tempfile.mkdtemp(prefix=".bundle-",dir=catalog))
     try:
-        (tmp/"bin").mkdir(); src=next((p for p in binaries if p.name == "llama-server"), binaries[0]); shutil.copy2(src,tmp/"bin"/src.name)
+        (tmp/"bin").mkdir(); src=next((p for p in binaries if p.name == "llama-server"), binaries[0])
+        shutil.copy2(src,tmp/"bin"/src.name)
+        links = []
+        for lib in sorted(build.rglob("*.so*")):
+            if lib.is_symlink():
+                target = os.readlink(lib); (tmp/"lib").mkdir(exist_ok=True); (tmp/"lib"/lib.name).symlink_to(target)
+                links.append({"path": "lib/"+lib.name, "target": target})
+            elif lib.is_file():
+                (tmp/"lib").mkdir(exist_ok=True); shutil.copy2(lib,tmp/"lib"/lib.name)
         dependency_inventory = _dependency_inventory(src)
-        manifest={"schema_version":1,"id":bundle.name,"runtime_family":"llamacpp","source_url":item["source_url"],"resolved_commit":resolved,"branch":branch,"subject":_run(["git","show","-s","--format=%s",resolved],cwd=repo),"recipe":"cmake-cpu","cuda":False,"network":False,"files":{"bin/"+src.name:_sha(tmp/"bin"/src.name)},"links":[],"dependencies":dependency_inventory}
+        files={"bin/"+src.name:_sha(tmp/"bin"/src.name)}
+        files.update({p.relative_to(tmp).as_posix(): _sha(p) for p in (tmp/"lib").glob("*") if p.is_file() and not p.is_symlink()} if (tmp/"lib").exists() else {})
+        manifest={"schema_version":1,"id":bundle.name,"runtime_family":"llamacpp","source_url":item["source_url"],"resolved_commit":resolved,"branch":branch,"subject":_run(["git","show","-s","--format=%s","--end-of-options",resolved],cwd=repo),"recipe":"cmake-cpu","cuda":False,"network":False,"files":files,"links":links,"dependencies":dependency_inventory}
         (tmp/"manifest.json").write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n")
         if bundle.exists(): raise RuntimeControlError("refusing to overwrite existing immutable bundle")
         os.replace(tmp,bundle)
+        index = catalog / "index.json"
+        anchors = {} if not index.exists() else json.loads(index.read_text()).get("bundles", {})
+        anchors[bundle.name] = _sha(bundle / "manifest.json")
+        index.write_text(json.dumps({"schema_version": 1, "bundles": anchors}, indent=2, sort_keys=True) + "\n")
     finally:
         shutil.rmtree(tmp,ignore_errors=True)
     return manifest
 
+_MANIFEST_KEYS = {"schema_version","id","runtime_family","source_url","resolved_commit","branch","subject","recipe","cuda","network","files","links","dependencies"}
+
+def _manifest_path(catalog: Path, ident: str) -> Path:
+    if not SAFE_NAME.fullmatch(ident): raise RuntimeControlError("invalid bundle id")
+    bundle = _assert_safe_path(catalog / ident, catalog, directory=True)
+    path = _assert_safe_path(bundle / "manifest.json", bundle)
+    if not path.is_file() or path.is_symlink(): raise RuntimeControlError("bundle manifest is missing or unsafe")
+    return path
+
+def _catalog_index(catalog: Path) -> dict:
+    index = _assert_safe_path(catalog / "index.json", catalog)
+    if not index.is_file() or index.is_symlink(): raise RuntimeControlError("bundle trust index is missing")
+    try: value=json.loads(index.read_text())
+    except Exception as exc: raise RuntimeControlError("invalid bundle trust index") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1 or not isinstance(value.get("bundles"), dict):
+        raise RuntimeControlError("invalid bundle trust index")
+    return value
+
+def _strict_manifest(path: Path, ident: str) -> dict:
+    try: value=json.loads(path.read_text())
+    except Exception as exc: raise RuntimeControlError("invalid bundle manifest") from exc
+    if not isinstance(value, dict) or set(value) != _MANIFEST_KEYS or value.get("schema_version") != 1 or value.get("id") != ident:
+        raise RuntimeControlError("invalid bundle manifest schema")
+    return value
+
 def bundle_list(root: Path) -> list[dict]:
-    return [json.loads(p.read_text()) for p in sorted((root/"bundles").glob("*/manifest.json"))]
+    catalog=_assert_safe_path(Path(root)/"bundles", Path(root), directory=True); index=_catalog_index(catalog)
+    result=[]
+    for ident, digest in sorted(index["bundles"].items()):
+        path=_manifest_path(catalog, ident)
+        if not isinstance(digest,str) or _sha(path) != digest: raise RuntimeControlError(f"bundle trust anchor mismatch: {ident}")
+        result.append(_strict_manifest(path, ident))
+    return result
 
 def bundle_verify(root: Path,name: str) -> dict:
     m=next((x for x in bundle_list(root) if x["id"]==name),None)
     if not m: raise RuntimeControlError("unknown bundle")
-    p=root/"bundles"/name; errors=[]
+    p=_assert_safe_path(Path(root)/"bundles"/name, Path(root)/"bundles", directory=True); errors=[]
     expected=set(m.get("files",{})) | {x["path"] for x in m.get("links",[]) if isinstance(x,dict) and "path" in x} | {"manifest.json"}
-    actual={entry.relative_to(p).as_posix() for entry in p.rglob("*") if entry.is_file() or entry.is_symlink()}
-    errors=["unexpected:"+x for x in sorted(actual-expected)]
+    actual=set()
+    for entry in p.rglob("*"):
+        rel=_safe_relative(entry,p)
+        if entry.is_dir() and entry.is_symlink(): errors.append("symlink-directory:"+rel)
+        elif entry.is_file() or entry.is_symlink(): actual.add(rel)
+    errors += ["unexpected:"+x for x in sorted(actual-expected)]
     for rel,digest in m["files"].items():
         if not (p/rel).is_file() or (p/rel).is_symlink() or _sha(p/rel)!=digest: errors.append(rel)
     for link in m.get("links", []):
-        path = p / link["path"]
+        path = _assert_safe_path(p / link["path"], p)
         if not path.is_symlink() or os.readlink(path) != link["target"]: errors.append(link["path"])
+        if not link["target"] or os.path.isabs(link["target"]) or ".." in Path(link["target"]).parts or not (path.parent / link["target"]).resolve().is_relative_to(p): errors.append(link["path"])
     return {"id":name,"status":"ok" if not errors else "invalid","errors":errors,"manifest":m}

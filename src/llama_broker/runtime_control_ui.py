@@ -5,7 +5,7 @@ import subprocess
 import sys
 from typing import Callable, Iterable, Mapping, Sequence, TextIO
 
-from .runtime_control import RuntimeControlError, load_projects, project_commits
+from .runtime_control import RuntimeControlError, _project, project_commits
 
 
 def _git(repo, args: Sequence[str]) -> list[str]:
@@ -16,17 +16,13 @@ def _git(repo, args: Sequence[str]) -> list[str]:
 
 def project_branches(root, name: str) -> list[str]:
     """Read local/remote branch names without modifying the repository."""
-    item = next((x for x in load_projects(root) if x.get("name") == name), None)
-    if not item:
-        raise RuntimeControlError(f"unknown project: {name}")
+    item = _project(root, name)
     branches = _git(item["path"], ["branch", "--format=%(refname:short)", "--no-color", "--"])
     return sorted(dict.fromkeys(branches))
 
 
 def default_branch(root, name: str) -> str | None:
-    item = next((x for x in load_projects(root) if x.get("name") == name), None)
-    if not item:
-        raise RuntimeControlError(f"unknown project: {name}")
+    item = _project(root, name)
     value = item.get("default_branch") or item.get("resolved_default_ref")
     return str(value) if value else None
 

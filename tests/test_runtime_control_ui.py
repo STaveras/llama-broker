@@ -17,8 +17,8 @@ class RuntimeControlUITests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "control"
-        repo = Path(self.tmp.name) / "repo"
-        repo.mkdir()
+        repo = self.root / "fixture"
+        repo.mkdir(parents=True)
         subprocess.run(["git", "init", "-b", "trunk"], cwd=repo, check=True, capture_output=True)
         subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
