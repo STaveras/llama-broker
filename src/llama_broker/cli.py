@@ -77,6 +77,7 @@ from .runtime_builds import (
 from .runtimes import get_runtime_info, list_runtimes, runtime_names
 from .runtime_control import (RuntimeControlError, project_add, project_list, project_fetch,
                               project_commits, bundle_plan, bundle_build, bundle_list, bundle_verify)
+from .runtime_control_ui import bundle_table_rows, select_source, project_branches
 from .integration import filtered_manifest, inspect_manifest, report_for
 from .hygiene import (
     CATEGORIES as CLEAN_CATEGORIES,
@@ -3181,11 +3182,23 @@ def _cmd_runtime_control(args: argparse.Namespace) -> int:
         if args.project_command == "add": result = project_add(root, args.name, args.url, default_branch=args.default_branch)
         elif args.project_command == "list": result = project_list(root)
         elif args.project_command == "fetch": result = project_fetch(root, args.name)
+        elif args.project_command == "branches": result = project_branches(root, args.name)
         else: result = project_commits(root, args.name, args.ref)
     else:
-        if args.bundle_command == "plan": result = bundle_plan(root, args.name, branch=args.branch, commit=args.commit, allow_network=args.allow_network)
-        elif args.bundle_command == "build": result = bundle_build(root, args.name, branch=args.branch, commit=args.commit, allow_network=args.allow_network, jobs=args.jobs)
-        elif args.bundle_command == "list": result = bundle_list(root)
+        if args.bundle_command == "plan":
+            selection = select_source(root, args.name) if args.select else {}
+            result = bundle_plan(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network)
+        elif args.bundle_command == "build":
+            if args.select and not args.build:
+                raise RuntimeControlError("--select only chooses a source; add --build to execute")
+            selection = select_source(root, args.name) if args.select else {}
+            result = bundle_build(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network, jobs=args.jobs)
+        elif args.bundle_command == "list":
+            manifests = bundle_list(root)
+            if getattr(args, "json", False): result = manifests
+            else:
+                print(_render_table(("FAMILY", "SOURCE URL", "COMMIT", "SUBJECT", "STATUS"), bundle_table_rows(manifests), width=_terminal_width(getattr(args, "width", None))))
+                return 0
         else: result = bundle_verify(root, args.name)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -3710,13 +3723,16 @@ def build_parser() -> argparse.ArgumentParser:
     pa = project_sub.add_parser("add"); pa.add_argument("name"); pa.add_argument("url"); pa.add_argument("--default-branch")
     project_sub.add_parser("list")
     pf = project_sub.add_parser("fetch"); pf.add_argument("name")
+    pb = project_sub.add_parser("branches"); pb.add_argument("name")
     pc = project_sub.add_parser("commits"); pc.add_argument("name"); pc.add_argument("--ref")
     bundle = runtime_sub.add_parser("bundle", help="plan, build, list, or verify immutable CPU bundles")
     bundle_sub = bundle.add_subparsers(dest="bundle_command", required=True)
     for command in ("plan", "build"):
-        bp = bundle_sub.add_parser(command); bp.add_argument("name"); bp.add_argument("--branch"); bp.add_argument("--commit"); bp.add_argument("--allow-network", action="store_true")
-        if command == "build": bp.add_argument("--jobs", type=int, default=2)
-    bundle_sub.add_parser("list")
+        bp = bundle_sub.add_parser(command); bp.add_argument("name"); bp.add_argument("--branch"); bp.add_argument("--commit"); bp.add_argument("--select", action="store_true", help="interactively select branch and commit (TTY only)"); bp.add_argument("--allow-network", action="store_true")
+        if command == "build":
+            bp.add_argument("--build", action="store_true", help="execute the build after interactive selection")
+            bp.add_argument("--jobs", type=int, default=2)
+    bl = bundle_sub.add_parser("list"); bl.add_argument("--json", action="store_true"); bl.add_argument("--width", type=int)
     bv = bundle_sub.add_parser("verify"); bv.add_argument("name")
 
     security = subparsers.add_parser(
