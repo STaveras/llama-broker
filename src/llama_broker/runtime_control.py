@@ -180,7 +180,7 @@ def bundle_build(root: Path,name: str, *, branch=None, commit=None, allow_networ
     return manifest
 
 def bundle_list(root: Path) -> list[dict]:
-    return [json.loads((p/"manifest.json").read_text()) for p in sorted((root/"bundles").glob("*/manifest.json"))]
+    return [json.loads(p.read_text()) for p in sorted((root/"bundles").glob("*/manifest.json"))]
 
 def bundle_verify(root: Path,name: str) -> dict:
     m=next((x for x in bundle_list(root) if x["id"]==name),None)
