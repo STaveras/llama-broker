@@ -15,6 +15,63 @@ ALLOWED_SCHEMES = {"https", "ssh"}
 
 class RuntimeControlError(ValueError): pass
 
+def _safe_relative(path: Path, root: Path) -> str:
+    try:
+        rel = path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeControlError(f"path escapes bundle root: {path}") from exc
+    if any(part in ("", ".", "..") for part in rel.parts):
+        raise RuntimeControlError(f"unsafe bundle path: {rel}")
+    return rel.as_posix()
+
+def _copy_tree_preserve_links(source: Path, destination: Path) -> list[dict]:
+    """Copy a tree without dereferencing links; reject links escaping source."""
+    source = source.resolve(); destination.mkdir(parents=True, exist_ok=True)
+    records = []
+    for item in sorted(source.rglob("*")):
+        rel = _safe_relative(item, source); target = destination / rel
+        if item.is_symlink():
+            link = os.readlink(item)
+            resolved = (item.parent / link).resolve()
+            if not resolved.is_relative_to(source):
+                raise RuntimeControlError(f"symlink escapes source tree: {rel} -> {link}")
+            target.parent.mkdir(parents=True, exist_ok=True); target.symlink_to(link)
+            records.append({"path": rel, "type": "symlink", "target": link})
+        elif item.is_dir(): target.mkdir(parents=True, exist_ok=True)
+        elif item.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(item, target)
+            records.append({"path": rel, "type": "file", "sha256": _sha(item)})
+        else: raise RuntimeControlError(f"unsupported bundle entry: {rel}")
+    return records
+
+def _elf_dependencies(binary: Path) -> list[str]:
+    try:
+        out = subprocess.run(["readelf", "-d", str(binary)], text=True, capture_output=True,
+                             check=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeControlError(f"cannot inspect ELF dependencies: {exc}") from exc
+    return sorted(set(re.findall(r"Shared library: \[(.+?)\]", out)))
+
+def _dependency_inventory(binary: Path) -> dict:
+    deps = _elf_dependencies(binary)
+    resolved = {}
+    missing = []
+    for dep in deps:
+        result = shutil.which("ldconfig")
+        found = None
+        if result:
+            try:
+                text = subprocess.run([result, "-p"], text=True, capture_output=True, check=True, timeout=10).stdout
+                for line in text.splitlines():
+                    match = re.search(r"\b" + re.escape(dep) + r"\s+\([^)]*\)\s+=>\s+(/[^ ]+)", line)
+                    if match:
+                        found = match.group(1); break
+            except (OSError, subprocess.SubprocessError): pass
+        if found: resolved[dep] = {"path": found, "sha256": _sha(Path(found))}
+        else: missing.append(dep)
+    if missing: raise RuntimeControlError("unsupported unresolved ELF dependencies: " + ", ".join(missing))
+    return {"mode": "readelf+ldconfig", "needed": deps, "resolved": resolved}
+
 def _run(argv, *, cwd=None, timeout=900, env=None, log=None):
     if not isinstance(argv, (list, tuple)) or any(not isinstance(x, str) for x in argv):
         raise RuntimeControlError("command must be an argv list")
@@ -113,7 +170,8 @@ def bundle_build(root: Path,name: str, *, branch=None, commit=None, allow_networ
     bundle=catalog/(name+"-"+resolved[:12]); tmp=Path(tempfile.mkdtemp(prefix=".bundle-",dir=catalog))
     try:
         (tmp/"bin").mkdir(); src=binaries[0]; shutil.copy2(src,tmp/"bin"/src.name)
-        manifest={"schema_version":1,"id":bundle.name,"runtime_family":"llamacpp","source_url":item["source_url"],"resolved_commit":resolved,"branch":branch,"subject":_run(["git","show","-s","--format=%s",resolved],cwd=repo),"recipe":"cmake-cpu","cuda":False,"network":bool(allow_network),"files":{"bin/"+src.name:_sha(tmp/"bin"/src.name)},"dependencies":{"mode":"host-compatible","resolved":[]}}
+        dependency_inventory = _dependency_inventory(src)
+        manifest={"schema_version":1,"id":bundle.name,"runtime_family":"llamacpp","source_url":item["source_url"],"resolved_commit":resolved,"branch":branch,"subject":_run(["git","show","-s","--format=%s",resolved],cwd=repo),"recipe":"cmake-cpu","cuda":False,"network":bool(allow_network),"files":{"bin/"+src.name:_sha(tmp/"bin"/src.name)},"links":[],"dependencies":dependency_inventory}
         (tmp/"manifest.json").write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n")
         if bundle.exists(): raise RuntimeControlError("refusing to overwrite existing immutable bundle")
         os.replace(tmp,bundle)
@@ -129,5 +187,8 @@ def bundle_verify(root: Path,name: str) -> dict:
     if not m: raise RuntimeControlError("unknown bundle")
     p=root/"bundles"/name; errors=[]
     for rel,digest in m["files"].items():
-        if not (p/rel).is_file() or _sha(p/rel)!=digest: errors.append(rel)
+        if not (p/rel).is_file() or (p/rel).is_symlink() or _sha(p/rel)!=digest: errors.append(rel)
+    for link in m.get("links", []):
+        path = p / link["path"]
+        if not path.is_symlink() or os.readlink(path) != link["target"]: errors.append(link["path"])
     return {"id":name,"status":"ok" if not errors else "invalid","errors":errors,"manifest":m}
