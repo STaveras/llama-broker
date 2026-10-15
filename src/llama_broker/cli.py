@@ -75,6 +75,8 @@ from .runtime_builds import (
     runtime_build_label,
 )
 from .runtimes import get_runtime_info, list_runtimes, runtime_names
+from .runtime_control import (RuntimeControlError, project_add, project_list, project_fetch,
+                              project_commits, bundle_plan, bundle_build, bundle_list, bundle_verify)
 from .integration import filtered_manifest, inspect_manifest, report_for
 from .hygiene import (
     CATEGORIES as CLEAN_CATEGORIES,
@@ -3173,6 +3175,22 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_runtime_control(args: argparse.Namespace) -> int:
+    root = Path(args.control_root).expanduser().resolve()
+    if args.runtime_command == "project":
+        if args.project_command == "add": result = project_add(root, args.name, args.url, default_branch=args.default_branch)
+        elif args.project_command == "list": result = project_list(root)
+        elif args.project_command == "fetch": result = project_fetch(root, args.name)
+        else: result = project_commits(root, args.name, args.ref)
+    else:
+        if args.bundle_command == "plan": result = bundle_plan(root, args.name, branch=args.branch, commit=args.commit, allow_network=args.allow_network)
+        elif args.bundle_command == "build": result = bundle_build(root, args.name, branch=args.branch, commit=args.commit, allow_network=args.allow_network, jobs=args.jobs)
+        elif args.bundle_command == "list": result = bundle_list(root)
+        else: result = bundle_verify(root, args.name)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def _configure_after_credential_change(args: argparse.Namespace) -> None:
     """Refresh configured tools after the native key file has changed."""
 
@@ -3686,6 +3704,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="target output width in columns; the table wraps to fit instead of overflowing the terminal (default: detected terminal width)",
     )
+    runtime.add_argument("--control-root", type=Path, default=Path.home() / ".local/share/llama-broker/runtime-control")
+    project = runtime_sub.add_parser("project", help="register and inspect reviewed source projects")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+    pa = project_sub.add_parser("add"); pa.add_argument("name"); pa.add_argument("url"); pa.add_argument("--default-branch")
+    project_sub.add_parser("list")
+    pf = project_sub.add_parser("fetch"); pf.add_argument("name")
+    pc = project_sub.add_parser("commits"); pc.add_argument("name"); pc.add_argument("--ref")
+    bundle = runtime_sub.add_parser("bundle", help="plan, build, list, or verify immutable CPU bundles")
+    bundle_sub = bundle.add_subparsers(dest="bundle_command", required=True)
+    for command in ("plan", "build"):
+        bp = bundle_sub.add_parser(command); bp.add_argument("name"); bp.add_argument("--branch"); bp.add_argument("--commit"); bp.add_argument("--allow-network", action="store_true")
+        if command == "build": bp.add_argument("--jobs", type=int, default=2)
+    bundle_sub.add_parser("list")
+    bv = bundle_sub.add_parser("verify"); bv.add_argument("name")
 
     security = subparsers.add_parser(
         "security", help="provision and rotate deployment-owned API-key and TLS material"
@@ -4091,8 +4123,10 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_security_revoke(args)
         if args.command == "model" and args.model_command == "list":
             return _cmd_model_list(args)
-        if args.command == "runtime" and args.runtime_command == "list":
-            return _cmd_runtime_list(args)
+        if args.command == "runtime":
+            if args.runtime_command == "list":
+                return _cmd_runtime_list(args)
+            return _cmd_runtime_control(args)
         if args.command == "profile":
             if args.profiles_command == "list":
                 return _cmd_profiles_list(args)
