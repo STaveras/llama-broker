@@ -302,7 +302,8 @@ def bundle_verify(root: Path,name: str) -> dict:
     for rel,digest in m["files"].items():
         if not (p/rel).is_file() or (p/rel).is_symlink() or _sha(p/rel)!=digest: errors.append(rel)
     for link in m.get("links", []):
-        path = _assert_safe_path(p / link["path"], p)
-        if not path.is_symlink() or os.readlink(path) != link["target"]: errors.append(link["path"])
+        path = p / link["path"]
+        _assert_safe_path(path.parent, p)
+        if not path.is_relative_to(p) or not path.is_symlink() or os.readlink(path) != link["target"]: errors.append(link["path"])
         if not link["target"] or os.path.isabs(link["target"]) or ".." in Path(link["target"]).parts or not (path.parent / link["target"]).resolve().is_relative_to(p): errors.append(link["path"])
     return {"id":name,"status":"ok" if not errors else "invalid","errors":errors,"manifest":m}
