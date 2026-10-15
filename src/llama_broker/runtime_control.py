@@ -21,7 +21,7 @@ def _cmake_recipe(recipe: str, *, cuda_arch: str | None = None) -> tuple[list[st
         raise RuntimeControlError("recipe must be cmake-cpu or cmake-cuda")
     common = ["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
               "-DLLAMA_OPENSSL=ON", "-DLLAMA_BUILD_BORINGSSL=OFF",
-              "-DLLAMA_BUILD_SUBPROCESS=OFF", "-DGGML_RPC=OFF",
+              "-DLLAMA_SUBPROCESS=OFF", "-DGGML_RPC=OFF",
               "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
               "-DLLAMA_BUILD_SERVER=ON", "-DLLAMA_BUILD_TOOLS=OFF",
               "-DLLAMA_BUILD_WEBUI=OFF"]
@@ -40,8 +40,9 @@ def _cuda_toolchain_check() -> str | None:
         version = subprocess.run([nvcc, "--version"], text=True, capture_output=True, check=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         return f"could not inspect nvcc: {exc}"
-    if not re.search(r"release\s+(?:12\.[0-9]+)", version, re.I):
-        return "nvcc version is incompatible; CUDA 12.x is required for arch 120a"
+    match = re.search(r"release\s+(\d+)\.(\d+)", version, re.I)
+    if not match or tuple(map(int, match.groups())) < (12, 8):
+        return "nvcc version is incompatible; CUDA 12.8 or newer is required for arch 120a"
     return None
 
 class RuntimeControlError(ValueError): pass
