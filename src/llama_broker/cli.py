@@ -3070,6 +3070,7 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
                     "source_repository": (
                         str(build.source_repository) if build.source_repository else None
                     ),
+                    "source_url": build.source_url,
                     "provenance_file": (
                         str(build.provenance_file) if build.provenance_file else None
                     ),
@@ -3187,12 +3188,12 @@ def _cmd_runtime_control(args: argparse.Namespace) -> int:
     else:
         if args.bundle_command == "plan":
             selection = select_source(root, args.name) if args.select else {}
-            result = bundle_plan(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network)
+            result = bundle_plan(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network, recipe=args.recipe, cuda_arch=args.cuda_arch)
         elif args.bundle_command == "build":
             if args.select and not args.build:
                 raise RuntimeControlError("--select only chooses a source; add --build to execute")
             selection = select_source(root, args.name) if args.select else {}
-            result = bundle_build(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network, jobs=args.jobs)
+            result = bundle_build(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network, jobs=args.jobs, recipe=args.recipe, cuda_arch=args.cuda_arch)
         elif args.bundle_command == "list":
             manifests = bundle_list(root)
             if getattr(args, "json", False): result = manifests
@@ -3728,7 +3729,7 @@ def build_parser() -> argparse.ArgumentParser:
     bundle = runtime_sub.add_parser("bundle", help="plan, build, list, or verify immutable CPU bundles")
     bundle_sub = bundle.add_subparsers(dest="bundle_command", required=True)
     for command in ("plan", "build"):
-        bp = bundle_sub.add_parser(command); bp.add_argument("name"); bp.add_argument("--branch"); bp.add_argument("--commit"); bp.add_argument("--select", action="store_true", help="interactively select branch and commit (TTY only)"); bp.add_argument("--allow-network", action="store_true")
+        bp = bundle_sub.add_parser(command); bp.add_argument("name"); bp.add_argument("--branch"); bp.add_argument("--commit"); bp.add_argument("--recipe", choices=("cmake-cpu", "cmake-cuda"), default="cmake-cpu"); bp.add_argument("--cuda-arch"); bp.add_argument("--select", action="store_true", help="interactively select branch and commit (TTY only)"); bp.add_argument("--allow-network", action="store_true")
         if command == "build":
             bp.add_argument("--build", action="store_true", help="execute the build after interactive selection")
             bp.add_argument("--jobs", type=int, default=2)

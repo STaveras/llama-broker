@@ -39,6 +39,7 @@ class RuntimeBuild:
     bundle_root: Path | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
     source_repository: Path | None = None
+    source_url: str | None = None
     provenance_file: Path | None = None
     source_branch: str | None = None
     source_commit: str | None = None
@@ -119,6 +120,7 @@ def _runtime_build_mapping(build: RuntimeBuild) -> dict[str, Any]:
         "source_repository": str(build.source_repository)
         if build.source_repository
         else None,
+        "source_url": build.source_url,
         "provenance_file": str(build.provenance_file)
         if build.provenance_file
         else None,
@@ -155,6 +157,7 @@ def parse_runtime_builds(
         "environment",
         "launch_environment",
         "source_repository",
+        "source_url",
         "provenance_file",
         "source_branch",
         "source_commit",
@@ -247,6 +250,7 @@ def parse_runtime_builds(
             if item.get("source_repository") is not None
             else None
         )
+        source_url = _optional_text(item, "source_url")
         provenance_file = (
             _absolute_path(
                 item["provenance_file"],
@@ -299,6 +303,7 @@ def parse_runtime_builds(
                 bundle_root=bundle_root,
                 environment=environment,
                 source_repository=source_repository,
+                source_url=source_url,
                 provenance_file=provenance_file,
                 source_branch=source_branch,
                 source_commit=source_commit,

@@ -13,6 +13,36 @@ from urllib.parse import urlsplit
 SAFE_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
 ALLOWED_SCHEMES = {"https", "ssh"}
 FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+CUDA_ARCHES = {"120a"}
+
+
+def _cmake_recipe(recipe: str, *, cuda_arch: str | None = None) -> tuple[list[str], bool]:
+    if recipe not in {"cmake-cpu", "cmake-cuda"}:
+        raise RuntimeControlError("recipe must be cmake-cpu or cmake-cuda")
+    common = ["-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
+              "-DLLAMA_OPENSSL=ON", "-DLLAMA_BUILD_BORINGSSL=OFF",
+              "-DLLAMA_BUILD_SUBPROCESS=OFF", "-DGGML_RPC=OFF",
+              "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
+              "-DLLAMA_BUILD_SERVER=ON", "-DLLAMA_BUILD_TOOLS=OFF",
+              "-DLLAMA_BUILD_WEBUI=OFF"]
+    if recipe == "cmake-cpu":
+        return ["-DGGML_CUDA=OFF", *common], False
+    if cuda_arch not in CUDA_ARCHES:
+        raise RuntimeControlError("cmake-cuda requires --cuda-arch 120a")
+    return ["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}", *common], True
+
+
+def _cuda_toolchain_check() -> str | None:
+    nvcc = shutil.which("nvcc")
+    if not nvcc:
+        return "nvcc not found; install a CUDA toolkit with nvcc before building"
+    try:
+        version = subprocess.run([nvcc, "--version"], text=True, capture_output=True, check=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not inspect nvcc: {exc}"
+    if not re.search(r"release\s+(?:12\.[0-9]+)", version, re.I):
+        return "nvcc version is incompatible; CUDA 12.x is required for arch 120a"
+    return None
 
 class RuntimeControlError(ValueError): pass
 
@@ -191,19 +221,20 @@ def _sha(path):
         for b in iter(lambda:f.read(1024*1024),b""): h.update(b)
     return h.hexdigest()
 
-def bundle_plan(root: Path,name: str, *, branch=None, commit=None, build_command=None, allow_network=False) -> dict:
+def bundle_plan(root: Path,name: str, *, branch=None, commit=None, build_command=None, allow_network=False, recipe="cmake-cpu", cuda_arch=None) -> dict:
     item=_project(root,name); path=_assert_safe_path(Path(item["path"]), Path(root), directory=True)
     if branch and commit: raise RuntimeControlError("choose branch or commit, not both")
     if allow_network: raise RuntimeControlError("--allow-network is unsupported; builds are always offline")
     if commit and not FULL_COMMIT.fullmatch(commit): raise RuntimeControlError("--commit requires an exact 40-hex commit")
     ref=commit or branch or item.get("default_branch") or "origin/HEAD"
     if not ref: raise RuntimeControlError("no default branch known; pass --branch or --commit")
-    if build_command and not (build_command == ["cmake"] or build_command[:2] == ["cmake","--build"]):
-        raise RuntimeControlError("only the reviewed CMake recipe is supported")
-    return {"project":name,"source_url":item["source_url"],"ref":ref,"selection":"commit" if commit else "branch","build_recipe":"cmake-cpu","network":False,"cuda":False,"status":"planned"}
+    flags, cuda = _cmake_recipe(recipe, cuda_arch=cuda_arch)
+    issue = _cuda_toolchain_check() if cuda else None
+    return {"project":name,"source_url":item["source_url"],"ref":ref,"selection":"commit" if commit else "branch","build_recipe":recipe,"configure_flags":flags,"network":False,"cuda":cuda,"toolchain_issue":issue,"status":"blocked" if issue else "planned"}
 
-def bundle_build(root: Path,name: str, *, branch=None, commit=None, allow_network=False, jobs=2, log=None) -> dict:
-    plan=bundle_plan(root,name,branch=branch,commit=commit,allow_network=allow_network)
+def bundle_build(root: Path,name: str, *, branch=None, commit=None, allow_network=False, jobs=2, log=None, recipe="cmake-cpu", cuda_arch=None) -> dict:
+    plan=bundle_plan(root,name,branch=branch,commit=commit,allow_network=allow_network,recipe=recipe,cuda_arch=cuda_arch)
+    if plan.get("toolchain_issue"): raise RuntimeControlError(plan["toolchain_issue"])
     item=_project(root,name); repo=_assert_safe_path(Path(item["path"]), Path(root), directory=True)
     resolved=_run(["git","rev-parse","--verify","--end-of-options",plan["ref"]+"^{commit}"],cwd=repo).strip()
     if commit and resolved != commit: raise RuntimeControlError("commit does not resolve exactly")
@@ -223,8 +254,12 @@ def bundle_build(root: Path,name: str, *, branch=None, commit=None, allow_networ
               "--ro-bind", str(source), "/tmp/src", "--bind", str(build), "/tmp/build",
               "--chdir", "/tmp/build", "--clearenv"]
     for key, value in sandbox_env.items(): common += ["--setenv", key, value]
-    _run(common + ["cmake", "-S", "/tmp/src", "-B", "/tmp/build", "-DGGML_CUDA=OFF", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"], timeout=1200, log=log)
-    _run(common + ["cmake", "--build", "/tmp/build", "--parallel", str(max(1,min(int(jobs),4)))], timeout=1800, log=log)
+    _run(common + ["cmake", "-S", "/tmp/src", "-B", "/tmp/build", *plan["configure_flags"]], timeout=1200, log=log)
+    _run(common + ["cmake", "--build", "/tmp/build", "--target", "llama-server", "--parallel", str(max(1,min(int(jobs),4)))], timeout=1800, log=log)
+    # Preserve reviewed fixture targets without ever falling back to an arbitrary executable.
+    targets = _run(common + ["cmake", "--build", "/tmp/build", "--target", "help"], timeout=120, log=log)
+    if "network-proof" in targets:
+        _run(common + ["cmake", "--build", "/tmp/build", "--target", "network-proof"], timeout=1800, log=log)
     binaries=sorted(p for p in build.rglob("*") if p.is_file() and os.access(p,os.X_OK) and not p.is_symlink())
     if not binaries: raise RuntimeControlError("recipe produced no executable")
     catalog=root/"bundles"; catalog.mkdir(parents=True,exist_ok=True)
