@@ -3134,10 +3134,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
         wildcard. Only ``/v1`` (the OpenAI surface) is cross-origin-authorized.
         """
         if self._cors_target():
+            # The response varies by Origin (it carries ACAO only when the request
+            # has one), so mark it on *every* /v1 response — including no-Origin
+            # ones — so a shared cache can't serve a no-Origin response to a browser.
+            self.send_header("Vary", "Origin")
             origin = self.headers.get("Origin")
             if origin is not None:
                 self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Vary", "Origin")
                 if self.command == "OPTIONS":
                     self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                     self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
