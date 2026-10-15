@@ -3133,7 +3133,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
         (not the origin), so we mirror the request Origin and never use a
         wildcard. Only ``/v1`` (the OpenAI surface) is cross-origin-authorized.
         """
-        if self._cors_target():
+        # HTTP parser errors can precede initialization of path or headers.
+        if hasattr(self, "path") and hasattr(self, "headers") and self._cors_target():
             # The response varies by Origin (it carries ACAO only when the request
             # has one), so mark it on *every* /v1 response — including no-Origin
             # ones — so a shared cache can't serve a no-Origin response to a browser.
@@ -4035,7 +4036,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "x-request-id",
                 "x-llama-broker-profile",
                 "access-control-allow-origin",
-                "vary",
             }
             for key, value in headers:
                 if key.lower() not in skip:

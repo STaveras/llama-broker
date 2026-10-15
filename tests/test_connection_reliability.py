@@ -221,6 +221,72 @@ def harness(tmp_path, monkeypatch):
         instance.close()
 
 
+@pytest.mark.parametrize(("request_bytes", "status"), [
+    pytest.param(
+        b"GET /v1/models EXTRA HTTP/1.1\r\nHost: fixture\r\n\r\n",
+        400, id="malformed-request-line",
+    ),
+    pytest.param(
+        b"GET /" + b"x" * 65537 + b" HTTP/1.1\r\n\r\n",
+        414, id="oversized-request-line",
+    ),
+    pytest.param(
+        b"GET /v1/models HTTP/1.1\r\nX-Large: " + b"x" * 65537 + b"\r\n\r\n",
+        431, id="oversized-header",
+    ),
+])
+def test_cors_preserves_http_parser_errors(harness, request_bytes, status):
+    h = harness()
+    client = MemorySocket(request_bytes)
+    h.clients.append(client)
+    h.server.process_request(client, ("127.0.0.1", 1))
+    assert h.finished(client).startswith(f"HTTP/1.1 {status} ".encode())
+
+
+@pytest.mark.parametrize("origin", [None, "https://peer.example"])
+@pytest.mark.parametrize(("upstream_vary", "expected_fields"), [
+    pytest.param(
+        [("Vary", "Accept-Language, Origin")], {"accept-language", "origin"},
+        id="combined-fields",
+    ),
+    pytest.param([("Vary", "*")], {"*", "origin"}, id="wildcard"),
+    pytest.param(
+        [("Vary", "Accept-Encoding"), ("vArY", "Accept-Language")],
+        {"accept-encoding", "accept-language", "origin"}, id="multiple-headers",
+    ),
+])
+def test_cors_preserves_upstream_vary(harness, monkeypatch, origin, upstream_vary, expected_fields):
+    h = harness()
+    original = BackendResponse.getheaders
+    monkeypatch.setattr(BackendResponse, "getheaders", lambda self: original(self) + upstream_vary + [
+        ("Access-Control-Allow-Origin", "https://backend.example"),
+    ])
+    body = json.dumps({"model": MAIN}).encode()
+    headers = (
+        "POST /v1/completions HTTP/1.1\r\nHost: fixture\r\n"
+        "Authorization: Bearer fixture-key\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+    )
+    if origin is not None:
+        headers += f"Origin: {origin}\r\n"
+    client = MemorySocket(headers.encode() + b"\r\n" + body)
+    h.clients.append(client)
+    h.server.process_request(client, ("127.0.0.1", 1))
+    response = http.client.HTTPResponse(MemorySocket(h.finished(client)))
+    response.begin()
+    assert response.status == 200
+    fields = {
+        field.strip().lower()
+        for value in response.headers.get_all("Vary", [])
+        for field in value.split(",")
+    }
+    assert fields == expected_fields
+    assert response.headers.get_all("Access-Control-Allow-Origin", []) == (
+        [] if origin is None else [origin]
+    )
+    assert response.read() == b'{"ok":true}'
+
+
 def test_waits_through_temporary_switch_without_taking_a_lease(harness):
     h = harness(workers=2)
     gate = threading.Event()
