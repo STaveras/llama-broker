@@ -3099,6 +3099,51 @@ class BrokerHandler(BaseHTTPRequestHandler):
         )
         return False
 
+    def _cors_target(self) -> bool:
+        """The OpenAI API surface is the only cross-origin-authorized route."""
+        path = urlsplit(self.path).path
+        return path.startswith("/v1/") or path == "/v1"
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        """CORS preflight for browser clients (Ouroboros page on a peer device).
+
+        The real request is a cross-origin POST carrying ``Content-Type:
+        application/json`` + ``Authorization: Bearer <key>``, which forces a
+        preflight. Without this the browser blocks the call before it reaches
+        the model. We answer 204 and the ``end_headers`` override below adds the
+        mirrored ``Access-Control-Allow-Origin`` + allow-list.
+        """
+        if not self._cors_target():
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return
+
+    def end_headers(self) -> None:
+        """Inject CORS for the ``/v1`` OpenAI surface.
+
+        The Ouroboros page runs on a *peer* device's origin and talks to the
+        key-gated broker cross-origin. Its chat call is a ``POST`` with
+        ``Content-Type: application/json`` + ``Authorization: Bearer <key>``,
+        which forces a preflight; without these headers the browser blocks the
+        request before it reaches the model. Access is gated by the Bearer key
+        (not the origin), so we mirror the request Origin and never use a
+        wildcard. Only ``/v1`` (the OpenAI surface) is cross-origin-authorized.
+        """
+        if self._cors_target():
+            origin = self.headers.get("Origin")
+            if origin is not None:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                if self.command == "OPTIONS":
+                    self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                    self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                    self.send_header("Access-Control-Max-Age", "600")
+        super().end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         if not self._admit_control_reserve(path):
@@ -3979,8 +4024,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self._client_write_timeout()
         try:
             self.send_response(status, reason)
+            # The llama.cpp backend already mirrors the request Origin and emits
+            # its own Access-Control-Allow-Origin; we strip it here so the broker
+            # (see end_headers) is the *single* CORS authority. A duplicate ACAO
+            # header is exactly what makes Safari reject a cross-origin response.
+            skip = HOP_BY_HOP_RESPONSE_HEADERS | {
+                "x-request-id",
+                "x-llama-broker-profile",
+                "access-control-allow-origin",
+                "vary",
+            }
             for key, value in headers:
-                if key.lower() not in HOP_BY_HOP_RESPONSE_HEADERS | {"x-request-id", "x-llama-broker-profile"}:
+                if key.lower() not in skip:
                     self.send_header(key, value)
             self.send_header("X-Llama-Broker-Profile", profile.id)
             self.send_header("X-Request-ID", self._request_id())
