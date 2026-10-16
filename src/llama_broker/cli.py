@@ -2247,52 +2247,18 @@ def _model_payload(profile: Profile) -> dict[str, object]:
 
 
 def _cmd_model_list(args: argparse.Namespace) -> int:
-    """List canonical profile references and read-only local artifact bundles."""
+    """List managed on-disk model artifacts; profiles are a separate command."""
 
-    registry = ProfileRegistry.from_path(args.profiles)
-    models = [_model_payload(profile) for profile in registry.profiles]
     bundles = discover_model_bundles(getattr(args, "scan_path", None) or [MODELS_DIR])
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {"schema_version": 1, "object": "model_list", "data": models, "bundles": bundles},
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        # Schema 2 makes ``data`` truthful: entries are artifact bundles, not
+        # profile selectors. Profile references remain available to lifecycle
+        # commands and ``brokerctl profile list``.
+        print(json.dumps({"schema_version": 2, "object": "model_list", "data": bundles}, indent=2, sort_keys=True))
         return 0
-
-    if not models:
-        print("No models configured.")
-        _print_model_bundles(bundles, args)
-        return 0
-
-    rows = [
-        (
-            profile.alias,
-            profile.display_name,
-            profile.runtime,
-            ", ".join(sorted(profile.capabilities)),
-            f"{profile.context_size:,}",
-            profile.parallel,
-        )
-        for profile in registry.profiles
-    ]
-    print(
-        _render_table(
-            (
-                "PROFILE",
-                "MODEL",
-                "RUNTIME",
-                "CAPABILITIES",
-                "CONTEXT",
-                "SLOTS",
-            ),
-            rows,
-            width=_terminal_width(getattr(args, "width", None)),
-        )
-    )
     _print_model_bundles(bundles, args)
+    if not bundles:
+        print("No managed model artifacts found.")
     return 0
 
 

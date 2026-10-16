@@ -228,13 +228,16 @@ python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 
 ## Local model bundle listing
 
-`brokerctl model list` keeps the configured profile table and adds a file tree
-for local models under the XDG models directory (`LLAMA_BROKER_MODELS_DIR`
-overrides). Use `--scan-path DIR` to scan another directory, including a Hugging
-Face cache's `hub` or `snapshots` directory; repeat it to scan several roots.
-Listing only reads directory entries, small config/index files and file sizes.
-It never hashes weights, updates the catalog, imports profiles or contacts a
-backend. The existing profile manifest is still required.
+`brokerctl model list` lists managed on-disk artifacts under the XDG models
+ directory (`LLAMA_BROKER_MODELS_DIR` overrides). Use `--scan-path DIR` to scan
+another directory. It is read-only and does not load or import profiles. Profile
+references remain available through `brokerctl profile list` and lifecycle
+commands.
+
+JSON uses `schema_version: 2`: `data` contains artifact bundles (HF safetensors
+weights plus metadata/index files under one model node, or GGUF files), not
+canonical profile references. Consumers of schema 1 must stop treating `data`
+as load selectors; use profile commands for that purpose.
 
 HF safetensors are grouped at the directory containing a model `config.json`
 (with a nonempty string `model_type` or list of architecture names) or a
@@ -284,7 +287,7 @@ to act on that directory.
 | Command | Purpose |
 | --- | --- |
 | `brokerctl` (bare) | (planned) launches the interactive TUI |
-| `brokerctl model list` | list canonical profile references and local model bundles with their files (`--json` for machine output, `-v` for full bundle paths, repeatable `--scan-path DIR` to override the models directory) |
+| `brokerctl model list` | list managed on-disk model artifacts with their files (`--json` emits schema 2 artifact data, `-v` includes full bundle paths, repeatable `--scan-path DIR` overrides the XDG models directory) |
 | `brokerctl status` | show durable/live backend state (`--json` for schema-versioned JSON) |
 | `brokerctl profile render <model>` | render a profile unit without installing |
 | `brokerctl load <model>` | queue a profile load (`start` is an alias) |

@@ -254,7 +254,7 @@ def test_index_cannot_use_symlinked_directory_from_a_sibling_model(tmp_path):
     assert all(f["role"] != "weight" for f in bundle["files"])
 
 
-def test_cli_json_preserves_profile_selection_and_adds_bundles(tmp_path):
+def test_cli_json_lists_artifacts_and_keeps_profiles_separate(tmp_path):
     profiles = materialize_fixture(tmp_path / "fixture")
     root = tmp_path / "local"
     hf(root)
@@ -263,18 +263,12 @@ def test_cli_json_preserves_profile_selection_and_adds_bundles(tmp_path):
     with redirect_stdout(output), patch.object(cli, "_broker_admin", side_effect=AssertionError("no service control")):
         assert cli.main(["--profiles", str(profiles), "model", "list", "--scan-path", str(root), "--json"]) == 0
     payload = json.loads(output.getvalue())
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["object"] == "model_list"
-    registry = ProfileRegistry.from_path(profiles)
-    assert [item["id"] for item in payload["data"]] == [p.alias for p in registry.profiles]
-    for item in payload["data"]:
-        assert registry.resolve(item["id"]).alias == item["id"]
-        assert set(item) == {"id", "display_name", "runtime", "capabilities", "context_size", "parallel"}
-    bundle, = payload["bundles"]
+    assert "profiles" not in payload
+    bundle, = payload["data"]
     assert Path(bundle["path"]).is_file()
-    with pytest.raises(ProfileError):
-        registry.resolve(bundle["path"])
-    assert profiles.read_bytes() == before
+    assert bundle["bundle_root"] == str(root)
 
     # Exercise the actual load parser/resolver without permitting backend calls.
     for selector in (bundle["path"], bundle["bundle_root"]):
@@ -298,12 +292,12 @@ def test_cli_default_tree_verbose_and_json_members_agree(tmp_path):
             assert cli.main(["--profiles", str(profiles), "model", "list", "--width", "100", *flags]) == 0
         outputs.append(output.getvalue())
     normal, verbose, machine = outputs
-    assert normal.count("local [hf-safetensors, complete]") == 1
+    assert "local [hf-safetensors, complete]" in normal
     assert "├── config.json" in normal
     assert "└── tokenizer_config.json" in normal
     assert str(root) not in normal
     assert str(root) in verbose
-    for member in json.loads(machine)["bundles"][0]["files"]:
+    for member in json.loads(machine)["data"][0]["files"]:
         assert member["relative_path"] in normal
     assert all(len(line) <= 100 for line in normal.splitlines())
 
