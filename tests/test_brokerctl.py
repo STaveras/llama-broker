@@ -39,7 +39,7 @@ class BrokerctlStatusTests(unittest.TestCase):
         ):
             result = brokerctl.main(["model", "list", "--json"])
         self.assertEqual(result, 0)
-        self.assertEqual(json.loads(output.getvalue())["schema_version"], 1)
+        self.assertEqual(json.loads(output.getvalue())["schema_version"], 2)
 
     def test_status_json_has_schema_version(self) -> None:
         controller = Mock()
@@ -1683,16 +1683,11 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         rendered = output.getvalue()
-        self.assertIn("MODEL", rendered)
-        self.assertIn("PROFILE", rendered)
-        self.assertIn("RUNTIME", rendered)
-        self.assertIn("fixture-text-7b", rendered)
-        self.assertIn("fixture-vision-12b", rendered)
-        self.assertIn("llamacpp", rendered)
-        self.assertNotIn("model_path", rendered)
-        self.assertNotIn(tempdir, rendered)
+        self.assertTrue(rendered)
+        self.assertIn("Local model bundles", rendered)
+        self.assertIn("mmproj", rendered)
 
-    def test_model_list_json_advertises_only_canonical_model_ids(self) -> None:
+    def test_model_list_json_advertises_artifact_bundles(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             from tests.fixtures import materialize_fixture  # noqa: PLC0415
 
@@ -1707,10 +1702,11 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["object"], "model_list")
         self.assertTrue(payload["data"])
-        for model in payload["data"]:
-            self.assertIn("id", model)
-            self.assertNotIn("profile", model)
-            self.assertNotIn("aliases", model)
+        for bundle in payload["data"]:
+            self.assertIn("path", bundle)
+            self.assertIn("files", bundle)
+            self.assertIn("format", bundle)
+            self.assertNotIn("id", bundle)
 
     def test_profile_list_reports_total_and_slot_context(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

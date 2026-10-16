@@ -61,6 +61,7 @@ from .broker_profiles import (
     launch_environment,
 )
 from .discovery import discover_backends
+from .model_bundles import discover_model_bundles
 from .profile_config import (
     ApplyError,
     apply_manifest_transaction,
@@ -2249,50 +2250,45 @@ def _model_payload(profile: Profile) -> dict[str, object]:
 
 
 def _cmd_model_list(args: argparse.Namespace) -> int:
-    """List client-facing model references backed by canonical profiles."""
+    """List managed on-disk model artifacts; profiles are a separate command."""
 
-    registry = ProfileRegistry.from_path(args.profiles)
-    models = [_model_payload(profile) for profile in registry.profiles]
+    bundles = discover_model_bundles(getattr(args, "scan_path", None) or [MODELS_DIR])
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {"schema_version": 1, "object": "model_list", "data": models},
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        # Schema 2 makes ``data`` truthful: entries are artifact bundles, not
+        # profile selectors. Profile references remain available to lifecycle
+        # commands and ``brokerctl profile list``.
+        print(json.dumps({"schema_version": 2, "object": "model_list", "data": bundles}, indent=2, sort_keys=True))
         return 0
-
-    if not models:
-        print("No models configured.")
-        return 0
-
-    rows = [
-        (
-            profile.alias,
-            profile.display_name,
-            profile.runtime,
-            ", ".join(sorted(profile.capabilities)),
-            f"{profile.context_size:,}",
-            profile.parallel,
-        )
-        for profile in registry.profiles
-    ]
-    print(
-        _render_table(
-            (
-                "PROFILE",
-                "MODEL",
-                "RUNTIME",
-                "CAPABILITIES",
-                "CONTEXT",
-                "SLOTS",
-            ),
-            rows,
-            width=_terminal_width(getattr(args, "width", None)),
-        )
-    )
+    _print_model_bundles(bundles, args)
+    if not bundles:
+        print("No managed model artifacts found.")
     return 0
+
+
+def _print_model_bundles(bundles: Sequence[Mapping[str, Any]], args: argparse.Namespace) -> None:
+    if not bundles:
+        return
+    width = _terminal_width(getattr(args, "width", None))
+
+    def line(value: str, prefix: str = "", continuation: str = "") -> None:
+        for index, part in enumerate(_wrap_cell(value, max(1, width - len(prefix)))):
+            print((prefix if index == 0 else continuation) + part)
+
+    print()
+    line("Local model bundles (file presence only):")
+    for bundle in bundles:
+        line(f"{bundle['name']} [{bundle['format']}, {bundle['status']}] ({bundle['size']:,} bytes)")
+        if getattr(args, "verbose", False):
+            line(f"root: {bundle['bundle_root']}", "  ", "  ")
+            line(f"file reference: {bundle['path']}", "  ", "  ")
+        children = [f"{item['relative_path']} ({item['size']:,} bytes)" for item in bundle["files"]]
+        children.extend(f"{name} [missing or unfinished]" for name in bundle["missing_files"])
+        for index, child in enumerate(children):
+            last = index == len(children) - 1
+            line(child, "└── " if last else "├── ", "    " if last else "│   ")
+        for issue in bundle["issues"]:
+            line(issue, "  ! ", "    ")
+
 
 def _cmd_profiles_list(args: argparse.Namespace) -> int:
     """List profiles with status."""
@@ -3566,13 +3562,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     model = subparsers.add_parser(
-        "model", help="inspect profile-backed client-facing models"
+        "model", help="inspect profile-backed models and local model bundles"
     )
     model_sub = model.add_subparsers(dest="model_command", required=True)
     model_list = model_sub.add_parser(
-        "list", help="list canonical model references from the profile manifest"
+        "list", help="list canonical profile references and local model bundle files"
     )
     model_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    model_list.add_argument("-v", "--verbose", action="store_true", help="include full bundle roots and file references in the tree")
+    model_list.add_argument("--scan-path", type=Path, action="append", help="scan this local model directory (repeatable; default: models directory)")
     model_list.add_argument(
         "--width",
         type=int,
