@@ -3117,7 +3117,7 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
     # One row per (family, bundle) pair so the table reads:
     # family -> bundle -> the profiles using that bundle. The family cell
     # spans its bundle rows (blanked on continuation rows).
-    rows: list[tuple[str, str, str]] = []
+    rows: list[tuple[str, str, str, str]] = []
     for row in runtime_rows:
         family = str(row["name"])
         family_profiles = [
@@ -3146,6 +3146,10 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
             profiles_by_bundle.setdefault(
                 profile.runtime_build or "(none)", []
             ).append(profile.alias)
+        sources = {
+            str(build["id"]): str(build.get("source_url") or "(unknown)")
+            for build in row["builds"]
+        }
         for bundle in bundles:
             aliases = profiles_by_bundle.get(bundle)
             rows.append(
@@ -3153,19 +3157,20 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
                     family,
                     bundle,
                     ", ".join(aliases) if aliases else "(none)",
+                    sources.get(bundle, "(unknown)"),
                 )
             )
     # Blank the family cell on continuation rows (one family per visual block).
-    rendered: list[tuple[str, str, str]] = []
+    rendered: list[tuple[str, str, str, str]] = []
     last_family: str | None = None
-    for family, bundle, profiles in rows:
+    for family, bundle, profiles, source in rows:
         rendered.append(
-            ("" if family == last_family else family, bundle, profiles)
+            ("" if family == last_family else family, bundle, profiles, source)
         )
         last_family = family
     print(
         _render_table(
-            ("RUNTIME", "BUNDLE", "PROFILES"),
+            ("RUNTIME", "BUNDLE", "PROFILES", "SOURCE URL"),
             rendered,
             width=_terminal_width(getattr(args, "width", None)),
         )
@@ -3184,12 +3189,12 @@ def _cmd_runtime_control(args: argparse.Namespace) -> int:
     else:
         if args.bundle_command == "plan":
             selection = select_source(root, args.name) if args.select else {}
-            result = bundle_plan(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network, recipe=args.recipe, cuda_arch=args.cuda_arch)
+            result = bundle_plan(root, args.name, branch=args.branch, commit=args.commit or selection.get("commit"), allow_network=args.allow_network, recipe=args.recipe, cuda_arch=args.cuda_arch)
         elif args.bundle_command == "build":
             if args.select and not args.build:
                 raise RuntimeControlError("--select only chooses a source; add --build to execute")
             selection = select_source(root, args.name) if args.select else {}
-            result = bundle_build(root, args.name, branch=args.branch or selection.get("branch"), commit=args.commit or selection.get("commit"), allow_network=args.allow_network, jobs=args.jobs, recipe=args.recipe, cuda_arch=args.cuda_arch)
+            result = bundle_build(root, args.name, branch=args.branch, commit=args.commit or selection.get("commit"), allow_network=args.allow_network, jobs=args.jobs, recipe=args.recipe, cuda_arch=args.cuda_arch)
         elif args.bundle_command == "list":
             manifests = bundle_list(root)
             if getattr(args, "json", False): result = manifests
@@ -3724,7 +3729,7 @@ def build_parser() -> argparse.ArgumentParser:
     pf = project_sub.add_parser("fetch"); pf.add_argument("name")
     pb = project_sub.add_parser("branches"); pb.add_argument("name")
     pc = project_sub.add_parser("commits"); pc.add_argument("name"); pc.add_argument("--ref")
-    bundle = runtime_sub.add_parser("bundle", help="plan, build, list, or verify immutable CPU bundles")
+    bundle = runtime_sub.add_parser("bundle", help="plan, build, list, or verify staged CPU/CUDA bundles")
     bundle_sub = bundle.add_subparsers(dest="bundle_command", required=True)
     for command in ("plan", "build"):
         bp = bundle_sub.add_parser(command); bp.add_argument("name"); bp.add_argument("--branch"); bp.add_argument("--commit"); bp.add_argument("--recipe", choices=("cmake-cpu", "cmake-cuda"), default="cmake-cpu"); bp.add_argument("--cuda-arch"); bp.add_argument("--select", action="store_true", help="interactively select branch and commit (TTY only)"); bp.add_argument("--allow-network", action="store_true")
