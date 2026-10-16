@@ -226,12 +226,65 @@ For TLS on a LAN:
 python3 brokerctl.py security init --ip <lan-ip> --hostname <lan-hostname>
 ```
 
+## Local model bundle listing
+
+`brokerctl model list` keeps the configured profile table and adds a file tree
+for local models under the XDG models directory (`LLAMA_BROKER_MODELS_DIR`
+overrides). Use `--scan-path DIR` to scan another directory, including a Hugging
+Face cache's `hub` or `snapshots` directory; repeat it to scan several roots.
+Listing only reads directory entries, small config/index files and file sizes.
+It never hashes weights, updates the catalog, imports profiles or contacts a
+backend. The existing profile manifest is still required.
+
+HF safetensors are grouped at the directory containing a model `config.json`
+(with a nonempty string `model_type` or list of architecture names) or a
+`*.safetensors.index.json`. An index defines the weight membership, including
+relative paths into weight subdirectories. Without an index, each unsharded
+weight or conventional `-00001-of-00002.safetensors` set is a separate bundle.
+Known sidecars in that root (config, generation/processor/quantization config,
+tokenizer, vocab/merges, chat templates, README and license files) appear as
+children. Arbitrary files and metadata subdirectories are not inferred as members.
+Nested model roots, different indexes, unindexed weight variants and independent
+GGUFs remain separate. Conventional split GGUFs retain their own shard grouping.
+
+HF cache snapshots retain their semantic filenames rather than blob hashes.
+Different snapshots are separate bundles, even if they share blobs. Overlapping
+scan roots and directory symlink aliases are deduplicated; symlink cycles, hidden
+directories, cache `blobs`/`refs`, and partial download names are excluded.
+Files have deterministic root-relative paths. Each bundle's byte total counts
+each physical `(device, inode)` once, including sidecars: symlinks and hard links
+do not inflate it, but byte-identical separate files do. Shared bytes can be
+counted again in another logical bundle, so adding bundle totals does not give
+unique disk usage for the whole store.
+
+`complete` means the enumerated weight files are readable and nonempty.
+`incomplete` means a shard is missing/empty/unfinished, or an index is unreadable,
+malformed, empty, unsafe, or claims another model's files. Partial artifacts and
+broken symlinks are omitted from children; missing members and index issues are
+reported explicitly. Neither status asserts integrity, tokenizer validity,
+runtime compatibility or serving readiness. In particular, a renamed but still
+growing final weight file cannot be detected without download coordination.
+
+The normal tree includes every member and its size; `--verbose` (`-v`) adds full
+bundle roots and file references. `--width` wraps human output. `--json` always
+includes full paths and all members, independent of verbosity. Its schema-1
+`object: "model_list"` and canonical `data` profile records remain unchanged;
+the additive `bundles` array contains `name`, `path`, `bundle_root`, `format`,
+`status`, `files` (`path`, `relative_path`, `role`, `size`), `size`, `size_policy`,
+`missing_files` and `issues`. `size_policy` is `unique-inode-per-bundle`.
+`path` is a representative present weight file (or the index/expected file for
+an incomplete bundle); `bundle_root` is display metadata. Bundles do not create
+loadable IDs. Continue selecting `data[].id` for `load`, and use explicit file
+paths for existing setup/import operations. Listing does not change import,
+load or cleanup/delete targets; no operation treats a bundle root as permission
+to act on that directory.
+
 ## CLI reference
 
 | Command | Purpose |
 | --- | --- |
 | `brokerctl` (bare) | (planned) launches the interactive TUI |
-| `brokerctl model list` | list client-facing model references from canonical profiles (`--json` for a schema-versioned report) |
+| `brokerctl model list` | list canonical profile references and local model bundles with their files (`--json` for machine output, `-v` for full bundle paths, repeatable `--scan-path DIR` to override the models directory) |
 | `brokerctl status` | show durable/live backend state (`--json` for schema-versioned JSON) |
 | `brokerctl profile render <model>` | render a profile unit without installing |
 | `brokerctl load <model>` | queue a profile load (`start` is an alias) |
