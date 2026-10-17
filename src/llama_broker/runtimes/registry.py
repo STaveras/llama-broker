@@ -12,6 +12,7 @@ from typing import Any, Mapping, Protocol, Sequence
 from .llamacpp import LlamaCppRuntime
 from .strata import StrataRuntime
 from .vllm import VllmRuntime
+from .basalt import BasaltRuntime
 
 
 class RuntimeError(ValueError):
@@ -163,6 +164,9 @@ _STRATA_FIELDS = frozenset(
 _LLAMACPP = LlamaCppRuntime()
 _VLLM = VllmRuntime()
 _STRATA = StrataRuntime()
+_BASALT = BasaltRuntime()
+
+_BASALT_FIELDS = _BASE_FIELDS | frozenset({"basalt_config_path", "context_size", "parallel"})
 
 RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
     "llamacpp": RuntimeInfo(
@@ -182,9 +186,16 @@ RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
     "strata": RuntimeInfo(
         name="strata",
         binaries=("strata-server",),
-        capabilities=("text",),
+        capabilities=_STRATA.capabilities,
         editable_fields=_STRATA_FIELDS,
         adapter=_STRATA,
+    ),
+    "basalt": RuntimeInfo(
+        name="basalt",
+        binaries=("basalt",),
+        capabilities=_BASALT.capabilities,
+        editable_fields=_BASALT_FIELDS,
+        adapter=_BASALT,
     ),
 }
 
