@@ -9,6 +9,8 @@ import os
 import ssl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+from pathlib import Path
+from .broker_security import read_api_keys
 
 _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 _STRIP = {"authorization", "x-api-key", "x-basalt-bridge-token"}
@@ -21,16 +23,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
     upstream_port = 0
     upstream_path = ""
     bridge_token = ""
+    bridge_tokens = ()
     upstream_token = ""
 
     def _authorized(self) -> bool:
         supplied = self.headers.get("X-Basalt-Bridge-Token", "")
         authorization = self.headers.get("Authorization", "")
         bearer = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
-        return bool(self.bridge_token) and (
-            hmac.compare_digest(supplied, self.bridge_token)
-            or hmac.compare_digest(bearer, self.bridge_token)
-        )
+        matches = [hmac.compare_digest(supplied, token) | hmac.compare_digest(bearer, token)
+                   for token in (self.bridge_tokens or ((self.bridge_token,) if self.bridge_token else ()))]
+        return any(matches)
 
     def _reject(self, status: int, message: str) -> None:
         body = message.encode()
@@ -133,9 +135,8 @@ def main(argv=None) -> int:
         host, port = _loopback(args.upstream_url)
         if args.max_body_bytes < 0 or args.port < 0 or args.port > 65535:
             raise ValueError("invalid size or port")
-        with open(args.auth_token_file, encoding="utf-8") as token_file:
-            token = token_file.read().strip()
-        if not token:
+        tokens = read_api_keys(Path(args.auth_token_file))
+        if not tokens:
             raise ValueError("auth token file is empty")
         upstream_token = ""
         if args.upstream_token_file:
@@ -147,7 +148,8 @@ def main(argv=None) -> int:
         context.load_cert_chain(args.cert, args.key)
         server = BridgeServer((args.host, args.port), BridgeHandler)
         BridgeHandler.upstream_host, BridgeHandler.upstream_port = host, port
-        BridgeHandler.bridge_token = token
+        BridgeHandler.bridge_tokens = tuple(tokens)
+        BridgeHandler.bridge_token = ""
         BridgeHandler.upstream_token = upstream_token
         BridgeHandler.max_body_bytes = args.max_body_bytes
         server.socket = context.wrap_socket(server.socket, server_side=True)

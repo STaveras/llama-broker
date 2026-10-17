@@ -46,11 +46,16 @@ class LauncherTests(unittest.TestCase):
    except OSError: pass
    time.sleep(.05)
   self.assertTrue(ready); self.assertEqual(json.loads(data),{'ok':True})
+  if 'second-key' in (self.p/'token').read_text():
+   c=http.client.HTTPSConnection('127.0.0.1',self.port,context=self.context,timeout=1); c.request('GET','/health',headers={'Authorization':'Bearer second-key'}); r=c.getresponse(); self.assertEqual(r.status,200); r.read(); c.close()
   info=json.loads(self.marker.read_text()); c=http.client.HTTPConnection('127.0.0.1',info['port'],timeout=1); c.request('GET','/health',headers={'Authorization':'Bearer public-test-token'}); r=c.getresponse(); self.assertEqual(r.status,401); r.read(); c.close()
   c=http.client.HTTPSConnection('127.0.0.1',self.port,context=self.context,timeout=1); c.request('GET','/health'); r=c.getresponse(); self.assertEqual(r.status,401); r.read(); c.close()
   proc.terminate(); self.assertEqual(proc.wait(timeout=8),0)
   with self.assertRaises(ProcessLookupError): os.kill(info['pid'],0)
   with self.assertRaises(OSError): socket.create_connection(('127.0.0.1',self.port),timeout=.2)
+ def test_multiple_backend_keys(self):
+  (self.p/'token').write_text('# rotation keys\npublic-test-token\n\nsecond-key\n')
+  self.test_real_tls_auth_private_listener_and_cleanup()
  def test_invalid_tls_never_spawns_native_child(self):
   proc=self.launch(self.p/'missing-cert'); self.assertNotEqual(proc.wait(timeout=5),0); self.assertFalse(self.marker.exists())
  def test_early_native_exit_is_detected_and_bounded(self):
