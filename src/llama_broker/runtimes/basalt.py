@@ -5,6 +5,7 @@ source tree through the immutable bundle's basalt launcher; no model conversion
 or download is performed here.
 """
 from __future__ import annotations
+import sys
 from typing import Any, Sequence
 
 
@@ -23,7 +24,7 @@ class BasaltRuntime:
     name = "basalt"
     binaries = ("basalt",)
     capabilities = ("text", "tools", "streaming")
-    editable_fields = frozenset()
+    editable_fields = frozenset({"basalt_config_path", "basalt_config_sha256"})
 
     def sync_capability_edit(self, draft, extra_args, capabilities):
         unsupported = set(capabilities) - set(self.capabilities)
@@ -42,7 +43,10 @@ class BasaltRuntime:
         return tuple(args)
 
     def build_command(self, profile: Any, *, host: str, port: int, managed_args: Sequence[str] = ()) -> tuple[str, ...]:
-        return (str(profile.server_binary), *self.build_args(profile, host=host, port=port, managed_args=managed_args))
+        # The wrapper owns the private native listener and the public TLS bridge.
+        if not hasattr(profile, "basalt_config_sha256"):
+            return (str(profile.server_binary), *self.build_args(profile, host=host, port=port, managed_args=managed_args))
+        return (sys.executable, "-m", "llama_broker.basalt_launcher", "--basalt-binary", str(profile.server_binary), "--config", str(profile.basalt_config_path), "--bridge-port", str(port), *tuple(managed_args))
 
 
 __all__ = ["BasaltRuntime"]

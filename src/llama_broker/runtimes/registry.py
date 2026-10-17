@@ -166,7 +166,7 @@ _VLLM = VllmRuntime()
 _STRATA = StrataRuntime()
 _BASALT = BasaltRuntime()
 
-_BASALT_FIELDS = _BASE_FIELDS | frozenset({"basalt_config_path", "context_size", "parallel"})
+_BASALT_FIELDS = _BASE_FIELDS | frozenset({"basalt_config_path", "basalt_config_sha256", "context_size", "parallel"})
 
 RUNTIME_REGISTRY: Mapping[str, RuntimeInfo] = {
     "llamacpp": RuntimeInfo(

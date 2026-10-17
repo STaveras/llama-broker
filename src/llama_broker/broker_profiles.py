@@ -625,6 +625,8 @@ class Profile:
     strata_engine_binary: Path | None = None
     strata_engine_sha256: str | None = None
     strata_model_name: str | None = None
+    basalt_config_path: Path | None = None
+    basalt_config_sha256: str | None = None
 
     @property
     def backend_model_name(self) -> str:
@@ -1619,6 +1621,24 @@ def _parse_profile(
         allow_missing=allow_missing_artifacts,
     )
     model_sha256 = _sha256(record, "model_sha256")
+    basalt_config_path: Path | None = None
+    basalt_config_sha256: str | None = None
+    if runtime == "basalt":
+        basalt_config_path = _absolute_existing_path(record, "basalt_config_path", allow_missing=allow_missing_artifacts)
+        basalt_config_sha256 = _sha256(record, "basalt_config_sha256")
+        if model_path.suffix.lower() != ".basalt" or model_path.is_symlink():
+            raise ProfileError(f"Basalt model_path must be a regular .basalt file for {profile_id!r}")
+        if not allow_missing_artifacts:
+            if model_path.stat().st_size == 0 or model_path.read_bytes()[:4] == b"GGUF":
+                raise ProfileError(f"Basalt model_path is not a native Basalt artifact for {profile_id!r}")
+            if hashlib.sha256(basalt_config_path.read_bytes()).hexdigest() != basalt_config_sha256:
+                raise ProfileError(f"Basalt config hash mismatch for {profile_id!r}")
+        try:
+            config = json.loads(basalt_config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ProfileError(f"cannot read Basalt config for {profile_id!r}: {error}") from error
+        if not isinstance(config, dict) or config.get("model_path") not in {None, str(model_path)}:
+            raise ProfileError(f"Basalt config model_path must be pinned to profile model for {profile_id!r}")
     mmproj_path: Path | None = None
     mmproj_sha256: str | None = None
     if record.get("mmproj_path"):
@@ -2119,4 +2139,6 @@ def _parse_profile(
         strata_engine_binary=strata_metadata.get("engine_binary"),
         strata_engine_sha256=strata_metadata.get("engine_sha256"),
         strata_model_name=strata_metadata.get("model_name"),
+        basalt_config_path=basalt_config_path,
+        basalt_config_sha256=basalt_config_sha256,
     )

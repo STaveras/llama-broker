@@ -23,8 +23,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
     bridge_token = ""
 
     def _authorized(self) -> bool:
-        return bool(self.bridge_token) and hmac.compare_digest(
-            self.headers.get("X-Basalt-Bridge-Token", ""), self.bridge_token
+        supplied = self.headers.get("X-Basalt-Bridge-Token", "")
+        authorization = self.headers.get("Authorization", "")
+        bearer = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+        return bool(self.bridge_token) and (
+            hmac.compare_digest(supplied, self.bridge_token)
+            or hmac.compare_digest(bearer, self.bridge_token)
         )
 
     def _reject(self, status: int, message: str) -> None:
