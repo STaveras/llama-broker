@@ -212,6 +212,18 @@ class BackendControllerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_render_unit_emits_optional_memory_high(self) -> None:
+        profile = replace(self.main, safety=replace(
+            self.main.safety,
+            service=replace(self.main.safety.service, memory_high_mib=18_432),
+        ))
+        self.controller.profiles[profile.id] = profile
+        rendered = self.controller.render_unit(profile.id)
+        self.assertIn("MemoryHigh=18432M", rendered)
+
+    def test_render_unit_omits_absent_memory_high(self) -> None:
+        self.assertNotIn("MemoryHigh=", self.controller.render_unit(self.main.id))
+
     def read_state(self) -> dict:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 

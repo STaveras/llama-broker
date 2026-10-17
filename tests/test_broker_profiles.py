@@ -239,6 +239,27 @@ class ProfileRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ProfileError, "memory_swap_max_mib"):
             ProfileRegistry.from_path(self._write([profile]))
 
+    def test_optional_memory_high_must_be_positive_and_within_memory_max(self) -> None:
+        for value in (0, -1, 20_481):
+            with self.subTest(value=value):
+                profile = self._profile("main", "main-27b", self.main_model)
+                safety = dict(profile["safety"])  # type: ignore[arg-type]
+                service = dict(safety["service"])  # type: ignore[arg-type]
+                service["memory_high_mib"] = value
+                safety["service"] = service
+                profile["safety"] = safety
+                with self.assertRaises(ProfileError):
+                    ProfileRegistry.from_path(self._write([profile]))
+
+        profile = self._profile("main", "main-27b", self.main_model)
+        safety = dict(profile["safety"])  # type: ignore[arg-type]
+        service = dict(safety["service"])  # type: ignore[arg-type]
+        service["memory_high_mib"] = 18_432
+        safety["service"] = service
+        profile["safety"] = safety
+        parsed = ProfileRegistry.from_path(self._write([profile])).get("main")
+        self.assertEqual(parsed.safety.service.memory_high_mib, 18_432)
+
     def test_service_tasks_budget_has_a_fail_closed_upper_bound(self) -> None:
         profile = self._profile("main", "main-27b", self.main_model)
         safety = dict(profile["safety"])  # type: ignore[arg-type]

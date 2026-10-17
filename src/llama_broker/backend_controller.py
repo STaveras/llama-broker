@@ -844,6 +844,7 @@ class BackendController:
             "[Service]",
             f"Type={service.service_type}",
             f"MemoryMax={service.memory_max_mib}M",
+            *([f"MemoryHigh={service.memory_high_mib}M"] if service.memory_high_mib is not None else []),
             f"MemorySwapMax={service.memory_swap_max_mib}M",
             f"TasksMax={service.tasks_max}",
             f"KillSignal={service.kill_signal}",

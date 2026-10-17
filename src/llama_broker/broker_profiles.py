@@ -404,6 +404,7 @@ class ServiceSafetyBudget:
     tasks_max: int
     kill_signal: str
     timeout_stop_sec: int
+    memory_high_mib: int | None = None
 
 
 @dataclass(frozen=True)
@@ -457,7 +458,15 @@ def _parse_safety(record: Mapping[str, Any], profile_id: str, *, runtime: str) -
         tasks_max=_positive_int(raw_service, "tasks_max"),
         kill_signal=kill_signal,
         timeout_stop_sec=_positive_int(raw_service, "timeout_stop_sec"),
+        memory_high_mib=(
+            _positive_int(raw_service, "memory_high_mib")
+            if "memory_high_mib" in raw_service else None
+        ),
     )
+    if service.memory_high_mib is not None and service.memory_high_mib > service.memory_max_mib:
+        raise ProfileError(
+            f"safety.service.memory_high_mib cannot exceed memory_max_mib for {profile_id!r}"
+        )
     if service.memory_swap_max_mib > service.memory_max_mib:
         raise ProfileError(
             f"safety.service.memory_swap_max_mib cannot exceed memory_max_mib "
@@ -1629,7 +1638,11 @@ def _parse_profile(
         if model_path.suffix.lower() != ".basalt" or model_path.is_symlink():
             raise ProfileError(f"Basalt model_path must be a regular .basalt file for {profile_id!r}")
         if not allow_missing_artifacts:
-            if model_path.stat().st_size < 8 or model_path.read_bytes()[:6] != b"BASALT":
+            if model_path.stat().st_size < 8:
+                raise ProfileError(f"Basalt model_path is not a native Basalt artifact for {profile_id!r}")
+            with model_path.open("rb") as model_file:
+                magic = model_file.read(6)
+            if magic != b"BASALT":
                 raise ProfileError(f"Basalt model_path is not a native Basalt artifact for {profile_id!r}")
             if hashlib.sha256(basalt_config_path.read_bytes()).hexdigest() != basalt_config_sha256:
                 raise ProfileError(f"Basalt config hash mismatch for {profile_id!r}")
@@ -1896,7 +1909,7 @@ def _parse_profile(
 
         tool_call_parser = optional_text("tool_call_parser")
         tool_parser_plugin = optional_text("tool_parser_plugin")
-        if "tools" in capabilities and not tool_call_parser:
+        if runtime == "vllm" and "tools" in capabilities and not tool_call_parser:
             raise ProfileError(
                 f"vllm tools profile {profile_id!r} requires tool_call_parser"
             )
