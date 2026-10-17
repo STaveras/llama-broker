@@ -21,6 +21,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     upstream_port = 0
     upstream_path = ""
     bridge_token = ""
+    upstream_token = ""
 
     def _authorized(self) -> bool:
         supplied = self.headers.get("X-Basalt-Bridge-Token", "")
@@ -66,6 +67,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if k.lower() not in _HOP and k.lower() not in _STRIP and k.lower() not in nominated
         }
         headers["Host"] = f"{self.upstream_host}:{self.upstream_port}"
+        if self.upstream_token:
+            headers["Authorization"] = f"Bearer {self.upstream_token}"
         conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=30)
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
@@ -121,6 +124,7 @@ def main(argv=None) -> int:
     parser.add_argument("--key", required=True)
     parser.add_argument("--auth-token-file", required=True)
     parser.add_argument("--upstream-url", required=True)
+    parser.add_argument("--upstream-token-file")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--max-body-bytes", type=int, default=8 * 1024 * 1024)
@@ -133,11 +137,18 @@ def main(argv=None) -> int:
             token = token_file.read().strip()
         if not token:
             raise ValueError("auth token file is empty")
+        upstream_token = ""
+        if args.upstream_token_file:
+            with open(args.upstream_token_file, encoding="utf-8") as token_file:
+                upstream_token = token_file.read().strip()
+            if not upstream_token:
+                raise ValueError("upstream token file is empty")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(args.cert, args.key)
         server = BridgeServer((args.host, args.port), BridgeHandler)
         BridgeHandler.upstream_host, BridgeHandler.upstream_port = host, port
         BridgeHandler.bridge_token = token
+        BridgeHandler.upstream_token = upstream_token
         BridgeHandler.max_body_bytes = args.max_body_bytes
         server.socket = context.wrap_socket(server.socket, server_side=True)
     except (OSError, ValueError, ssl.SSLError) as exc:

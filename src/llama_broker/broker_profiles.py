@@ -1629,7 +1629,7 @@ def _parse_profile(
         if model_path.suffix.lower() != ".basalt" or model_path.is_symlink():
             raise ProfileError(f"Basalt model_path must be a regular .basalt file for {profile_id!r}")
         if not allow_missing_artifacts:
-            if model_path.stat().st_size == 0 or model_path.read_bytes()[:4] == b"GGUF":
+            if model_path.stat().st_size < 8 or model_path.read_bytes()[:6] != b"BASALT":
                 raise ProfileError(f"Basalt model_path is not a native Basalt artifact for {profile_id!r}")
             if hashlib.sha256(basalt_config_path.read_bytes()).hexdigest() != basalt_config_sha256:
                 raise ProfileError(f"Basalt config hash mismatch for {profile_id!r}")
@@ -1637,8 +1637,11 @@ def _parse_profile(
             config = json.loads(basalt_config_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ProfileError(f"cannot read Basalt config for {profile_id!r}: {error}") from error
-        if not isinstance(config, dict) or config.get("model_path") not in {None, str(model_path)}:
-            raise ProfileError(f"Basalt config model_path must be pinned to profile model for {profile_id!r}")
+        if not isinstance(config, dict):
+            raise ProfileError(f"Basalt config must be an object for {profile_id!r}")
+        server = config.get("server")
+        if not isinstance(server, dict) or server.get("model") != str(model_path):
+            raise ProfileError(f"Basalt config server.model must be pinned to profile model for {profile_id!r}")
     mmproj_path: Path | None = None
     mmproj_sha256: str | None = None
     if record.get("mmproj_path"):

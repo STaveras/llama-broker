@@ -49,6 +49,8 @@ SIMPLE_FIELDS: tuple[str, ...] = (
     "flash_attention",
     "gpu_layers",
     "mmproj_path",
+    "basalt_config_path",
+    "basalt_config_sha256",
 )
 
 ADVANCED_FIELDS: tuple[str, ...] = (
@@ -76,6 +78,8 @@ ADVANCED_FIELDS: tuple[str, ...] = (
     "extra_args",
     "model_draft",
     "model_draft_sha256",
+    "basalt_config_path",
+    "basalt_config_sha256",
 )
 
 _GGUF_TYPES = {
