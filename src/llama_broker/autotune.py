@@ -403,7 +403,11 @@ class HttpCandidateSession:
         }
         if tools is not None:
             payload["tools"] = tools
-            payload["response_format"] = {"type": "json_object"}
+            # Do not force a JSON grammar alongside tools. This runtime build
+            # (llamAmpere v0.5.4) cannot parse a combined tools + json_object
+            # grammar and rejects the request with "failed to parse grammar".
+            # The tools prompt already requests a JSON tool_calls response, and
+            # the harness measures throughput/latency, not response shape.
         return payload
 
     @staticmethod
