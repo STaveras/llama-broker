@@ -34,11 +34,9 @@ class BasaltRuntime:
     def build_args(self, profile: Any, *, host: str, port: int, managed_args: Sequence[str] = ()) -> tuple[str, ...]:
         del host
         config = getattr(profile, "basalt_config_path", None)
-        model = getattr(profile, "model_path", None)
-        if config is None and model is None:
-            raise ValueError("Basalt profile requires basalt_config_path or model_path")
-        target = config or model
-        args = ["serve", "--config", str(target)] if config is not None else ["serve", str(target)]
+        if config is None:
+            raise ValueError("Basalt profile requires a pinned basalt_config_path")
+        args = ["serve", "--config", str(config)]
         args += ["--host", "127.0.0.1", "--port", str(port)]
         args.extend(_without_endpoint_args(managed_args))
         return tuple(args)

@@ -279,8 +279,13 @@ def effective_backend_url(security: SecurityConfig | None = None) -> str:
 
 
 def backend_url_for_runtime(backend_url: str, runtime: str) -> str:
-    """Use plain HTTP only for audited loopback-only native backend listeners."""
-    if str(runtime).strip().lower() not in {"strata", "basalt"}:
+    """Return the configured secured transport without silently downgrading it."""
+    if str(runtime).strip().lower() == "basalt":
+        parts = urlsplit(backend_url)
+        if parts.scheme.lower() != "https":
+            raise SecurityError("basalt backend transport requires HTTPS")
+        return backend_url
+    if str(runtime).strip().lower() != "strata":
         return backend_url
     parts = urlsplit(backend_url)
     host = (parts.hostname or "").strip().lower()
@@ -289,7 +294,7 @@ def backend_url_for_runtime(backend_url: str, runtime: str) -> str:
     except ValueError:
         loopback = host == "localhost"
     if not loopback:
-        raise SecurityError(f"{runtime} backend transport requires a loopback endpoint")
+        raise SecurityError("strata backend transport requires a loopback endpoint")
     return parts._replace(scheme="http").geturl()
 
 
