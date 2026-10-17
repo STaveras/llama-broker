@@ -1,0 +1,5 @@
+[Service]
+RuntimeMaxSec=1500
+# Do not invoke systemctl restart on llama-broker.service from its own ExecStopPost.
+# Dispatch only to the independent recovery unit; it must be installed and gated first.
+ExecStopPost=/path/to/repository/tools/basalt_production_rollback.py --state /var/lib/llama-broker/basalt-production --recovery-unit llama-broker-recovery.service

@@ -1,0 +1,7 @@
+[Unit]
+Description=Independent bounded Basalt rollback recovery
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 /path/to/repository/tools/basalt_recovery_apply.py
+TimeoutStartSec=120

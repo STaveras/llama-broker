@@ -2893,7 +2893,20 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.assertNotIn("reasoning_budget_tokens", rewritten)
 
-    def test_route_payload_uses_active_profile_when_model_is_absent(self) -> None:
+    def test_route_payload_uses_basalt_native_model_name(self) -> None:
+        class NativeProfile:
+            id = "basalt"
+            alias = "basalt-example"
+            aliases = ()
+            backend_model_name = "native-example"
+        native = NativeProfile()
+        class Registry:
+            def try_resolve(self, value): return native if value == native.alias else None
+            def get(self, value): return native
+        resolved, payload = route_payload(Registry(), {}, active_profile="basalt")
+        self.assertIs(resolved, native)
+        self.assertEqual(payload["model"], native.backend_model_name)
+
         profile, payload = route_payload(
             self.registry_fixture(), {}, active_profile="main"
         )

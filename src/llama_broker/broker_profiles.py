@@ -636,11 +636,12 @@ class Profile:
     strata_model_name: str | None = None
     basalt_config_path: Path | None = None
     basalt_config_sha256: str | None = None
+    basalt_model_name: str | None = None
 
     @property
     def backend_model_name(self) -> str:
         """Return the backend's model identifier behind the public profile alias."""
-        return self.strata_model_name or self.alias
+        return self.strata_model_name or self.basalt_model_name or self.alias
 
     @property
     def is_transient(self) -> bool:
@@ -1632,6 +1633,7 @@ def _parse_profile(
     model_sha256 = _sha256(record, "model_sha256")
     basalt_config_path: Path | None = None
     basalt_config_sha256: str | None = None
+    basalt_model_name: str | None = None
     if runtime == "basalt":
         basalt_config_path = _absolute_existing_path(record, "basalt_config_path", allow_missing=allow_missing_artifacts)
         basalt_config_sha256 = _sha256(record, "basalt_config_sha256")
@@ -1655,6 +1657,9 @@ def _parse_profile(
         server = config.get("server")
         if not isinstance(server, dict) or server.get("model") != str(model_path):
             raise ProfileError(f"Basalt config server.model must be pinned to profile model for {profile_id!r}")
+        basalt_model_name = server.get("alias", alias)
+        if not isinstance(basalt_model_name, str) or not basalt_model_name.strip():
+            raise ProfileError(f"Basalt config server.alias must be a non-empty native model name for {profile_id!r}")
     mmproj_path: Path | None = None
     mmproj_sha256: str | None = None
     if record.get("mmproj_path"):
@@ -2157,4 +2162,5 @@ def _parse_profile(
         strata_model_name=strata_metadata.get("model_name"),
         basalt_config_path=basalt_config_path,
         basalt_config_sha256=basalt_config_sha256,
+        basalt_model_name=basalt_model_name,
     )
