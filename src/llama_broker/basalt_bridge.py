@@ -71,7 +71,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         headers["Host"] = f"{self.upstream_host}:{self.upstream_port}"
         if self.upstream_token:
             headers["Authorization"] = f"Bearer {self.upstream_token}"
-        conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=30)
+        conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=300)
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
             response = conn.getresponse()
