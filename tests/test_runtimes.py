@@ -89,9 +89,9 @@ class RuntimeDispatchTests(unittest.TestCase):
         return path
 
     def test_registry_lists_only_supported_runtimes(self) -> None:
-        self.assertEqual(runtime_names(), ("llamacpp", "vllm", "strata"))
+        self.assertEqual(runtime_names(), ("llamacpp", "vllm", "strata", "basalt"))
         runtimes = {runtime.name: runtime for runtime in list_runtimes()}
-        self.assertEqual(set(runtimes), {"llamacpp", "vllm", "strata"})
+        self.assertEqual(set(runtimes), {"llamacpp", "vllm", "strata", "basalt"})
         self.assertIn("llama-server", runtimes["llamacpp"].binaries)
         self.assertIn("vllm", runtimes["vllm"].binaries)
         self.assertEqual(runtimes["strata"].capabilities, ("text",))

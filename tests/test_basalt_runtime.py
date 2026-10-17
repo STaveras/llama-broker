@@ -12,7 +12,7 @@ def test_basalt_is_explicit_runtime_and_builds_loopback_server_command():
     )
 
 
-def test_basalt_backend_downgrades_tls_only_on_loopback():
-    assert backend_url_for_runtime("https://127.0.0.1:10001", "basalt") == "http://127.0.0.1:10001"
-    with pytest.raises(Exception, match="loopback"):
-        backend_url_for_runtime("https://203.0.113.5:10001", "basalt")
+def test_basalt_backend_never_downgrades_tls():
+    assert backend_url_for_runtime("https://127.0.0.1:10001", "basalt") == "https://127.0.0.1:10001"
+    with pytest.raises(Exception, match="HTTPS"):
+        backend_url_for_runtime("http://127.0.0.1:10001", "basalt")
