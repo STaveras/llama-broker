@@ -42,6 +42,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return self._reject(401, "invalid bridge credentials")
         if self.command not in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
             return self._reject(405, "method not allowed")
+        if self.headers.get_all("Transfer-Encoding", []):
+            return self._reject(400, "transfer encoding is unsupported")
         lengths = self.headers.get_all("Content-Length", [])
         if len(lengths) != len(set(lengths)) or len(lengths) > 1:
             return self._reject(400, "duplicate content length")
@@ -54,9 +56,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if size > self.max_body_bytes:
             return self._reject(413, "request body too large")
         body = self.rfile.read(size) if size else None
+        nominated = {x.strip().lower() for value in self.headers.get_all('Connection', []) for x in value.split(',')}
         headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() not in _HOP and k.lower() not in _STRIP
+            if k.lower() not in _HOP and k.lower() not in _STRIP and k.lower() not in nominated
         }
         headers["Host"] = f"{self.upstream_host}:{self.upstream_port}"
         conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=30)
@@ -67,9 +70,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             for key, value in response.getheaders():
                 if key.lower() not in _HOP:
                     self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.close_connection = True
             self.end_headers()
             while True:
-                chunk = response.read(8192)
+                chunk = response.read1(8192)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
