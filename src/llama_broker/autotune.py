@@ -434,6 +434,12 @@ class HttpCandidateSession:
                 raw_content = message.get("content", choices[0].get("text", ""))
                 if isinstance(raw_content, str):
                     content = raw_content
+                # Reasoning models (e.g. Qwen3) emit every token in
+                # ``reasoning_content`` and leave ``content`` empty. The engine
+                # still decodes those tokens, so count them as generated output.
+                raw_reasoning = message.get("reasoning_content")
+                if isinstance(raw_reasoning, str):
+                    content = (content + " " + raw_reasoning).strip() if content else raw_reasoning
         tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
         tokens = self._token_count(tokens) or self._token_count(content)
         if not choices or tokens <= 0:
@@ -461,8 +467,17 @@ class HttpCandidateSession:
                     choices = payload.get("choices")
                     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
                         delta = choices[0].get("delta", choices[0])
-                        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-                            content_parts.append(delta["content"])
+                        if not isinstance(delta, dict):
+                            continue
+                        # Reasoning models (e.g. Qwen3) stream every token in
+                        # ``reasoning_content`` with ``content`` empty. The
+                        # engine decodes those tokens, so count them as output.
+                        delta_content = delta.get("content")
+                        if isinstance(delta_content, str):
+                            content_parts.append(delta_content)
+                        reasoning = delta.get("reasoning_content")
+                        if isinstance(reasoning, str):
+                            content_parts.append(reasoning)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
             return ResponseMeasurement(0, elapsed, error_class="malformed_sse", malformed=True)
         tokens = self._token_count(usage_tokens) or self._token_count("".join(content_parts))
