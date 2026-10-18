@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 import tempfile
+from unittest.mock import Mock, patch
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from llama_broker.autotune import (
     Candidate,
     CandidateRejected,
     KnobSpec,
+    HttpCandidateSession,
     LeaseBusy,
     MaintenanceLease,
     ResponseMeasurement,
@@ -30,6 +32,25 @@ from llama_broker.autotune import (
     patch_autotune_extra_args,
 )
 from llama_broker.cli import _autotune_report, _autotune_unit_directives
+
+
+class HttpAutotuneRequestTests(unittest.TestCase):
+    def test_tools_requests_do_not_force_a_second_json_grammar(self) -> None:
+        session = HttpCandidateSession("http://127.0.0.1:1", "fixture")
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                connection = Mock()
+                response = connection.getresponse.return_value
+                response.status = 200
+                response.read.return_value = b'{"choices": [{"message": {"content": "ok"}}], "usage": {"completion_tokens": 1}}'
+                with patch.object(session, "_connection", return_value=connection):
+                    session.request("tools-json", streaming=streaming, concurrent=False)
+                payload = json.loads(connection.request.call_args.kwargs["body"])
+                self.assertEqual(payload["model"], "fixture")
+                self.assertEqual(payload["stream"], streaming)
+                self.assertTrue(payload["tools"])
+                self.assertNotIn("response_format", payload)
+                connection.close.assert_called_once()
 
 
 class FakeSession:
