@@ -7,10 +7,12 @@ import http.client
 import ipaddress
 import os
 import ssl
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from pathlib import Path
 from .broker_security import read_api_keys
+from jsonschema import Draft202012Validator, SchemaError
 
 _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 _STRIP = {"authorization", "x-api-key", "x-basalt-bridge-token"}
@@ -25,6 +27,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
     bridge_token = ""
     bridge_tokens = ()
     upstream_token = ""
+    upstream_timeout = 900
+
+    @staticmethod
+    def validate_upstream_timeout(value: int) -> int:
+        if not 1 <= value <= 900:
+            raise ValueError("--upstream-timeout must be between 1 and 900 seconds")
+        return value
 
     def _authorized(self) -> bool:
         supplied = self.headers.get("X-Basalt-Bridge-Token", "")
@@ -63,6 +72,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if size > self.max_body_bytes:
             return self._reject(413, "request body too large")
         body = self.rfile.read(size) if size else None
+        if body and self.headers.get_content_type() == "application/json":
+            try:
+                payload = json.loads(body)
+                requested = payload.get("response_format", {})
+                schema = requested.get("json_schema", {}).get("schema") if isinstance(requested, dict) else None
+                if schema is not None:
+                    Draft202012Validator.check_schema(schema)
+            except (json.JSONDecodeError, AttributeError, TypeError, SchemaError) as exc:
+                return self._reject(400, f"invalid response schema: {exc}")
         nominated = {x.strip().lower() for value in self.headers.get_all('Connection', []) for x in value.split(',')}
         headers = {
             k: v for k, v in self.headers.items()
@@ -71,7 +89,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         headers["Host"] = f"{self.upstream_host}:{self.upstream_port}"
         if self.upstream_token:
             headers["Authorization"] = f"Bearer {self.upstream_token}"
-        conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=300)
+        conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=self.upstream_timeout)
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
             response = conn.getresponse()
@@ -130,11 +148,13 @@ def main(argv=None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--max-body-bytes", type=int, default=8 * 1024 * 1024)
+    parser.add_argument("--upstream-timeout", type=int, default=900)
     args = parser.parse_args(argv)
     try:
         host, port = _loopback(args.upstream_url)
         if args.max_body_bytes < 0 or args.port < 0 or args.port > 65535:
             raise ValueError("invalid size or port")
+        BridgeHandler.validate_upstream_timeout(args.upstream_timeout)
         tokens = read_api_keys(Path(args.auth_token_file))
         if not tokens:
             raise ValueError("auth token file is empty")
@@ -152,6 +172,7 @@ def main(argv=None) -> int:
         BridgeHandler.bridge_token = ""
         BridgeHandler.upstream_token = upstream_token
         BridgeHandler.max_body_bytes = args.max_body_bytes
+        BridgeHandler.upstream_timeout = args.upstream_timeout
         server.socket = context.wrap_socket(server.socket, server_side=True)
     except (OSError, ValueError, ssl.SSLError) as exc:
         parser.error(str(exc))

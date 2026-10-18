@@ -81,6 +81,7 @@ def main(argv=None) -> int:
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--bridge-port', type=int, required=True)
+    parser.add_argument('--upstream-timeout', type=int, default=900)
     args = parser.parse_args(argv)
 
     child = bridge = None
@@ -115,6 +116,7 @@ def main(argv=None) -> int:
                 '--key', args.key, '--auth-token-file', args.auth_token_file,
                 '--upstream-token-file', str(upstream_path), '--upstream-url', f'http://127.0.0.1:{native_port}',
                 '--host', args.host, '--port', str(args.bridge_port),
+                '--upstream-timeout', str(args.upstream_timeout),
             ], start_new_session=True)
             def stop(signum, _frame):
                 nonlocal stopping

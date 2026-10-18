@@ -22,6 +22,7 @@ class BasaltBridgeNetworkTests(unittest.TestCase):
         cls.up=ThreadingHTTPServer(('127.0.0.1',0),Upstream)
         class Handler(BridgeHandler): pass
         Handler.upstream_host='127.0.0.1'; Handler.upstream_port=cls.up.server_port; Handler.bridge_token='test-token'; Handler.max_body_bytes=100
+        Handler.upstream_timeout=900
         cls.bridge=BridgeServer(('127.0.0.1',0),Handler)
         server_context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); server_context.load_cert_chain(p/'cert.pem',p/'key.pem')
         cls.bridge.socket=server_context.wrap_socket(cls.bridge.socket,server_side=True)
@@ -48,3 +49,20 @@ class BasaltBridgeNetworkTests(unittest.TestCase):
     def test_upstream_loopback_only(self):
         for url in ('http://example.com:80','https://127.0.0.1:80','http://user:password@127.0.0.1:80'):
             with self.assertRaises(ValueError): _loopback(url)
+
+    def test_long_deadline_is_configurable_and_defaults_to_900(self):
+        self.assertEqual(BridgeHandler.upstream_timeout, 900)
+        self.assertEqual(BridgeHandler.validate_upstream_timeout(300), 300)
+        with self.assertRaises(ValueError): BridgeHandler.validate_upstream_timeout(0)
+        with self.assertRaises(ValueError): BridgeHandler.validate_upstream_timeout(901)
+
+    def test_invalid_json_schema_is_rejected_before_upstream(self):
+        n = len(Upstream.seen)
+        c = self.connect()
+        body = json.dumps({'response_format': {'type': 'json_schema', 'json_schema': {'schema': {'type': 'not-a-type'}}}}).encode()
+        c.request('POST', '/chat', body=body, headers={'X-Basalt-Bridge-Token': 'test-token', 'Content-Type': 'application/json'})
+        r = c.getresponse()
+        self.assertEqual(r.status, 400)
+        self.assertIn(b'invalid response schema', r.read())
+        c.close()
+        self.assertEqual(len(Upstream.seen), n)
