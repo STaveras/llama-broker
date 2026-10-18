@@ -216,8 +216,13 @@ def _run(argv, *, cwd=None, timeout=900, env=None, log=None):
         raise RuntimeControlError("command must be an argv list")
     proc = subprocess.Popen(list(argv), cwd=str(cwd) if cwd else None, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, shell=False, start_new_session=True)
+                            bufsize=0, shell=False, start_new_session=True)
     lines=[]
+    pending = bytearray()
+    def record(data):
+        line = data.decode("utf-8", errors="replace").rstrip("\r")
+        lines.append(line)
+        if log: log(line)
     deadline = time.monotonic() + timeout
     sel = selectors.DefaultSelector()
     sel.register(proc.stdout, selectors.EVENT_READ)
@@ -226,11 +231,17 @@ def _run(argv, *, cwd=None, timeout=900, env=None, log=None):
             remaining = deadline - time.monotonic()
             if remaining <= 0: raise subprocess.TimeoutExpired(argv, timeout)
             for key, _ in sel.select(remaining):
-                data = key.fileobj.readline()
-                if data == "": sel.unregister(key.fileobj); continue
-                line = data.rstrip("\n")
-                lines.append(line)
-                if log: log(line)
+                # readline() can block past the deadline on a partial log line.
+                data = os.read(key.fd, 8192)
+                if not data:
+                    if pending: record(pending); pending.clear()
+                    sel.unregister(key.fileobj)
+                    continue
+                pending.extend(data)
+                while b"\n" in pending:
+                    line, _, remainder = pending.partition(b"\n")
+                    record(line)
+                    pending = bytearray(remainder)
         code = proc.wait(timeout=max(0, deadline - time.monotonic()))
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
         os.killpg(proc.pid, signal.SIGKILL)
@@ -238,6 +249,7 @@ def _run(argv, *, cwd=None, timeout=900, env=None, log=None):
         raise RuntimeControlError("command timed out or cancelled")
     finally:
         sel.close()
+        proc.stdout.close()
     if code: raise RuntimeControlError(f"command failed ({code}): {' '.join(argv)}\n" + "\n".join(lines[-20:]))
     return "\n".join(lines)
 

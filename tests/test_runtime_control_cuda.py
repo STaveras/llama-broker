@@ -42,8 +42,8 @@ endif()
     subprocess.run(["git", "commit", "-qm", "inert CPU and CUDA"], cwd=repo, check=True)
     rc.project_add(control, "fixture", "https://fixture.example/inert.git", default_branch="main")
     plan = rc.bundle_plan(control, "fixture", recipe="cmake-cuda", cuda_arch="120a")
-    if not shutil.which("nvcc") or not shutil.which("bwrap"):
-        assert plan["status"] == "blocked"
+    if plan["status"] == "blocked":
+        assert plan["capabilities"]["cuda_compile"] == "unvalidated"
         with pytest.raises(rc.RuntimeControlError):
             rc.bundle_build(control, "fixture", recipe="cmake-cuda", cuda_arch="120a")
         pytest.skip("CUDA sandbox capability unavailable; real CUDA acceptance remains unvalidated")

@@ -18,8 +18,25 @@ from llama_broker.runtime_control import (
 PYTHON = os.environ.get("PYTHON", "python3")
 
 
+@pytest.fixture(scope="module")
+def build_sandbox(tmp_path_factory):
+    import shutil
+    from llama_broker import runtime_control as rc
+    if any(shutil.which(tool) is None for tool in ("bwrap", "cmake", "cc", "c++", "readelf")):
+        pytest.skip("sandbox build tools unavailable; real build acceptance remains unvalidated")
+    root = tmp_path_factory.mktemp("sandbox-capability")
+    source = root / "source"; source.mkdir()
+    build = root / "build"; build.mkdir()
+    try:
+        result = subprocess.run(rc._sandbox(source, build, {}) + ["/usr/bin/true"], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip("sandbox permission unavailable; real build acceptance remains unvalidated")
+    if result.returncode:
+        pytest.skip("sandbox namespaces unavailable; real build acceptance remains unvalidated")
+
+
 @pytest.fixture()
-def fixture_repo(tmp_path):
+def fixture_repo(tmp_path, build_sandbox):
     control = tmp_path / "control"
     repo = control / "fixture"
     repo.mkdir(parents=True)
