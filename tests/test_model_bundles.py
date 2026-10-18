@@ -296,7 +296,9 @@ def test_cli_default_tree_verbose_and_json_members_agree(tmp_path):
     assert "├── config.json" in normal
     assert "└── tokenizer_config.json" in normal
     assert str(root) not in normal
-    assert str(root) in verbose
+    # Full paths wrap in narrow terminals and under long isolated temp roots.
+    displayed_root = verbose.split("  root:", 1)[1].split("  file reference:", 1)[0]
+    assert "".join(line.strip() for line in displayed_root.splitlines()) == str(root)
     for member in json.loads(machine)["data"][0]["files"]:
         assert member["relative_path"] in normal
     assert all(len(line) <= 100 for line in normal.splitlines())
