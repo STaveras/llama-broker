@@ -3879,6 +3879,12 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
         return
 
     operation = state.get("operation")
+    accepted = isinstance(operation, dict) and operation.get("status") in {
+        "accepted",
+        "queued",
+        "preflight",
+        "committed",
+    }
     if isinstance(operation, dict):
         print(f"Request:   {operation.get('status', 'unknown')}")
         request_id = operation.get("request_id")
@@ -3889,6 +3895,8 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
             print(f"Execution ID: {execution_id}")
         if operation.get("target") is not None:
             print(f"Target:    {operation['target']}")
+        if accepted and isinstance(request_id, str):
+            print(f"Wait:      brokerctl operation wait {request_id}")
     print(f"Broker:    {state.get('status', 'unknown')}")
     backend = state.get("backend")
     if not isinstance(backend, dict):
@@ -3897,12 +3905,6 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
 
     profile = backend.get("profile")
     phase = backend.get("phase", "unknown")
-    accepted = isinstance(operation, dict) and operation.get("status") in {
-        "accepted",
-        "queued",
-        "preflight",
-        "committed",
-    }
     if accepted:
         print(
             f"Backend:   transition pending (current: {profile if profile else 'none'})"
@@ -4248,6 +4250,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("Backend:   (none)")
             else:
                 print(f"Backend:   {phase}")
+                if phase == "failed":
+                    if state.get("target_profile"):
+                        print(f"Target:    {state['target_profile']}")
+                    if state.get("error"):
+                        print(f"Error:     {state['error']}")
 
             # JSON detail if requested. Include the live snapshot when one was
             # available so scripts can consume the same context shown above.

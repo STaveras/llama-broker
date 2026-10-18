@@ -307,6 +307,17 @@ to act on that directory.
 | `brokerctl profiles list\|discover\|edit\|add` | profile management; `profile edit` opens a numbered selection menu when no model ID/alias is supplied; profiles remain the canonical model-to-runtime binding and client naming source |
 | `brokerctl profiles calibrate ... --autotemp` | (planned) hardware calibration with optional model-keyed behavioral evaluation |
 
+Lifecycle commands submit asynchronous operations. A successful `load` or
+`start` command acknowledges acceptance; the returned request may still be
+queued or loading. Run `brokerctl operation wait <request_id>` to observe its
+terminal result before inference or cleanup. The wait command exits 0 on
+success, 1 on failure or cancellation, and 124 if its waiting deadline expires.
+`brokerctl operation status <request_id>` shows one request's exact error;
+`brokerctl operation list` includes older history. Plain `brokerctl status`
+shows the target and reason for the current failed backend transition, even
+while the broker is stopped. Stopping the broker during activation interrupts
+the load.
+
 ## API and security
 
 The stable additive OpenAI-compatible subset is under `/v1`:
