@@ -47,6 +47,15 @@ class RuntimeControlUITests(unittest.TestCase):
     def test_branches_does_not_assume_main(self):
         self.assertEqual(project_branches(self.root, "fixture"), ["trunk"])
 
+    def test_nonpositive_menu_entries_cannot_select_from_end(self):
+        for selection in ("0\n", "-1\n", "1\n0\n", "1\n-1\n"):
+            with self.subTest(selection=selection), self.assertRaisesRegex(ValueError, "invalid .* selection"):
+                select_source(self.root, "fixture", input_stream=TTY(selection), output_stream=StringIO())
+
+    def test_branches_includes_fetched_remote_refs(self):
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/reviewed", self.commit], cwd=self.root / "fixture", check=True)
+        self.assertEqual(project_branches(self.root, "fixture"), ["origin/reviewed", "trunk"])
+
 
 if __name__ == "__main__":
     unittest.main()

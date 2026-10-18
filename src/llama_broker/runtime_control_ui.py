@@ -17,7 +17,7 @@ def _git(repo, args: Sequence[str]) -> list[str]:
 def project_branches(root, name: str) -> list[str]:
     """Read local/remote branch names without modifying the repository."""
     item = _project(root, name)
-    branches = _git(item["path"], ["branch", "--format=%(refname:short)", "--no-color", "--"])
+    branches = _git(item["path"], ["branch", "--all", "--format=%(refname:short)", "--no-color", "--"])
     return sorted(dict.fromkeys(branches))
 
 
@@ -44,7 +44,9 @@ def select_source(root, name: str, *, input_stream: TextIO = sys.stdin,
     if not choice.strip():
         raise RuntimeControlError("selection cancelled")
     try:
-        branch = branches[int(choice.strip()) - 1]
+        index = int(choice.strip())
+        if index < 1: raise ValueError
+        branch = branches[index - 1]
     except (ValueError, IndexError):
         raise RuntimeControlError("invalid branch selection")
     commits = project_commits(root, name, branch)
@@ -60,7 +62,9 @@ def select_source(root, name: str, *, input_stream: TextIO = sys.stdin,
     if not choice.strip():
         raise RuntimeControlError("selection cancelled")
     try:
-        selected = commits[int(choice.strip()) - 1]
+        index = int(choice.strip())
+        if index < 1: raise ValueError
+        selected = commits[index - 1]
     except (ValueError, IndexError):
         raise RuntimeControlError("invalid commit selection")
     return {"branch": branch, "commit": selected["hash"], "subject": selected["subject"]}
