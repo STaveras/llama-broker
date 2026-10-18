@@ -458,6 +458,7 @@ Tests must not depend on this machine's `profiles.json`; use
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and ground
 rules (fail-closed, no secrets, offline tests).
 
+
 ## 0.1.0 release boundary
 
 The qualified first-release runtime is llama.cpp. vLLM and retained adapters

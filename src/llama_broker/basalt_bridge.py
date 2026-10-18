@@ -113,6 +113,39 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _proxy
 
+    def finish(self):
+        """Flush the response and complete TLS shutdown before closing.
+
+        ``Connection: close`` makes the HTTP message delimited by EOF because
+        response Content-Length is deliberately not forwarded.  A raw
+        ``SSLSocket.close()`` can tear down the TCP connection without a TLS
+        close_notify on recent OpenSSL/Python combinations, which makes strict
+        clients (notably curl) report a false incomplete-read (error 56) after
+        receiving the complete body.  unwrap() performs the orderly TLS
+        shutdown; the returned plain socket is then closed normally.
+        """
+        try:
+            if not self.wfile.closed:
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        try:
+            self.wfile.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        try:
+            self.rfile.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        connection = self.connection
+        try:
+            if isinstance(connection, ssl.SSLSocket):
+                connection.unwrap().close()
+            else:
+                connection.close()
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
+            connection.close()
+
     def log_message(self, *_args):
         pass
 
