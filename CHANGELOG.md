@@ -1,4 +1,18 @@
-# Retrospective changelog
+# Changelog
+
+## [0.8.0] - Unreleased
+
+Candidate metadata is `0.8.0.dev0`; stable `0.8.0` is proposed, not tagged.
+This candidate consolidates the development line, including artifact-first
+model listing (JSON schema 2) and FIFO inference admission with SSE heartbeats.
+It adds scoped failed-transition reporting and explicit operation-wait guidance,
+removes a conflicting tools/JSON grammar in autotune probes, and stages the
+reviewed opt-in runtime bundle control plane. Follow-up fixes bound build
+commands with partial log lines and validate interactive source selections.
+Positive sandbox/CUDA tests require host capabilities; no production GPU,
+FreeToken, Basalt deployment, or system1 routing qualification is claimed.
+
+## Retrospective changelog
 
 Current assigned version: **0.6.16**.
 
