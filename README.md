@@ -1,3 +1,7 @@
+Current candidate: **0.8.0.dev0**. The proposed next stable release is **0.8.0**,
+subject to integration review and release qualification. No package publication
+is implied. See [the next-release sequence](docs/RELEASING.md#next-release-sequence).
+
 <!-- retrospective-release:start -->
 ## Retrospective version: 0.6.16
 
@@ -195,7 +199,7 @@ uv run --extra dev pytest -q
 With the optional [system 1 decision model](docs/system1.md) enabled, clients
 can also request the `auto` model and let Liquid AI's d1 pick the profile.
 
-## Quick start (0.1.0)
+## Quick start
 
 ```bash
 # Installed workflow (recommended)
@@ -229,7 +233,7 @@ The current release keeps one backing runtime active at a time because of the
 local hardware budget. The planned residency manager will allow multiple
 broker-owned instances, including duplicate instances of one model, and will
 evict only the oldest idle instance when memory pressure requires it. That
-future behavior is intentionally deferred from 0.1.0.
+future behavior remains deferred.
 
 For TLS on a LAN:
 
@@ -281,15 +285,15 @@ growing final weight file cannot be detected without download coordination.
 
 The normal tree includes every member and its size; `--verbose` (`-v`) adds full
 bundle roots and file references. `--width` wraps human output. `--json` always
-includes full paths and all members, independent of verbosity. Its schema-1
-`object: "model_list"` and canonical `data` profile records remain unchanged;
-the additive `bundles` array contains `name`, `path`, `bundle_root`, `format`,
+includes full paths and all members, independent of verbosity. Its schema-2
+`object: "model_list"` uses `data` for artifact records containing `name`,
+`path`, `bundle_root`, `format`,
 `status`, `files` (`path`, `relative_path`, `role`, `size`), `size`, `size_policy`,
 `missing_files` and `issues`. `size_policy` is `unique-inode-per-bundle`.
 `path` is a representative present weight file (or the index/expected file for
 an incomplete bundle); `bundle_root` is display metadata. Bundles do not create
-loadable IDs. Continue selecting `data[].id` for `load`, and use explicit file
-paths for existing setup/import operations. Listing does not change import,
+loadable IDs. Select profiles through `brokerctl profile list` for `load`, and
+use explicit file paths for existing setup/import operations. Listing does not change import,
 load or cleanup/delete targets; no operation treats a bundle root as permission
 to act on that directory.
 
@@ -317,6 +321,17 @@ to act on that directory.
 | `brokerctl update` | deferred from 0.1.0; runtime acquisition is never automatic |
 | `brokerctl profiles list\|discover\|edit\|add` | profile management; `profile edit` opens a numbered selection menu when no model ID/alias is supplied; profiles remain the canonical model-to-runtime binding and client naming source |
 | `brokerctl profiles calibrate ... --autotemp` | (planned) hardware calibration with optional model-keyed behavioral evaluation |
+
+Lifecycle commands submit asynchronous operations. A successful `load` or
+`start` command acknowledges acceptance; the returned request may still be
+queued or loading. Run `brokerctl operation wait <request_id>` to observe its
+terminal result before inference or cleanup. The wait command exits 0 on
+success, 1 on failure or cancellation, and 124 if its waiting deadline expires.
+`brokerctl operation status <request_id>` shows one request's exact error;
+`brokerctl operation list` includes older history. Plain `brokerctl status`
+shows the target and reason for the current failed backend transition, even
+while the broker is stopped. Stopping the broker during activation interrupts
+the load.
 
 ## API and security
 
@@ -469,13 +484,15 @@ Tests must not depend on this machine's `profiles.json`; use
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and ground
 rules (fail-closed, no secrets, offline tests).
 
-
-## 0.1.0 release boundary
+## Public release runtime scope
 
 The qualified first-release runtime is llama.cpp. vLLM and retained adapters
 are experimental and require explicit selection. Runtime acquisition, compiler
 or driver installation, multi-instance residency/eviction, cloud control,
-scoped credentials, and calibration/autotune are deferred. Standard CI is
+scoped credentials, and production calibration/autotune qualification are deferred.
+Runtime bundle staging is opt-in and experimental: it never registers or
+activates a runtime. Its CPU and inert CUDA fixture checks do not qualify a
+production GPU build, driver compatibility, or inference. Standard CI is
 offline and hardware-independent; GPU/runtime qualification is a separate
 self-hosted activity.
 

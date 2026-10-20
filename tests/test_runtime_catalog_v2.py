@@ -226,6 +226,22 @@ class ExternalRuntimeCatalogTests(unittest.TestCase):
         )
         self.assertIn("fixture-text-7b", build["selected_profile_ids"])
 
+    def test_human_runtime_list_includes_source_url_and_wraps(self) -> None:
+        source = "https://fixture.example/a-long-reviewed-source-repository.git"
+        catalog = json.loads(self.catalog.read_text())
+        catalog["runtimes"][0]["source_url"] = source
+        self.catalog.write_text(json.dumps(catalog))
+        output = io.StringIO()
+        with patch.dict(os.environ, {"LLAMA_BROKER_RUNTIME_CATALOG": str(self.catalog)}), redirect_stdout(output), patch.object(
+            brokerctl, "_render_table", wraps=brokerctl._render_table
+        ) as render:
+            self.assertEqual(brokerctl._cmd_runtime_list(SimpleNamespace(profiles=self.profiles, json=False, width=60)), 0)
+        headers, rows = render.call_args.args
+        self.assertIn("SOURCE URL", headers)
+        column = headers.index("SOURCE URL")
+        self.assertIn(source, [row[column] for row in rows])
+        self.assertTrue(all(len(line) <= 60 for line in output.getvalue().splitlines()))
+
     def test_missing_optional_draft_and_moe_cache_degrade_without_parse_failure(self) -> None:
         self.data["schema_version"] = 1
         self.data.pop("deployment_revision", None)

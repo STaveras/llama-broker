@@ -1622,13 +1622,26 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertEqual(application.crash_loops.snapshot(), {})
 
     def test_completed_response_clears_crash_history(self) -> None:
+        success_recorded = threading.Event()
+        guard = self.broker.application.crash_loops
+        record_success = guard.record_success
+
+        def completed(profile_id: str) -> None:
+            record_success(profile_id)
+            success_recorded.set()
+
         self.controller.describe_exit = lambda _profile: BackendExit(  # type: ignore[attr-defined]
             result="signal", exit_status="SIGABRT"
         )
-        with patch.object(llama_broker, "_log"):
+        with (
+            patch.object(llama_broker, "_log"),
+            patch.object(guard, "record_success", side_effect=completed),
+        ):
             self._crash_main_backend()
             self.assertIn("main", self.broker.application.crash_loops.snapshot())
             status, _ = self._post({"model": "main", "messages": []})
+            # Receiving the final body can precede the handler's cleanup.
+            self.assertTrue(success_recorded.wait(3), "handler did not record success")
 
         self.assertEqual(status, 200)
         self.assertEqual(self.broker.application.crash_loops.snapshot(), {})

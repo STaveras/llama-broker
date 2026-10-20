@@ -5,25 +5,35 @@ the project is young and wants to stay approachable.
 
 ## Project shape
 
-- `llama_broker.py` — broker daemon (request leasing, profile switching, TLS).
-- `brokerctl.py` — administrative CLI.
-- `broker_profiles.py` — profile manifest parsing and fail-closed validation.
-- `backend_controller.py` — systemd unit install/management.
-- `runtimes/` — runtime adapters (llama.cpp, vLLM).
-- `tests/` — offline unittest suite (no model, no systemd required).
+- `src/llama_broker/daemon.py` — broker daemon (request leasing, profile switching, TLS).
+- `src/llama_broker/cli.py` — administrative CLI.
+- `src/llama_broker/broker_profiles.py` — profile manifest parsing and validation.
+- `src/llama_broker/backend_controller.py` — systemd unit install/management.
+- `src/llama_broker/runtimes/` — runtime adapters.
+- `tests/` — offline pytest and unittest suite (no model or systemd required).
 
 ## Development workflow
 
-1. Create a feature branch off `dev/0.0.1` (or the current dev branch).
+1. Create a feature branch off `development`.
 2. Make focused changes. Keep the offline test suite green:
    ```bash
-   python3 -m py_compile brokerctl.py llama_broker.py backend_controller.py
-   PYTHONPATH=. python3 -m unittest discover -s tests -v
+   uv run --extra dev pytest -q --ignore=tests/test_local_production_manifest.py
+   uv run python tools/check_public_tree.py
+   uv run python tools/check_release.py --development
    ```
 3. Never depend on this machine's `profiles.json` in tests — use
    `tests/fixtures` (see `tests/fixtures/__init__.py`) or construct profiles
    in a tempdir.
 4. Open a PR. Describe what changed and why; include test evidence.
+
+Use disposable HOME/XDG directories and unreachable session/system D-Bus
+addresses when running the suite on a machine with a broker installation.
+HTTP/TLS tests use loopback fixtures. Positive runtime-build tests also need
+Linux namespace permission, Bubblewrap, CMake and a compiler. They explicitly
+skip with an unvalidated-acceptance reason when that capability is absent;
+passing portable tests alone does not qualify a runtime build or GPU execution.
+Use a failing regression before changing production code. See `CONTEXT.md` for
+the lifecycle contract and `docs/RELEASING.md` for release gates.
 
 ## Ground rules
 

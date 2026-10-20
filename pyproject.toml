@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llama-broker"
-version = "0.6.16"
+version = "0.8.0.dev0"
 description = "A profile-driven OpenAI-compatible broker for local inference runtimes"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -112,6 +112,64 @@ class BrokerctlStatusTests(unittest.TestCase):
                     self.assertIn("Broker:    switching", output.getvalue())
                     self.assertIn("Backend:   switching", output.getvalue())
 
+    def test_status_reports_current_interrupted_transition_without_history_errors(self) -> None:
+        failure = "Llama-Broker startup was interrupted"
+        controller = Mock()
+        controller.state.return_value = {
+            "generation": 12,
+            "profile": None,
+            "phase": "failed",
+            "target_profile": "main",
+            "error": failure,
+            "operations": {"executions": {"old": {"error": "old timeout"}}},
+        }
+        for json_output in (False, True):
+            with self.subTest(json_output=json_output):
+                output = io.StringIO()
+                with (
+                    patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+                    patch.object(brokerctl, "create_production_controller", return_value=controller),
+                    patch.object(brokerctl, "_broker_admin_get", side_effect=brokerctl.BackendControllerError("offline")),
+                    patch.object(brokerctl, "backend_endpoint_ready", return_value=False),
+                    redirect_stdout(output),
+                ):
+                    result = brokerctl.main(["status", "--json"] if json_output else ["status"])
+
+                self.assertEqual(result, 1)
+                if json_output:
+                    detail = json.loads(output.getvalue())
+                    self.assertEqual(detail["error"], failure)
+                    self.assertEqual(detail["target_profile"], "main")
+                else:
+                    self.assertIn("Backend:   failed", output.getvalue())
+                    self.assertIn("Target:    main", output.getvalue())
+                    self.assertIn(f"Error:     {failure}", output.getvalue())
+                    self.assertNotIn("old timeout", output.getvalue())
+
+    def test_status_does_not_report_previous_failure_during_new_transition(self) -> None:
+        controller = Mock()
+        controller.state.return_value = {
+            "phase": "failed", "profile": None,
+            "target_profile": "old", "error": "previous failure",
+        }
+        output = io.StringIO()
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "create_production_controller", return_value=controller),
+            patch.object(brokerctl, "_broker_admin_get", return_value={
+                "status": "degraded",
+                "backend": {"profile": None, "phase": "switching", "ready": False},
+                "leases": {"transitioning": True, "transition_target": "main"},
+            }),
+            patch.object(brokerctl, "backend_endpoint_ready", return_value=False),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(brokerctl.main(["status"]), 1)
+
+        self.assertIn("Backend:   switching", output.getvalue())
+        self.assertNotIn("previous failure", output.getvalue())
+        self.assertNotIn("Target:    old", output.getvalue())
+
     def test_status_includes_live_context_and_slot_utilisation(self) -> None:
         controller = Mock()
         controller.state.return_value = {
@@ -247,6 +305,7 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
             "Request ID: request-1\n"
             "Execution ID: execution-1\n"
             "Target:    vision\n"
+            "Wait:      brokerctl operation wait request-1\n"
             "Broker:    ok\n"
             "Backend:   transition pending (current: main)\n"
             "Phase:     transition_pending\n"
@@ -1679,7 +1738,10 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
             profiles = materialize_fixture(Path(tempdir))
             output = io.StringIO()
             with redirect_stdout(output):
-                result = brokerctl.main(["--profiles", str(profiles), "model", "list"])
+                result = brokerctl.main([
+                    "--profiles", str(profiles), "model", "list",
+                    "--scan-path", str(profiles.parent / "models"),
+                ])
 
         self.assertEqual(result, 0)
         rendered = output.getvalue()
@@ -1695,7 +1757,10 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 result = brokerctl.main(
-                    ["--profiles", str(profiles), "model", "list", "--json"]
+                    [
+                        "--profiles", str(profiles), "model", "list", "--json",
+                        "--scan-path", str(profiles.parent / "models"),
+                    ]
                 )
 
         self.assertEqual(result, 0)
