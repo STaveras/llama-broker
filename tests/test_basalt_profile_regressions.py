@@ -154,3 +154,28 @@ class BasaltProfileRegressionTests(unittest.TestCase):
         with patch.dict(os.environ, {"LLAMA_BROKER_RUNTIME_CATALOG": str(self.fixture.catalog)}), \
                 self.assertRaisesRegex(ProfileError, "requires tool_call_parser"):
             ProfileRegistry.from_path(self.fixture.manifest)
+
+    def test_catalog_listing_tolerates_absent_artifacts_but_activation_rejects_them(self):
+        self.fixture.config.unlink()
+        self.fixture.model.unlink()
+        with patch.dict(os.environ, {"LLAMA_BROKER_RUNTIME_CATALOG": str(self.fixture.catalog)}):
+            registry = ProfileRegistry.from_path(self.fixture.manifest, allow_missing_artifacts=True)
+            self.assertEqual(registry.get('basalt-fixture').alias, 'basalt-fixture')
+            with self.assertRaises(ProfileError):
+                ProfileRegistry.from_path(self.fixture.manifest)
+
+    def test_native_alias_comes_from_hashed_operator_config(self):
+        self.fixture.config.write_text(json.dumps({'server': {'model': str(self.fixture.model), 'alias': 'native-fixture'}}))
+        self.fixture._write_manifests()
+        with patch.dict(os.environ, {"LLAMA_BROKER_RUNTIME_CATALOG": str(self.fixture.catalog)}):
+            profile = ProfileRegistry.from_path(self.fixture.manifest).get('basalt-fixture')
+            self.assertEqual(profile.backend_model_name, 'native-fixture')
+
+    def test_config_model_binding_and_hash_fail_closed(self):
+        self.fixture.config.write_text(json.dumps({'server': {'model': '/example/different.basalt'}}))
+        with patch.dict(os.environ, {"LLAMA_BROKER_RUNTIME_CATALOG": str(self.fixture.catalog)}):
+            with self.assertRaisesRegex(ProfileError, 'hash mismatch'):
+                ProfileRegistry.from_path(self.fixture.manifest)
+            self.fixture._write_manifests()
+            with self.assertRaisesRegex(ProfileError, 'pinned to profile model'):
+                ProfileRegistry.from_path(self.fixture.manifest)

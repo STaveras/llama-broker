@@ -6,7 +6,12 @@ from pathlib import Path
 
 
 def run(argv: list[str], timeout: float) -> int:
-    return subprocess.run(argv, timeout=timeout, check=False).returncode
+    try:
+        return subprocess.run(argv, timeout=timeout, check=False).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+    except OSError:
+        return 127
 
 
 def main() -> int:

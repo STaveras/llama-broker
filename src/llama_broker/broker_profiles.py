@@ -1648,18 +1648,19 @@ def _parse_profile(
                 raise ProfileError(f"Basalt model_path is not a native Basalt artifact for {profile_id!r}")
             if hashlib.sha256(basalt_config_path.read_bytes()).hexdigest() != basalt_config_sha256:
                 raise ProfileError(f"Basalt config hash mismatch for {profile_id!r}")
-        try:
-            config = json.loads(basalt_config_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ProfileError(f"cannot read Basalt config for {profile_id!r}: {error}") from error
-        if not isinstance(config, dict):
-            raise ProfileError(f"Basalt config must be an object for {profile_id!r}")
-        server = config.get("server")
-        if not isinstance(server, dict) or server.get("model") != str(model_path):
-            raise ProfileError(f"Basalt config server.model must be pinned to profile model for {profile_id!r}")
-        basalt_model_name = server.get("alias", alias)
-        if not isinstance(basalt_model_name, str) or not basalt_model_name.strip():
-            raise ProfileError(f"Basalt config server.alias must be a non-empty native model name for {profile_id!r}")
+        if not allow_missing_artifacts or basalt_config_path.exists():
+            try:
+                config = json.loads(basalt_config_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ProfileError(f"cannot read Basalt config for {profile_id!r}: {error}") from error
+            if not isinstance(config, dict):
+                raise ProfileError(f"Basalt config must be an object for {profile_id!r}")
+            server = config.get("server")
+            if not isinstance(server, dict) or server.get("model") != str(model_path):
+                raise ProfileError(f"Basalt config server.model must be pinned to profile model for {profile_id!r}")
+            basalt_model_name = server.get("alias", alias)
+            if not isinstance(basalt_model_name, str) or not basalt_model_name.strip():
+                raise ProfileError(f"Basalt config server.alias must be a non-empty native model name for {profile_id!r}")
     mmproj_path: Path | None = None
     mmproj_sha256: str | None = None
     if record.get("mmproj_path"):

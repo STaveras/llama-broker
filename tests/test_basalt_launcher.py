@@ -2,7 +2,7 @@
 import http.client,json,os,pathlib,socket,ssl,subprocess,sys,tempfile,time,unittest
 
 FIXTURE='''#!/usr/bin/env python3
-import sys,json,os,time
+import sys,json,os,time,subprocess
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 args=sys.argv
 config=json.load(open(args[args.index('--config')+1]))
@@ -14,7 +14,10 @@ class H(BaseHTTPRequestHandler):
   ok=self.headers.get('Authorization')=='Bearer '+token
   body=json.dumps({'ok':ok}).encode(); self.send_response(200 if ok else 401); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
 s=ThreadingHTTPServer(('127.0.0.1',port),H)
-open(config['marker'],'w').write(json.dumps({'pid':os.getpid(),'port':port}))
+grandchild=None
+if config.get('grandchild'):
+ grandchild=subprocess.Popen([sys.executable,'-c','import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)']).pid
+open(config['marker'],'w').write(json.dumps({'pid':os.getpid(),'port':port,'grandchild':grandchild}))
 s.serve_forever()
 '''
 
@@ -60,3 +63,18 @@ class LauncherTests(unittest.TestCase):
   proc=self.launch(self.p/'missing-cert'); self.assertNotEqual(proc.wait(timeout=5),0); self.assertFalse(self.marker.exists())
  def test_early_native_exit_is_detected_and_bounded(self):
   (self.p/'config').write_text(json.dumps({'exit':True})); start=time.monotonic(); proc=self.launch(); self.assertNotEqual(proc.wait(timeout=5),0); self.assertLess(time.monotonic()-start,5)
+ def test_shutdown_kills_descendants_even_after_group_leader_exits(self):
+  (self.p/'config').write_text(json.dumps({'marker':str(self.marker),'grandchild':True}))
+  proc=self.launch()
+  for _ in range(100):
+   if self.marker.exists(): break
+   time.sleep(.05)
+  info=json.loads(self.marker.read_text()); descendant=info['grandchild']
+  time.sleep(.2)
+  try:
+   proc.terminate(); proc.wait(timeout=8)
+   status=pathlib.Path(f'/proc/{descendant}/stat')
+   self.assertTrue(not status.exists() or status.read_text().split()[2]=='Z', 'native descendant survived launcher shutdown')
+  finally:
+   try: os.kill(descendant,9)
+   except ProcessLookupError: pass

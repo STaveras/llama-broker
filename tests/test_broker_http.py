@@ -2907,6 +2907,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIs(resolved, native)
         self.assertEqual(payload["model"], native.backend_model_name)
 
+    def test_route_payload_uses_active_profile_when_model_is_absent(self) -> None:
         profile, payload = route_payload(
             self.registry_fixture(), {}, active_profile="main"
         )

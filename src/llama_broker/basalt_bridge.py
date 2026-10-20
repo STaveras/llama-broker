@@ -8,6 +8,8 @@ import ipaddress
 import os
 import ssl
 import json
+import socket
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from pathlib import Path
@@ -29,6 +31,23 @@ class BridgeHandler(BaseHTTPRequestHandler):
     upstream_token = ""
     upstream_timeout = 900
 
+    def setup(self):
+        self.request.settimeout(self.server.client_timeout)
+        self._upstream = None
+        self._upstream_socket = None
+        self._headers_sent = False
+        self._deadline_timer = threading.Timer(self.upstream_timeout, self._expire)
+        self._deadline_timer.daemon = True
+        super().setup()
+        self._deadline_timer.start()
+
+    def _expire(self):
+        # Shutdown interrupts blocked reads/writes, including a trickling peer.
+        for sock in (self.connection, self._upstream_socket, getattr(self._upstream, 'sock', None)):
+            if sock is not None:
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+
     @staticmethod
     def validate_upstream_timeout(value: int) -> int:
         if not 1 <= value <= 900:
@@ -36,10 +55,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return value
 
     def _authorized(self) -> bool:
+        if any(len(self.headers.get_all(name, [])) > 1 for name in ('Authorization', 'X-Basalt-Bridge-Token')):
+            return False
         supplied = self.headers.get("X-Basalt-Bridge-Token", "")
         authorization = self.headers.get("Authorization", "")
         bearer = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
-        matches = [hmac.compare_digest(supplied, token) | hmac.compare_digest(bearer, token)
+        matches = [hmac.compare_digest(supplied.encode(), token.encode()) | hmac.compare_digest(bearer.encode(), token.encode())
                    for token in (self.bridge_tokens or ((self.bridge_token,) if self.bridge_token else ()))]
         return any(matches)
 
@@ -54,6 +75,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _proxy(self) -> None:
+        try:
+            self._forward()
+        except (OSError, http.client.HTTPException):
+            # Never append a second HTTP response or complete a partial stream.
+            self.close_connection = True
+            if not self._headers_sent:
+                try: self._reject(502, 'upstream transport failed')
+                except OSError: pass
+
+    def _forward(self) -> None:
         if not self._authorized():
             return self._reject(401, "invalid bridge credentials")
         if self.command not in {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
@@ -72,6 +103,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if size > self.max_body_bytes:
             return self._reject(413, "request body too large")
         body = self.rfile.read(size) if size else None
+        if size and len(body) != size:
+            return self._reject(400, 'incomplete request body')
         if body and self.headers.get_content_type() == "application/json":
             try:
                 payload = json.loads(body)
@@ -79,8 +112,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 schema = requested.get("json_schema", {}).get("schema") if isinstance(requested, dict) else None
                 if schema is not None:
                     Draft202012Validator.check_schema(schema)
-            except (json.JSONDecodeError, AttributeError, TypeError, SchemaError) as exc:
-                return self._reject(400, f"invalid response schema: {exc}")
+            except (ValueError, AttributeError, TypeError, SchemaError):
+                return self._reject(400, 'invalid response schema')
         nominated = {x.strip().lower() for value in self.headers.get_all('Connection', []) for x in value.split(',')}
         headers = {
             k: v for k, v in self.headers.items()
@@ -90,56 +123,73 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if self.upstream_token:
             headers["Authorization"] = f"Bearer {self.upstream_token}"
         conn = http.client.HTTPConnection(self.upstream_host, self.upstream_port, timeout=self.upstream_timeout)
+        self._upstream = conn
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
+            self._upstream_socket = conn.sock
             response = conn.getresponse()
+            lengths = response.headers.get_all('Content-Length', [])
+            encodings = response.headers.get_all('Transfer-Encoding', [])
+            if len(lengths) > 1 or (lengths and encodings) or (encodings and encodings != ['chunked']):
+                return self._reject(502, 'invalid upstream framing')
+            if lengths and (not lengths[0].isascii() or not lengths[0].isdecimal()):
+                return self._reject(502, 'invalid upstream length')
+            nominated_response = {x.strip().lower() for value in response.headers.get_all('Connection', []) for x in value.split(',')}
+            has_body = response.status not in (204, 304) and response.status >= 200
+            chunked = has_body and not lengths
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():
-                if key.lower() not in _HOP:
+                if key.lower() not in _HOP | _STRIP | nominated_response:
                     self.send_header(key, value)
+            if lengths and has_body:
+                self.send_header('Content-Length', lengths[0])
+            elif chunked:
+                self.send_header('Transfer-Encoding', 'chunked')
             self.send_header("Connection", "close")
             self.close_connection = True
             self.end_headers()
-            while True:
+            self._headers_sent = True
+            while has_body:
                 chunk = response.read1(8192)
                 if not chunk:
+                    if response.length:
+                        raise http.client.IncompleteRead(b'', response.length)
                     break
+                if chunked:
+                    self.wfile.write(f'{len(chunk):x}\r\n'.encode())
                 self.wfile.write(chunk)
+                if chunked: self.wfile.write(b'\r\n')
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            if chunked:
+                self.wfile.write(b'0\r\n\r\n')
+                self.wfile.flush()
         finally:
             conn.close()
+            self._upstream = None
+            self._upstream_socket = None
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _proxy
 
     def finish(self):
-        """Flush the response and complete TLS shutdown before closing.
-
-        ``Connection: close`` makes the HTTP message delimited by EOF because
-        response Content-Length is deliberately not forwarded.  A raw
-        ``SSLSocket.close()`` can tear down the TCP connection without a TLS
-        close_notify on recent OpenSSL/Python combinations, which makes strict
-        clients (notably curl) report a false incomplete-read (error 56) after
-        receiving the complete body.  unwrap() performs the orderly TLS
-        shutdown; the returned plain socket is then closed normally.
-        """
+        """Finish TLS shutdown within a bounded interval, including silent peers."""
+        self._deadline_timer.cancel()
         try:
             if not self.wfile.closed:
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
         try:
             self.wfile.close()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
         try:
             self.rfile.close()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
         connection = self.connection
         try:
             if isinstance(connection, ssl.SSLSocket):
+                connection.settimeout(min(1, self.server.client_timeout))
                 connection.unwrap().close()
             else:
                 connection.close()
@@ -153,6 +203,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
 class BridgeServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    client_timeout = 10
+    max_connections = 32
+    ssl_context = None
+    _slots = None
+
+    def process_request(self, request, client_address):
+        if self._slots is None:
+            self._slots = threading.BoundedSemaphore(self.max_connections)
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            request.settimeout(self.client_timeout)
+            if self.ssl_context is not None:
+                request = self.ssl_context.wrap_socket(request, server_side=True)
+            super().process_request_thread(request, client_address)
+        except OSError:
+            self.shutdown_request(request)
+        finally:
+            self._slots.release()
 
 
 def _loopback(url: str):
@@ -166,8 +243,8 @@ def _loopback(url: str):
         allowed = parsed.hostname.lower() == "localhost"
     if not allowed:
         raise ValueError("--upstream-url must target loopback")
-    if parsed.query or parsed.fragment:
-        raise ValueError("--upstream-url must not contain query or fragment")
+    if parsed.query or parsed.fragment or parsed.path not in ('', '/'):
+        raise ValueError("--upstream-url must not contain a path, query or fragment")
     return parsed.hostname, parsed.port or 80
 
 
@@ -182,12 +259,16 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--max-body-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--upstream-timeout", type=int, default=900)
+    parser.add_argument('--client-timeout', type=int, default=10)
+    parser.add_argument('--max-connections', type=int, default=32)
     args = parser.parse_args(argv)
     try:
         host, port = _loopback(args.upstream_url)
         if args.max_body_bytes < 0 or args.port < 0 or args.port > 65535:
             raise ValueError("invalid size or port")
         BridgeHandler.validate_upstream_timeout(args.upstream_timeout)
+        if not 1 <= args.client_timeout <= 900 or not 1 <= args.max_connections <= 256:
+            raise ValueError('invalid client timeout or connection bound')
         tokens = read_api_keys(Path(args.auth_token_file))
         if not tokens:
             raise ValueError("auth token file is empty")
@@ -199,14 +280,17 @@ def main(argv=None) -> int:
                 raise ValueError("upstream token file is empty")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(args.cert, args.key)
-        server = BridgeServer((args.host, args.port), BridgeHandler)
-        BridgeHandler.upstream_host, BridgeHandler.upstream_port = host, port
-        BridgeHandler.bridge_tokens = tuple(tokens)
-        BridgeHandler.bridge_token = ""
-        BridgeHandler.upstream_token = upstream_token
-        BridgeHandler.max_body_bytes = args.max_body_bytes
-        BridgeHandler.upstream_timeout = args.upstream_timeout
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+        class Handler(BridgeHandler): pass
+        Handler.upstream_host, Handler.upstream_port = host, port
+        Handler.bridge_tokens = tuple(tokens)
+        Handler.bridge_token = ""
+        Handler.upstream_token = upstream_token
+        Handler.max_body_bytes = args.max_body_bytes
+        Handler.upstream_timeout = args.upstream_timeout
+        server = BridgeServer((args.host, args.port), Handler)
+        server.client_timeout = args.client_timeout
+        server.max_connections = args.max_connections
+        server.ssl_context = context
     except (OSError, ValueError, ssl.SSLError) as exc:
         parser.error(str(exc))
     try:

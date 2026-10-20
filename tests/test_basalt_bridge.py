@@ -25,7 +25,7 @@ class BasaltBridgeNetworkTests(unittest.TestCase):
         Handler.upstream_timeout=900
         cls.bridge=BridgeServer(('127.0.0.1',0),Handler)
         server_context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); server_context.load_cert_chain(p/'cert.pem',p/'key.pem')
-        cls.bridge.socket=server_context.wrap_socket(cls.bridge.socket,server_side=True)
+        cls.bridge.ssl_context=server_context
         cls.client_context=ssl.create_default_context(cafile=str(p/'cert.pem'))
         for s in (cls.up,cls.bridge): threading.Thread(target=s.serve_forever,daemon=True).start()
     @classmethod

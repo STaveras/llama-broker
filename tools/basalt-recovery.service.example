@@ -3,5 +3,6 @@ Description=Independent bounded Basalt rollback recovery
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/env python3 /path/to/repository/tools/basalt_recovery_apply.py
+# Supply an independently verified local restore command; it is not bundled.
+ExecStart=/path/to/operator-provided-restore
 TimeoutStartSec=120

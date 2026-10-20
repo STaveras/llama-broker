@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from .basalt_bridge import BridgeHandler
 
 
 def _read_secret(path: str) -> str:
@@ -36,6 +37,7 @@ def _reserve_port() -> int:
 def _validate(args):
     if args.port < 0 or args.port > 65535 or args.bridge_port < 0 or args.bridge_port > 65535:
         raise ValueError("invalid port")
+    BridgeHandler.validate_upstream_timeout(args.upstream_timeout)
     _read_secret(args.auth_token_file)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(args.cert, args.key)
@@ -54,17 +56,18 @@ def _wait_native(port: int, token: str, child=None, cancelled=lambda: False) -> 
             conn.request("GET", "/health", headers={"Authorization": f"Bearer {token}", "X-API-Key": token})
             response = conn.getresponse()
             response.read()
-            conn.close()
             if response.status in (200, 503):
                 return
         except (OSError, http.client.HTTPException):
             pass
+        finally:
+            conn.close()
         time.sleep(.1)
     raise RuntimeError("native Basalt child did not become reachable")
 
 
 def _stop(proc, sig=signal.SIGTERM):
-    if proc is not None and proc.poll() is None:
+    if proc is not None:
         try:
             os.killpg(proc.pid, sig)
         except ProcessLookupError:
@@ -136,13 +139,18 @@ def main(argv=None) -> int:
             if not stopping:
                 _stop(bridge)
                 _stop(child)
+            deadline = time.monotonic() + 5
             for proc in (bridge, child):
                 if proc is not None:
                     try:
-                        proc.wait(timeout=5)
+                        proc.wait(timeout=max(0, deadline - time.monotonic()))
                     except subprocess.TimeoutExpired:
-                        _stop(proc, signal.SIGKILL)
-                        proc.wait(timeout=5)
+                        pass
+            # A reaped group leader can leave descendants ignoring SIGTERM.
+            for proc in (bridge, child):
+                _stop(proc, signal.SIGKILL)
+                if proc is not None:
+                    proc.wait(timeout=2)
             if stopping:
                 return 0
             code = child.returncode if child and child.returncode is not None else bridge.returncode if bridge else 1
@@ -150,12 +158,14 @@ def main(argv=None) -> int:
     except (OSError, ValueError, RuntimeError, ssl.SSLError) as exc:
         _stop(bridge)
         _stop(child)
+        deadline = time.monotonic() + 5
         for proc in (bridge, child):
             if proc is not None:
-                try: proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    _stop(proc, signal.SIGKILL)
-                    proc.wait(timeout=5)
+                try: proc.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired: pass
+        for proc in (bridge, child):
+            _stop(proc, signal.SIGKILL)
+            if proc is not None: proc.wait(timeout=2)
         print(f"basalt launcher: {exc}", file=sys.stderr)
         return 1
 
