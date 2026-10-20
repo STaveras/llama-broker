@@ -2634,10 +2634,9 @@ class BrokerApplication:
         if profile is not None:
             result.update(
                 {
-                    # ``context_length`` is the aggregate ``-c`` value.  The
-                    # per-slot window is exposed separately for parallel
-                    # backends using ``-np``.
-                    "context_length": profile.context_size,
+                    # Clients budget one request against one slot, not all slots.
+                    "context_length": profile.slot_context_window,
+                    "aggregate_context_length": profile.context_size,
                     "parallel": profile.parallel,
                     "slot_context_window": profile.slot_context_window,
                     "max_output_tokens": self.max_output_tokens_for(profile),

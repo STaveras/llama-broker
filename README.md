@@ -339,7 +339,7 @@ The stable additive OpenAI-compatible subset is under `/v1`:
 
 | Route | Contract |
 | --- | --- |
-| `GET /v1/models` | Authenticated list of currently healthy/serving broker profiles; stopped, broken, or unverifiable profiles are hidden. Each model reports aggregate `context_length` (the profile's `-c` value), `parallel` (the profile's `-np` value), and per-slot `slot_context_window`. |
+| `GET /v1/models` | Authenticated list of currently healthy/serving broker profiles; stopped, broken, or unverifiable profiles are hidden. Each model reports per-request `context_length` and `slot_context_window`, `parallel` (the profile's `-np` value), and `aggregate_context_length` (the profile's `-c` value). |
 | `GET /v1/models/{model}` | Authenticated model metadata for a verified profile, or the currently healthy active backend. |
 | `POST /v1/chat/completions` | Authenticated chat request; an explicit `model` id/alias is routed to the matching profile, while an omitted model uses the currently loaded profile. `stream: true` preserves SSE streaming. |
 | `POST /v1/completions` | Authenticated completion request with the same explicit/currently-loaded model routing and streaming behavior. |
@@ -408,8 +408,9 @@ directly.
   enforce CUDA-graph safety environment, bound memory/swap/tasks per unit, and
   cap explicit output requests at the per-slot context window. Requests without
   a client budget use the inverse-parallel default
-  (`slot_context_window // parallel`); `LLAMA_BROKER_MAX_OUTPUT_TOKENS` may set
-  an explicit operator ceiling.
+  (`slot_context_window // parallel**2`), unless the profile's `max_output_tokens`
+  overrides that default; `LLAMA_BROKER_MAX_OUTPUT_TOKENS` may set an explicit
+  operator ceiling.
 - **GPU telemetry without vendor CLIs.** The shared capability probe reads AMD
   VRAM from DRM sysfs and NVIDIA/WSL VRAM through the CUDA driver API via ctypes;
   it never invokes `nvidia-smi` or treats host RAM as VRAM. Unsupported or

@@ -921,12 +921,40 @@ class BrokerHttpTests(unittest.TestCase):
             self.assertIsInstance(model["owned_by"], str)
             self.assertIsInstance(model["permission"], list)
         self.assertEqual(by_id["main-27b"]["context_length"], 65536)
+        self.assertEqual(by_id["main-27b"]["aggregate_context_length"], 65536)
         self.assertEqual(by_id["main-27b"]["max_output_tokens"], 65536)
-        self.assertEqual(by_id["qwen3.5-9b-vision"]["context_length"], 32768)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["context_length"], 16384)
+        self.assertEqual(by_id["qwen3.5-9b-vision"]["aggregate_context_length"], 32768)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["parallel"], 2)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["slot_context_window"], 16384)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["max_output_tokens"], 16384)
         self.assertEqual(by_id["qwen3.5-9b-vision"]["capabilities"], ["text", "vision"])
+
+    def test_model_detail_reports_the_same_per_slot_context_as_the_listing(self) -> None:
+        status, listing = self._get("/v1/models")
+        self.assertEqual(status, 200)
+        expected = next(
+            model for model in listing["data"]
+            if model["id"] == "qwen3.5-9b-vision"
+        )
+        with patch.object(
+            llama_broker.BackendClient, "model_info",
+            return_value={"context_length": 1048576},
+        ):
+            status, detail = self._get("/v1/models/qwen3.5-9b-vision")
+        self.assertEqual(status, 200)
+        self.assertEqual(detail, expected)
+        self.assertEqual(detail["context_length"], 16384)
+
+    def test_parallel_profile_output_default_and_explicit_override_reach_backend(self) -> None:
+        for budget, expected in ((None, 4096), (8192, 8192)):
+            with self.subTest(budget=budget):
+                payload = {"model": "qwen3.5-9b-vision", "messages": []}
+                if budget is not None:
+                    payload["max_tokens"] = budget
+                status, _ = self._post(payload)
+                self.assertEqual(status, 200)
+                self.assertEqual(self.backend.seen_payloads[-1]["max_tokens"], expected)
 
     def test_admin_switch_uses_coordinator_and_reports_consistent_health(self) -> None:
         status, payload = self._post(
