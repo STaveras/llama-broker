@@ -197,6 +197,26 @@ class RouterTests(unittest.TestCase):
         refused = self._decide(FakeClient(error=System1Error("down")), fallback="error")
         self.assertIsNone(refused.profile_id)
 
+    def test_active_fallback_is_fail_closed_when_no_candidate_can_serve_images(self) -> None:
+        router = System1Router(System1RoutingConfig.from_mapping({}), FakeClient(error=System1Error("unreachable")))  # type: ignore[arg-type]
+        decision = router.decide(
+            {"model": "auto", "messages": [{"role": "user", "content": [{"type": "input_image", "image_url": {"url": "data:x"}}]}]},
+            self.profiles[:2],
+            active_profile="main",
+            available=lambda _profile: True,
+        )
+        self.assertIsNone(decision.profile_id)
+
+    def test_explicit_fallback_must_be_an_eligible_candidate(self) -> None:
+        router = System1Router(System1RoutingConfig.from_mapping({"fallback": "vision"}), FakeClient(error=System1Error("unreachable")))  # type: ignore[arg-type]
+        decision = router.decide(
+            {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+            self.profiles,
+            active_profile="main",
+            available=lambda profile: profile.id != "vision",
+        )
+        self.assertIsNone(decision.profile_id)
+
     def test_images_restrict_candidates_to_vision_profiles(self) -> None:
         client = FakeClient()
         decision = self._decide(

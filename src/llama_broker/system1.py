@@ -607,12 +607,14 @@ class System1Router:
         if fallback == "error":
             return RouteDecision(None, reason)
         if fallback == "active":
-            if active_profile is not None and (not ids or active_profile in ids):
+            if active_profile is not None and active_profile in ids:
                 return RouteDecision(active_profile, f"fallback_active: {reason}")
             if ids:
                 return RouteDecision(ids[0], f"fallback_first_candidate: {reason}")
             return RouteDecision(None, reason)
-        return RouteDecision(fallback, f"fallback_profile: {reason}")
+        if fallback in ids:
+            return RouteDecision(fallback, f"fallback_profile: {reason}")
+        return RouteDecision(None, reason)
 
 
 class System1Sidecar:

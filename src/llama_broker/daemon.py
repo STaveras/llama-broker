@@ -2693,7 +2693,7 @@ class BrokerApplication:
             self.registry.profiles,
             active_profile=active,
             available=lambda profile: (
-                self._profile_artifacts_verified(profile) or profile.id == active
+                self._profile_artifacts_available(profile) or profile.id == active
             ),
         )
         _controller_event_logger(
