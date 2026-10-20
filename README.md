@@ -90,6 +90,10 @@ alias as the model. Multiple clients can share the same address and key.
 | `POST /v1/chat/completions` | Send a chat request; supports streaming. |
 | `POST /v1/completions` | Send a text completion request. |
 | `POST /v1/audio/transcriptions` | Transcribe an audio file. |
+| `POST /v1/systemone` | Ask the optional system 1 decision model (d1) a question. |
+
+With the optional [system 1 decision model](docs/system1.md) enabled, clients
+can also request the `auto` model and let Liquid AI's d1 pick the profile.
 
 For basic monitoring, `GET /health` and `GET /healthz` are available without an
 API key.

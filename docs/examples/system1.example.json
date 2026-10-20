@@ -1,0 +1,27 @@
+{
+  "enabled": true,
+  "model": "d1-3B",
+  "managed": true,
+  "url": "http://127.0.0.1:10001",
+  "server_binary": "~/builds/llama.cpp/build/bin/llama-server",
+  "model_path": "~/.local/share/models/LiquidAI/d1-3B-GGUF/d1-3B-Q4_K_M.gguf",
+  "context_size": 8192,
+  "gpu_layers": "all",
+  "memory_max_mib": 8192,
+  "timeout": 5,
+  "extra_args": [],
+  "environment": {},
+  "routing": {
+    "enabled": true,
+    "aliases": ["auto"],
+    "candidates": [],
+    "descriptions": {
+      "example-model-7b": "General chat and quick questions.",
+      "example-vision-12b": "Requests about images or screenshots."
+    },
+    "min_confidence": 0.5,
+    "switch_margin": 0.15,
+    "fallback": "active",
+    "max_state_chars": 4000
+  }
+}

@@ -49,6 +49,12 @@ from .broker_security import (
 from .tools.broker_backend import BackendClient
 from .tools.broker_backend import make_connection
 from .broker_profiles import Profile, ProfileError, ProfileRegistry
+from .system1 import (
+    System1ConfigError,
+    System1Service,
+    System1Sidecar,
+    load_system1_config,
+)
 from .autotune import MaintenanceLease
 from .profile_config import sha256_file
 from .paths import (
@@ -1330,10 +1336,12 @@ class BrokerApplication:
         drain_timeout: float = DRAIN_TIMEOUT,
         transition_timeout: float = TRANSITION_TIMEOUT,
         stop_timeout: float = STOP_TIMEOUT,
+        system1: System1Service | None = None,
     ) -> None:
         if max_output_tokens is not None and max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
         self.registry = registry
+        self.system1 = system1
         self.controller = controller
         self.backend_host = backend_host
         self.backend_port = backend_port
@@ -1695,8 +1703,50 @@ class BrokerApplication:
             self._openai_model_record({}, profile=profile)
             for profile in visible_profiles.values()
         ]
+        if self.system1 is not None:
+            # Routing aliases are virtual models: d1 picks the real profile.
+            for alias in self.system1.routing_aliases():
+                if alias in visible_profiles or self.registry.try_resolve(alias):
+                    continue
+                models.append(
+                    {
+                        "id": alias,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "llama-broker",
+                        "metadata": {"system1_router": self.system1.config.model},
+                    }
+                )
 
         return {"object": "list", "data": models}
+
+    def system1_route(self, payload: Mapping[str, Any]) -> Any:
+        """Return d1's routing decision when *payload* names a routing alias."""
+
+        if self.system1 is None:
+            return None
+        requested = payload.get("model")
+        router = self.system1.router
+        if not router.handles(requested) or self.registry.try_resolve(requested):
+            return None
+        active = self.coordinator.active_profile
+        decision = router.decide(
+            payload,
+            self.registry.profiles,
+            active_profile=active,
+            available=lambda profile: (
+                self._profile_artifacts_verified(profile) or profile.id == active
+            ),
+        )
+        _controller_event_logger(
+            {
+                "event": "system1_route",
+                "requested": str(requested),
+                "active": active,
+                **decision.as_dict(),
+            }
+        )
+        return decision
 
     def _api_key_path(self) -> Path:
         if self.security.api_key_file is None:
@@ -1829,6 +1879,9 @@ class BrokerApplication:
                 "autotune": self._autotune_lease.status(),
                 "degraded_reason": self._autotune_degraded_reason,
             },
+            "system1": (
+                self.system1.status() if self.system1 is not None else {"enabled": False}
+            ),
         }
 
     def reload_manifest_for_autotune(self) -> dict[str, Any]:
@@ -2042,8 +2095,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         if not self._require_api_auth():
             return
+        if path == "/v1/systemone":
+            self._proxy_system1()
+            return
         proxy_payload: Mapping[str, Any] | None = None
         payload: Mapping[str, Any] | None = None
+        self._system1_decision = None
         try:
             if path == "/v1/audio/transcriptions":
                 body = self._read_multipart_body()
@@ -2054,6 +2111,29 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 )
             else:
                 payload = self._read_payload()
+                decision = self.application.system1_route(payload)
+                if decision is not None:
+                    if decision.profile_id is None:
+                        self._send_json(
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                            {
+                                "error": {
+                                    "message": (
+                                        "system1 could not route this request: "
+                                        f"{decision.reason}"
+                                    ),
+                                    "type": "system1_route_unavailable",
+                                }
+                            },
+                        )
+                        return
+                    target = self.application.registry.try_resolve(decision.profile_id)
+                    if target is None:
+                        raise UnknownModelError(
+                            f"system1 routed to unknown profile: {decision.profile_id}"
+                        )
+                    self._system1_decision = decision
+                    payload = {**payload, "model": target.alias}
                 profile, rewritten = route_payload(
                     self.application.registry,
                     payload,
@@ -2371,6 +2451,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     continue
                 self.send_header(key, value)
             self.send_header("X-Llama-Broker-Profile", profile.id)
+            decision = getattr(self, "_system1_decision", None)
+            if decision is not None:
+                self.send_header("X-Llama-Broker-System1-Route", decision.reason)
             self.send_header("X-Request-ID", self._request_id())
             self.send_header("Connection", "close")
             self.end_headers()
@@ -2398,6 +2481,60 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 response.close()
             connection.close()
             self.close_connection = True
+
+    def _proxy_system1(self) -> None:
+        """Forward a decision request to the resident system 1 backend.
+
+        This never takes a profile lease: d1 lives outside the main backend's
+        lifecycle, so decisions keep working while profiles drain or swap.
+        """
+
+        service = self.application.system1
+        if service is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": {
+                        "message": "system1 decision model is not enabled",
+                        "type": "not_found",
+                    }
+                },
+            )
+            return
+        try:
+            body = self._read_raw_body()
+            json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": {"message": str(error), "type": "invalid_request_error"}},
+            )
+            return
+        try:
+            status, content_type, data = service.client.post_raw(body)
+        except (OSError, http.client.HTTPException) as error:
+            _log(f"[broker] system1 proxy failure: {error}")
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": {
+                        "message": "system1 backend request failed",
+                        "type": "broker_proxy_error",
+                    }
+                },
+            )
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Llama-Broker-System1", service.config.model)
+        self.send_header("X-Request-ID", self._request_id())
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
+            self.wfile.flush()
+        self.close_connection = True
 
     def _model_not_found(self, alias: str, *, message: str | None = None) -> None:
         self._send_json(
@@ -2743,6 +2880,38 @@ def create_production_controller(
     )
 
 
+def create_production_system1() -> System1Service | None:
+    """Load ``system1.json`` and start the resident decision backend.
+
+    System 1 is advisory: a bad config or a failed start is logged and the
+    broker keeps serving profiles; routing aliases then fall back per config.
+    """
+
+    try:
+        config = load_system1_config()
+    except (OSError, System1ConfigError) as error:
+        _log(f"[broker] system1 disabled: {error}")
+        return None
+    if config is None:
+        return None
+    sidecar = None
+    if config.managed:
+        sidecar = System1Sidecar(config, command_runner=subprocess_command_runner)
+        if sidecar.unit_name.startswith(f"{SERVICE_PREFIX}-"):
+            # The controller would see the unit as a stray profile backend.
+            _log(
+                f"[broker] system1 disabled: {sidecar.unit_name} collides with "
+                f"service prefix {SERVICE_PREFIX!r}"
+            )
+            return None
+        try:
+            sidecar.ensure_running()
+        except Exception as error:
+            _log(f"[broker] system1 backend failed to start: {error}")
+    _log(f"[broker] system1 decision model {config.model} at {config.url}")
+    return System1Service(config, sidecar=sidecar)
+
+
 def create_production_application(
     shutdown_requested: threading.Event | None = None,
 ) -> tuple[BrokerApplication, BackendController]:
@@ -2766,6 +2935,7 @@ def create_production_application(
             controller.switch(stale_profile)
     if shutdown_requested is not None and shutdown_requested.is_set():
         raise BrokerQuiescingError("Llama-Broker startup was interrupted")
+    system1 = create_production_system1()
     locked = LockedController(controller)
     parts = urlsplit(backend_url)
     application = BrokerApplication(
@@ -2781,6 +2951,7 @@ def create_production_application(
         drain_timeout=DRAIN_TIMEOUT,
         transition_timeout=TRANSITION_TIMEOUT,
         stop_timeout=STOP_TIMEOUT,
+        system1=system1,
     )
     application.start_recovery_watchdog()
     return application, controller
