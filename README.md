@@ -183,6 +183,17 @@ on services or live configuration:
 uv run --extra dev pytest -q tests/test_connection_reliability.py tests/test_connection_reliability_wire.py
 uv run --extra dev pytest -q
 ```
+| Route | Purpose |
+| --- | --- |
+| `GET /v1/models` | List healthy model profiles clients can use. |
+| `GET /v1/models/{model}` | Show details for one profile. |
+| `POST /v1/chat/completions` | Send a chat request; supports streaming. |
+| `POST /v1/completions` | Send a text completion request. |
+| `POST /v1/audio/transcriptions` | Transcribe an audio file. |
+| `POST /v1/systemone` | Ask the optional system 1 decision model (d1) a question. |
+
+With the optional [system 1 decision model](docs/system1.md) enabled, clients
+can also request the `auto` model and let Liquid AI's d1 pick the profile.
 
 ## Quick start (0.1.0)
 
