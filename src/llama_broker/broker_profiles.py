@@ -33,8 +33,10 @@ from .runtime_builds import (
 
 PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-ALLOWED_ROLES = frozenset({"persistent", "transient"})
-ALLOWED_CAPABILITIES = frozenset({"text", "vision", "tools", "reasoning"})
+# A "resident" profile is never switched to: it runs beside the active backend
+# in its own unit (currently only system 1 decision models such as d1).
+ALLOWED_ROLES = frozenset({"persistent", "transient", "resident"})
+ALLOWED_CAPABILITIES = frozenset({"text", "vision", "tools", "reasoning", "decision"})
 ALLOWED_CACHE_TYPES = frozenset(
     {"f16", "f32", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "turbo4", "kvarn4"}
 )
@@ -648,6 +650,10 @@ class Profile:
         return self.role == "transient"
 
     @property
+    def is_resident(self) -> bool:
+        return self.role == "resident"
+
+    @property
     def slot_context_window(self) -> int:
         """Return the context window available to one parallel slot."""
 
@@ -691,10 +697,14 @@ class ProfileRegistry:
         *,
         runtime_catalog: RuntimeCatalog | None = None,
     ):
+        # Resident profiles share the id/alias namespace but are kept out of
+        # the switchable set: nothing may lease, switch to or autotune them.
+        residents = tuple(profile for profile in profiles if profile.is_resident)
+        profiles = tuple(profile for profile in profiles if not profile.is_resident)
         by_id = {profile.id: profile for profile in profiles}
 
         aliases: dict[str, Profile] = {}
-        for profile in profiles:
+        for profile in (*profiles, *residents):
             for alias in (profile.id, profile.alias, *profile.aliases):
                 key = alias.casefold()
                 owner = aliases.get(key)
@@ -712,8 +722,14 @@ class ProfileRegistry:
                 )
 
         self._profiles = profiles
+        self._residents = residents
         self._by_id = MappingProxyType(by_id)
-        self._by_alias = MappingProxyType(aliases)
+        self._by_alias = MappingProxyType(
+            {key: profile for key, profile in aliases.items() if not profile.is_resident}
+        )
+        self._resident_by_alias = MappingProxyType(
+            {key: profile for key, profile in aliases.items() if profile.is_resident}
+        )
         self._runtime_catalog = runtime_catalog
 
     @classmethod
@@ -789,7 +805,17 @@ class ProfileRegistry:
 
     @property
     def profiles(self) -> tuple[Profile, ...]:
+        """Switchable profiles; resident profiles are listed separately."""
         return self._profiles
+
+    @property
+    def resident_profiles(self) -> tuple[Profile, ...]:
+        return self._residents
+
+    def try_resolve_resident(self, alias: object) -> Profile | None:
+        if not isinstance(alias, str) or not alias.strip():
+            return None
+        return self._resident_by_alias.get(alias.strip().casefold())
 
     @property
     def runtime_catalog(self) -> RuntimeCatalog | None:
@@ -1584,6 +1610,20 @@ def _parse_profile(
         raise ProfileError(f"invalid capabilities for {profile_id!r}: {sorted(capabilities)!r}")
     if runtime == "strata" and capabilities != frozenset({"text"}):
         raise ProfileError(f"Strata profiles currently support text capability only for {profile_id!r}")
+    if (role == "resident") != ("decision" in capabilities):
+        raise ProfileError(
+            f"resident profiles must have exactly the decision capability, and only "
+            f"resident profiles may have it, for {profile_id!r}"
+        )
+    if role == "resident":
+        if capabilities != frozenset({"decision"}):
+            raise ProfileError(
+                f"resident profile {profile_id!r} must have only the decision capability"
+            )
+        if runtime != "llamacpp":
+            raise ProfileError(f"resident profile {profile_id!r} must use the llamacpp runtime")
+        if str(record.get("restore_profile", "")).strip():
+            raise ProfileError(f"resident profile {profile_id!r} cannot restore another profile")
 
     warnings: list[str] = []
     degraded_features: list[str] = []

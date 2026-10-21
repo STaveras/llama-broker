@@ -1699,7 +1699,7 @@ def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
     try:
         if RUNTIME_CATALOG_PATH.is_file() and profiles_path.is_file() and strict_schema:
             registry = ProfileRegistry.from_path(profiles_path, allow_missing_artifacts=True)
-            for profile in registry.profiles:
+            for profile in (*registry.profiles, *registry.resident_profiles):
                 references.extend(
                     path
                     for path in (
@@ -1985,7 +1985,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             if registry is None:
                 registry = ProfileRegistry.from_path(args.profiles)
             all_failures = []
-            for profile in registry.profiles:
+            for profile in (*registry.profiles, *registry.resident_profiles):
                 failures = _verify_profile(profile)
                 if failures:
                     all_failures.extend(failures)
@@ -2293,7 +2293,7 @@ def _print_model_bundles(bundles: Sequence[Mapping[str, Any]], args: argparse.Na
 def _cmd_profiles_list(args: argparse.Namespace) -> int:
     """List profiles with status."""
     registry = ProfileRegistry.from_path(args.profiles)
-    for profile in registry.profiles:
+    for profile in (*registry.profiles, *registry.resident_profiles):
         caps = ",".join(sorted(profile.capabilities))
         slot_ctx = profile.slot_context_window
         print(
@@ -4348,7 +4348,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "verify":
             profiles = (
-                [registry.resolve(args.model)] if args.model else list(registry.profiles)
+                [registry.try_resolve_resident(args.model) or registry.resolve(args.model)]
+                if args.model
+                else [*registry.profiles, *registry.resident_profiles]
             )
             failures: list[str] = []
             results: list[dict[str, object]] = []
