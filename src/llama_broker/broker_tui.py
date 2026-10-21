@@ -55,11 +55,11 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("display_name", "Display name", "text"),
     EditorField("alias", "Primary alias", "text"),
     EditorField("aliases", "Additional aliases", "csv"),
-    EditorField("role", "Role", "select", options=("persistent", "transient")),
+    EditorField("role", "Role", "select", options=("persistent", "transient", "resident")),
     EditorField("runtime_family", "Runtime family", "select"),
     EditorField("runtime_build", "Backend build", "select"),
     EditorField("runtime", "Serving runtime", "select", options=runtime_names()),
-    EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools", "reasoning")),
+    EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools", "reasoning", "decision")),
     EditorField("context_size", "Context size", "int"),
     EditorField("parallel", "Parallel slots", "int"),
     EditorField("batch_size", "Batch size", "int"),
@@ -174,7 +174,7 @@ def _edit_simple_fields(
     values: dict[str, Any] = {}
     values["display_name"] = _default_text(input_fn, "Display name", current.get("display_name", ""))
     values["alias"] = _default_text(input_fn, "Alias", current.get("alias", ""))
-    values["role"] = _default_text(input_fn, "Role (persistent/transient)", current.get("role", "persistent"))
+    values["role"] = _default_text(input_fn, "Role (persistent/transient/resident)", current.get("role", "persistent"))
     values["capabilities"] = _default_text(
         input_fn, "Capabilities (comma-separated)", ",".join(current.get("capabilities", ["text"]))
     )

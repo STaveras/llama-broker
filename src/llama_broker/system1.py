@@ -25,12 +25,13 @@ from __future__ import annotations
 import http.client
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from .backend_controller import _unit_quote
+from .broker_profiles import launch_environment
 from .paths import CONFIG_DIR, SYSTEMD_USER_DIR
 from .tools.broker_backend import make_connection
 
@@ -150,6 +151,9 @@ class System1Config:
     """Validated ``system1.json``."""
 
     model: str = "d1-3B"
+    # A resident profile in profiles.json that defines the backend; when set,
+    # the inline server_binary/model_path/... fields are not used.
+    profile: str | None = None
     managed: bool = True
     url: str = "http://127.0.0.1:10001"
     server_binary: Path | None = None
@@ -199,10 +203,14 @@ class System1Config:
 
         server_binary = optional_path("server_binary")
         model_path = optional_path("model_path")
+        profile = record.get("profile")
+        if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+            raise System1ConfigError("system1.profile must be a resident profile id")
         if managed:
-            if server_binary is None or model_path is None:
+            if profile is None and (server_binary is None or model_path is None):
                 raise System1ConfigError(
-                    "a managed system1 backend needs server_binary and model_path"
+                    "a managed system1 backend needs a resident profile, or "
+                    "server_binary and model_path"
                 )
             if parts.scheme != "http":
                 raise System1ConfigError("a managed system1 backend listens on plain http")
@@ -224,6 +232,7 @@ class System1Config:
             raise System1ConfigError("system1.environment must map names to strings")
         return cls(
             model=model.strip(),
+            profile=profile.strip() if profile else None,
             managed=managed,
             url=url,
             server_binary=server_binary,
@@ -239,14 +248,25 @@ class System1Config:
         )
 
 
-def load_system1_config(path: Path | None = None) -> System1Config | None:
-    """Return the enabled configuration, or ``None`` when system 1 is off."""
+def load_system1_config(
+    path: Path | None = None,
+    *,
+    resident_profiles: Sequence[Any] = (),
+) -> System1Config | None:
+    """Return the enabled configuration, or ``None`` when system 1 is off.
+
+    A resident decision profile in profiles.json turns system 1 on by itself;
+    ``system1.json`` is then only needed to tune routing or to switch it off.
+    """
 
     path = path or SYSTEM1_CONFIG_PATH
+    residents = {profile.id: profile for profile in resident_profiles}
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return None
+        if not residents:
+            return None
+        text = json.dumps({"enabled": True})
     try:
         record = json.loads(text)
     except json.JSONDecodeError as error:
@@ -258,7 +278,27 @@ def load_system1_config(path: Path | None = None) -> System1Config | None:
         raise System1ConfigError("system1.enabled must be a boolean")
     if not enabled:
         return None
-    return System1Config.from_mapping(record)
+    if (
+        residents
+        and record.get("profile") is None
+        and record.get("managed", True)
+        and record.get("server_binary") is None
+    ):
+        if len(residents) > 1:
+            raise System1ConfigError(
+                "several resident profiles exist; set system1.profile to one of: "
+                + ", ".join(sorted(residents))
+            )
+        record = {**record, "profile": next(iter(residents))}
+    config = System1Config.from_mapping(record)
+    if config.profile is not None:
+        profile = residents.get(config.profile)
+        if profile is None:
+            raise System1ConfigError(
+                f"system1.profile {config.profile!r} is not a resident profile"
+            )
+        config = replace(config, model=profile.alias)
+    return config
 
 
 class System1Client:
@@ -627,8 +667,14 @@ class System1Sidecar:
         command_runner: Callable[[tuple[str, ...]], Any],
         systemd_dir: Path = SYSTEMD_USER_DIR,
         unit_name: str = SYSTEM1_UNIT_NAME,
+        profile: Any | None = None,
+        artifact_verifier: Callable[[Any], None] | None = None,
     ) -> None:
+        if (profile is None) != (config.profile is None):
+            raise System1ConfigError("system1.profile and the resident profile disagree")
         self.config = config
+        self.profile = profile
+        self.artifact_verifier = artifact_verifier
         self.command_runner = command_runner
         self.systemd_dir = Path(systemd_dir)
         self.unit_name = unit_name
@@ -639,6 +685,12 @@ class System1Sidecar:
 
     def command(self) -> tuple[str, ...]:
         config = self.config
+        if self.profile is not None:
+            return tuple(
+                self.profile.command(
+                    host=config.listen_host, port=config.listen_port, managed_args=()
+                )
+            )
         if config.server_binary is None or config.model_path is None:
             raise System1ConfigError("system1 backend is not managed by the broker")
         return (
@@ -660,6 +712,16 @@ class System1Sidecar:
             *config.extra_args,
         )
 
+    def _memory_max_mib(self) -> int:
+        if self.profile is not None:
+            return int(self.profile.safety.service.memory_max_mib)
+        return self.config.memory_max_mib
+
+    def _environment(self) -> Mapping[str, str]:
+        if self.profile is not None:
+            return launch_environment(self.profile.environment, runtime="llamacpp")
+        return self.config.environment
+
     def render_unit(self) -> str:
         lines = [
             "[Unit]",
@@ -670,7 +732,7 @@ class System1Sidecar:
             "",
             "[Service]",
             "Type=exec",
-            f"MemoryMax={self.config.memory_max_mib}M",
+            f"MemoryMax={self._memory_max_mib()}M",
             "KillSignal=SIGINT",
             "TimeoutStopSec=20s",
             "KillMode=control-group",
@@ -679,7 +741,7 @@ class System1Sidecar:
         ]
         lines.extend(
             f"Environment={_unit_quote(f'{name}={value}')}"
-            for name, value in sorted(self.config.environment.items())
+            for name, value in sorted(self._environment().items())
         )
         lines.extend(
             [
@@ -694,6 +756,11 @@ class System1Sidecar:
         return "\n".join(lines)
 
     def verify_artifacts(self) -> None:
+        if self.profile is not None:
+            # Resident profiles carry pinned hashes like every other profile.
+            if self.artifact_verifier is not None:
+                self.artifact_verifier(self.profile)
+            return
         config = self.config
         for label, path in (
             ("server_binary", config.server_binary),
@@ -748,6 +815,7 @@ class System1Service:
         return {
             "enabled": True,
             "model": self.config.model,
+            "profile": self.config.profile,
             "url": self.config.url,
             "managed": self.config.managed,
             "unit": self.sidecar.unit_name if self.sidecar else None,

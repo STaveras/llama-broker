@@ -2672,6 +2672,15 @@ class BrokerApplication:
             self._openai_model_record({}, profile=profile)
             for profile in visible_profiles.values()
         ]
+        if self.system1 is not None and self.system1.config.profile is not None:
+            # The resident decision profile is listed so clients can see it,
+            # but it answers only POST /v1/systemone, never completions.
+            resident = self.registry.try_resolve_resident(self.system1.config.profile)
+            if resident is not None:
+                record = self._openai_model_record({}, profile=resident)
+                record["role"] = "resident"
+                record["endpoints"] = ["/v1/systemone"]
+                models.append(record)
         if self.system1 is not None:
             # Routing aliases are virtual models: d1 picks the real profile.
             for alias in self.system1.routing_aliases():
@@ -3491,6 +3500,20 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return
         except UnknownModelError as error:
             requested = payload.get("model", "") if payload is not None else ""
+            if self.application.registry.try_resolve_resident(requested) is not None:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": {
+                            "message": (
+                                f"{requested} is a resident decision model; "
+                                "send it questions on POST /v1/systemone"
+                            ),
+                            "type": "invalid_request_error",
+                        }
+                    },
+                )
+                return
             self._model_not_found(str(requested), message=str(error))
             return
         except BrokerCoordinationError as error:
@@ -4757,7 +4780,7 @@ def _prepare_durable_state(controller: BackendController) -> bool:
         )
     controller._write_state(recovered)
     return True
-def create_production_system1() -> System1Service | None:
+def create_production_system1(registry: ProfileRegistry) -> System1Service | None:
     """Load ``system1.json`` and start the resident decision backend.
 
     System 1 is advisory: a bad config or a failed start is logged and the
@@ -4765,7 +4788,7 @@ def create_production_system1() -> System1Service | None:
     """
 
     try:
-        config = load_system1_config()
+        config = load_system1_config(resident_profiles=registry.resident_profiles)
     except (OSError, System1ConfigError) as error:
         _log(f"[broker] system1 disabled: {error}")
         return None
@@ -4773,7 +4796,14 @@ def create_production_system1() -> System1Service | None:
         return None
     sidecar = None
     if config.managed:
-        sidecar = System1Sidecar(config, command_runner=subprocess_command_runner)
+        sidecar = System1Sidecar(
+            config,
+            command_runner=subprocess_command_runner,
+            profile=(
+                registry.try_resolve_resident(config.profile) if config.profile else None
+            ),
+            artifact_verifier=_verify_profile_artifacts,
+        )
         if sidecar.unit_name.startswith(f"{SERVICE_PREFIX}-"):
             # The controller would see the unit as a stray profile backend.
             _log(
@@ -4819,7 +4849,7 @@ def create_production_application(
             controller.switch(stale_profile)
     if shutdown_requested is not None and shutdown_requested.is_set():
         raise BrokerQuiescingError("Llama-Broker startup was interrupted")
-    system1 = create_production_system1()
+    system1 = create_production_system1(registry)
     locked = LockedController(controller)
     parts = urlsplit(backend_url)
     application = BrokerApplication(

@@ -6,8 +6,41 @@ forward pass. Llama-Broker supports Liquid AI's
 [d1-3B](https://huggingface.co/LiquidAI/d1-3B-GGUF), which `llama-server`
 serves on `POST /v1/systemone`.
 
-It is off unless `~/.config/llama-broker/system1.json` exists with
-`"enabled": true` (override the path with `LLAMA_BROKER_SYSTEM1_CONFIG`).
+The usual way to turn it on is a **resident profile** in `profiles.json`: a
+profile with `"role": "resident"` and `"capabilities": ["decision"]`. It has the
+same fields, pinned hashes and `brokerctl verify`/`profile edit` tooling as
+any other llama.cpp profile, but the broker never switches to it, leases it or
+unloads it: it stays loaded beside whichever profile is active. Chat or
+completion requests that name it get a 400 pointing at `/v1/systemone`, and
+client integrations leave it out of their model lists.
+
+```json
+{
+  "id": "d1-3b",
+  "alias": "d1-3B",
+  "aliases": ["d1-3B", "d1"],
+  "display_name": "Liquid d1 3B (Q4_K_M)",
+  "role": "resident",
+  "capabilities": ["decision"],
+  "model_path": "~/.local/share/models/LiquidAI/d1-3B-GGUF/d1-3B-Q4_K_M.gguf",
+  "context_size": 8192,
+  "parallel": 1,
+  "gpu_layers": "all",
+  "...": "server_binary, hashes, cache/batch fields and safety as in other profiles"
+}
+```
+
+One resident decision profile turns system 1 on by itself, with the defaults
+below. `~/.config/llama-broker/system1.json` (override the path with
+`LLAMA_BROKER_SYSTEM1_CONFIG`) is then optional: use it to tune `routing`,
+change `url`, name the resident with `"profile"` when there are several, or
+switch system 1 off with `"enabled": false`. Without a resident profile,
+system 1 stays off unless `system1.json` has `"enabled": true` and the inline
+`server_binary`/`model_path` fields from
+[`examples/system1.example.json`](examples/system1.example.json).
+
+Resident is a stop-gap: a later redesign of `persistent`/`transient` into
+multi-model residency is expected to fold it into `persistent`.
 
 ## How it runs
 
@@ -17,7 +50,7 @@ It is outside the profile lifecycle: profile switches, drains and restarts
 never touch it, and the controller does not count it as a profile backend. The
 Q4_K_M file is about 1.7 GB, so expect it to hold roughly 2 GB of VRAM for as
 long as it runs; profile admission sees that through normal free-VRAM checks.
-Set `gpu_layers` to `0` to keep it on the CPU instead.
+Set the resident profile's `gpu_layers` to `0` to keep it on the CPU instead.
 
 On startup the broker writes the unit and starts it (a running unit is left
 alone). On broker shutdown it keeps running, like profile backends. A missing
@@ -33,8 +66,9 @@ hf download LiquidAI/d1-3B-GGUF --include '*Q4_K_M*' \
   --local-dir ~/.local/share/models/LiquidAI/d1-3B-GGUF
 ```
 
-then copy [`examples/system1.example.json`](examples/system1.example.json) to
-`~/.config/llama-broker/system1.json` and fix the two paths. Restart the
+then add the resident profile above (or copy
+[`examples/system1.example.json`](examples/system1.example.json) to
+`~/.config/llama-broker/system1.json` and fix its two paths). Restart the
 broker; `GET /health` shows a `system1` section with `ready: true` once d1 is
 serving.
 

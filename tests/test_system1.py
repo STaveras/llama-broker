@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from llama_broker import BrokerApplication, BrokerServer
+from llama_broker.broker_profiles import ProfileError, ProfileRegistry
 from llama_broker.broker_security import SecurityConfig
 from llama_broker.system1 import (
     SYSTEM1_UNIT_NAME,
@@ -460,3 +461,143 @@ class ClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResidentProfileTests(unittest.TestCase):
+    """d1 defined as a resident profile in profiles.json."""
+
+    setUp_base = _http.BrokerHttpTests.setUp
+    tearDown = _http.BrokerHttpTests.tearDown
+    _active_alias_ready = _http.BrokerHttpTests._active_alias_ready
+    _post = _http.BrokerHttpTests._post
+    _get = _http.BrokerHttpTests._get
+
+    def setUp(self) -> None:
+        self.setUp_base()
+        root = Path(self.tempdir.name)
+        self.d1_model = root / "d1-3B-Q4_K_M.gguf"
+        self.d1_model.write_bytes(b"d1")
+        self.manifest = json.loads(self.profiles_path.read_text(encoding="utf-8"))
+        main = self.manifest["profiles"][0]
+        self.resident = {
+            **main,
+            "id": "d1-3b",
+            "alias": "d1-3B",
+            "aliases": ["d1-3B", "d1"],
+            "display_name": "Liquid d1 3B",
+            "role": "resident",
+            "capabilities": ["decision"],
+            "model_path": str(self.d1_model),
+            "model_sha256": _http.sha256_file(self.d1_model),
+            "context_size": 8192,
+        }
+
+    def _registry(self, *extra: dict[str, object]):
+        manifest = {**self.manifest, "profiles": [*self.manifest["profiles"], *extra]}
+        self.profiles_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return ProfileRegistry.from_path(self.profiles_path)
+
+    def test_resident_profile_is_listed_apart_and_never_switchable(self) -> None:
+        registry = self._registry(self.resident)
+        self.assertEqual([p.id for p in registry.resident_profiles], ["d1-3b"])
+        self.assertNotIn("d1-3b", [p.id for p in registry.profiles])
+        self.assertIsNone(registry.try_resolve("d1"))
+        self.assertEqual(registry.try_resolve_resident("D1").id, "d1-3b")
+
+    def test_resident_role_and_decision_capability_go_together(self) -> None:
+        for change in (
+            {"capabilities": ["text"]},
+            {"capabilities": ["decision", "text"]},
+            {"role": "persistent"},
+            {"restore_profile": "main"},
+        ):
+            with self.subTest(change=change), self.assertRaises(ProfileError):
+                self._registry({**self.resident, **change})
+
+    def test_resident_aliases_cannot_shadow_switchable_profiles(self) -> None:
+        with self.assertRaisesRegex(ProfileError, "duplicate alias"):
+            self._registry({**self.resident, "aliases": ["d1-3B", "main"]})
+
+    def test_resident_profile_enables_system1_without_a_config_file(self) -> None:
+        registry = self._registry(self.resident)
+        root = Path(self.tempdir.name)
+        config = load_system1_config(
+            root / "absent.json", resident_profiles=registry.resident_profiles
+        )
+        assert config is not None
+        self.assertEqual((config.profile, config.model), ("d1-3b", "d1-3B"))
+        off = root / "off.json"
+        off.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+        self.assertIsNone(
+            load_system1_config(off, resident_profiles=registry.resident_profiles)
+        )
+        wrong = root / "wrong.json"
+        wrong.write_text(json.dumps({"enabled": True, "profile": "main"}), encoding="utf-8")
+        with self.assertRaisesRegex(System1ConfigError, "not a resident profile"):
+            load_system1_config(wrong, resident_profiles=registry.resident_profiles)
+        second = {**self.resident, "id": "d1-b", "alias": "d1-b", "aliases": ["d1-b"]}
+        two = self._registry(self.resident, second)
+        with self.assertRaisesRegex(System1ConfigError, "several resident profiles"):
+            load_system1_config(root / "absent.json", resident_profiles=two.resident_profiles)
+
+    def test_sidecar_launches_the_resident_profile_with_its_pins(self) -> None:
+        registry = self._registry(self.resident)
+        profile = registry.resident_profiles[0]
+        config = load_system1_config(
+            Path(self.tempdir.name) / "absent.json",
+            resident_profiles=registry.resident_profiles,
+        )
+        assert config is not None
+        verified: list[str] = []
+        commands: list[tuple[str, ...]] = []
+        sidecar = System1Sidecar(
+            config,
+            command_runner=commands.append,
+            systemd_dir=Path(self.tempdir.name) / "systemd",
+            profile=profile,
+            artifact_verifier=lambda p: verified.append(p.id),
+        )
+        unit = sidecar.render_unit()
+        self.assertIn(f'"{self.d1_model}"', unit)
+        self.assertIn('"--alias" "d1-3B"', unit)
+        self.assertIn('"--port" "10001"', unit)
+        self.assertIn(f"MemoryMax={profile.safety.service.memory_max_mib}M", unit)
+        sidecar.ensure_running()
+        self.assertEqual(verified, ["d1-3b"])
+        self.assertEqual(commands[-1], ("systemctl", "--user", "restart", SYSTEM1_UNIT_NAME))
+
+    def test_http_lists_resident_and_points_completions_at_systemone(self) -> None:
+        registry = self._registry(self.resident)
+        config = load_system1_config(
+            Path(self.tempdir.name) / "absent.json",
+            resident_profiles=registry.resident_profiles,
+        )
+        assert config is not None
+        self.broker.shutdown()
+        self.broker.server_close()
+        self.registry = registry
+        self.controller = _http.FakeController("main")
+        application = BrokerApplication(
+            registry=registry,
+            controller=self.controller,
+            backend_host="127.0.0.1",
+            backend_port=self.backend.server_port,
+            backend_timeout=10,
+            max_body_bytes=1_000_000,
+            security=SecurityConfig(api_key_file=self.auth_key_path),
+            backend_alias_ready=self._active_alias_ready,
+            system1=System1Service(config),
+        )
+        self.broker = BrokerServer(("127.0.0.1", 0), application=application, max_workers=4)
+        threading.Thread(target=self.broker.serve_forever, daemon=True).start()
+
+        status, models = self._get("/v1/models")
+        self.assertEqual(status, 200)
+        resident = [m for m in models["data"] if m["id"] == "d1-3B"]
+        self.assertEqual(len(resident), 1)
+        self.assertEqual(resident[0]["capabilities"], ["decision"])
+        self.assertEqual(resident[0]["endpoints"], ["/v1/systemone"])
+        status, body = self._post({"model": "d1", "messages": []})
+        self.assertEqual(status, 400)
+        self.assertIn("/v1/systemone", body["error"]["message"])
+        self.assertEqual(self.controller.transitions, [])
