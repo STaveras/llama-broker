@@ -693,22 +693,44 @@ class BrokerHttpTests(unittest.TestCase):
             forwarded["chat_template_kwargs"], {"enable_thinking": True}
         )
         self.assertEqual(forwarded["reasoning_effort"], "high")
-        self.assertEqual(forwarded["thinking_budget_tokens"], 3072)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 19328)
 
     def test_experimental_effort_uses_request_max_and_profile_ubatch(self) -> None:
         status, _ = self._post(
             {
                 "model": "main",
                 "messages": [{"role": "user", "content": "think"}],
-                "max_tokens": 8192,
+                "max_tokens": 384,
                 "reasoning_effort": "high",
             }
         )
 
         self.assertEqual(status, 200)
         forwarded = self.backend.seen_payloads[-1]  # type: ignore[attr-defined]
-        self.assertEqual(forwarded["max_tokens"], 8192)
-        self.assertEqual(forwarded["thinking_budget_tokens"], 384)
+        self.assertEqual(forwarded["max_tokens"], 384)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 192)
+
+    def test_reasoning_max_uses_defaulted_turn_limit(self) -> None:
+        self.broker.application.max_output_tokens = None
+        self.broker.application.default_max_output_tokens_for = lambda profile: 2048
+        status, _ = self._post(
+            {"model": "main", "messages": [], "reasoning_effort": "max"}
+        )
+        self.assertEqual(status, 200)
+        forwarded = self.backend.seen_payloads[-1]
+        self.assertEqual(forwarded["max_tokens"], 2048)
+        self.assertEqual(forwarded["thinking_budget_tokens"], 2048)
+
+    def test_reasoning_max_uses_either_client_limit_spelling(self) -> None:
+        for key in ("max_tokens", "max_completion_tokens"):
+            with self.subTest(key=key):
+                status, _ = self._post(
+                    {"model": "main", "messages": [], key: 1234, "reasoning_effort": "max"}
+                )
+                self.assertEqual(status, 200)
+                forwarded = self.backend.seen_payloads[-1]
+                self.assertEqual(forwarded[key], 1234)
+                self.assertEqual(forwarded["thinking_budget_tokens"], 1234)
 
     def test_llamacpp_reasoning_policy_defaults_off_in_forwarded_payload(self) -> None:
         status, _ = self._post(
@@ -2682,11 +2704,11 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_experimental_effort_scaling_uses_request_budget_and_alias(self) -> None:
         expected = {
-            "minimal": 256,
-            "low": 128,
-            "medium": 256,
-            "high": 384,
-            "extra high": 512,
+            "minimal": 1408,
+            "low": 2048,
+            "medium": 2880,
+            "high": 4096,
+            "extra high": 5824,
             "max": 8192,
         }
         for effort, budget in expected.items():
@@ -2711,18 +2733,73 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertEqual(rewritten["reasoning_effort"], effort)
                 self.assertEqual(rewritten["thinking_budget_tokens"], budget)
 
+    def test_effort_scaling_uses_geometric_spacing_and_ubatch_rounding(self) -> None:
+        levels = ("minimal", "low", "medium", "high", "extra high", "max")
+        for limit, batch, ubatch, expected in (
+            (16384, 4096, 512, (3072, 4608, 6144, 8704, 11776, 16384)),
+            (16384, 128, 128, (2816, 4096, 5760, 8192, 11648, 16384)),
+            (16384, 256, 64, (2752, 3968, 5632, 8064, 11520, 16384)),
+            (98304, 128, 128, (3072, 6144, 12288, 24576, 49152, 98304)),
+            (1000, 128, 128, (256, 384, 512, 640, 768, 1000)),
+            (512, 128, 128, (85, 122, 175, 250, 358, 512)),
+        ):
+            for effort, budget in zip(levels, expected):
+                with self.subTest(limit=limit, effort=effort):
+                    rewritten = apply_reasoning_policy(
+                        {"reasoning_effort": effort},
+                        runtime="llamacpp",
+                        max_output_tokens=98304,
+                        request_max_output_tokens=limit,
+                        batch_size=batch,
+                        ubatch_size=ubatch,
+                    )
+                    self.assertEqual(rewritten["thinking_budget_tokens"], budget)
+
+    def test_effort_scaling_responds_to_turn_limit_and_batch_floor(self) -> None:
+        def budget(limit: int, batch: int, effort: str) -> int:
+            return apply_reasoning_policy(
+                {"reasoning_effort": effort},
+                runtime="llamacpp",
+                max_output_tokens=131072,
+                request_max_output_tokens=limit,
+                batch_size=batch,
+                ubatch_size=128,
+            )["thinking_budget_tokens"]
+
+        self.assertLess(budget(8192, 128, "high"), budget(16384, 128, "high"))
+        self.assertLess(budget(16384, 128, "high"), budget(32768, 128, "high"))
+        self.assertEqual(budget(131072, 128, "minimal"), 3072)
+        self.assertEqual(budget(131072, 4096, "minimal"), 4096)
+
+    def test_effort_scaling_handles_nondivisible_batch_ratio(self) -> None:
+        budgets = [
+            apply_reasoning_policy(
+                {"reasoning_effort": effort},
+                runtime="llamacpp", max_output_tokens=16384,
+                batch_size=300, ubatch_size=96,
+            )["thinking_budget_tokens"]
+            for effort in ("minimal", "low", "medium", "high", "extra high", "max")
+        ]
+        self.assertEqual(budgets, sorted(budgets))
+        self.assertEqual(budgets[-1], 16384)
+        self.assertTrue(all(budget % 96 == 0 for budget in budgets[:-1]))
+        self.assertTrue(all(0 < budget <= 16384 for budget in budgets))
+
     def test_experimental_effort_scaling_ladder_is_monotonic(self) -> None:
         for limit, batch, ubatch in (
+            (16384, 4096, 512),
             (8192, 256, 64),
             (32768, 256, 64),
             (65536, 512, 128),
             (4096, 128, 32),
             (1024, 128, 32),
             (256, 128, 32),
+            (17, 32, 32),
+            (1, 1, 1),
         ):
             with self.subTest(limit=limit, batch=batch, ubatch=ubatch):
                 budgets = []
-                for effort in ("low", "medium", "high", "extra high", "max"):
+                for effort in ("minimal", "low", "medium", "high", "extra high", "max"):
                     rewritten = apply_reasoning_policy(
                         {"reasoning_effort": effort},
                         runtime="llamacpp",
@@ -2731,23 +2808,29 @@ class CoordinatorTests(unittest.TestCase):
                         ubatch_size=ubatch,
                     )
                     budgets.append(rewritten["thinking_budget_tokens"])
-                # low < medium < high < extra high < max, always.
+                # The output cap can make adjacent tiers equal.
                 self.assertEqual(budgets, sorted(budgets))
-                self.assertLess(budgets[-2], budgets[-1])
-                # Every derived level stays strictly below the slot limit.
-                for budget in budgets[:-1]:
-                    self.assertLess(budget, limit)
-                # minimal is the 1-batch anchor, capped by the limit.
-                rewritten = apply_reasoning_policy(
-                    {"reasoning_effort": "minimal"},
-                    runtime="llamacpp",
-                    max_output_tokens=limit,
-                    batch_size=batch,
-                    ubatch_size=ubatch,
-                )
-                self.assertEqual(
-                    rewritten["thinking_budget_tokens"], min(batch, limit)
-                )
+                for budget in budgets:
+                    self.assertGreaterEqual(budget, 1)
+                    self.assertLessEqual(budget, limit)
+                self.assertEqual(budgets[-1], limit)
+
+    def test_effort_budgets_do_not_shrink_when_turn_limit_grows(self) -> None:
+        for batch, ubatch in ((1, 1), (128, 128), (256, 64), (4096, 512), (300, 96)):
+            previous = [0] * 6
+            for limit in (1, 5, 6, 17, 127, 383, 384, 511, 512, 767, 768,
+                          999, 1000, 3071, 3072, 4096, 8192, 16384, 32768, 131072):
+                budgets = [
+                    apply_reasoning_policy(
+                        {"reasoning_effort": effort},
+                        runtime="llamacpp", max_output_tokens=limit,
+                        batch_size=batch, ubatch_size=ubatch,
+                    )["thinking_budget_tokens"]
+                    for effort in ("minimal", "low", "medium", "high", "extra high", "max")
+                ]
+                with self.subTest(limit=limit, batch=batch, ubatch=ubatch):
+                    self.assertTrue(all(old <= new for old, new in zip(previous, budgets)))
+                previous = budgets
 
     def test_experimental_effort_scaling_accepts_opencode_xhigh_alias(self) -> None:
         rewritten = apply_reasoning_policy(
@@ -2763,7 +2846,7 @@ class CoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(rewritten["reasoning_effort"], "extra high")
         self.assertEqual(rewritten["chat_template_kwargs"], {"enable_thinking": True})
-        self.assertEqual(rewritten["thinking_budget_tokens"], 512)
+        self.assertEqual(rewritten["thinking_budget_tokens"], 5824)
 
     def test_experimental_effort_scaling_preserves_explicit_budget(self) -> None:
         rewritten = apply_reasoning_policy(
@@ -2800,7 +2883,7 @@ class CoordinatorTests(unittest.TestCase):
             {
                 "reasoning": {"effort": "low"},
                 "chat_template_kwargs": {"enable_thinking": True},
-                "thinking_budget_tokens": 512,
+                "thinking_budget_tokens": 4992,
                 "reasoning_effort": "low",
             },
         )
@@ -2812,7 +2895,7 @@ class CoordinatorTests(unittest.TestCase):
                 batch_size=256,
                 ubatch_size=64,
             )["thinking_budget_tokens"],
-            1536,
+            12736,
         )
 
     def test_zero_thinking_budget_disables_reasoning_safely(self) -> None:
@@ -2867,11 +2950,11 @@ class CoordinatorTests(unittest.TestCase):
 
     def test_llamacpp_reasoning_policy_maps_extended_efforts(self) -> None:
         expected = {
-            "minimal": 256,
-            "low": 512,
-            "medium": 1024,
-            "high": 1536,
-            "extra high": 2048,
+            "minimal": 3072,
+            "low": 4992,
+            "medium": 7936,
+            "high": 12736,
+            "extra high": 20416,
             "max": 32768,
         }
         for effort, budget in expected.items():

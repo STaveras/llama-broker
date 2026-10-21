@@ -627,16 +627,28 @@ def apply_reasoning_policy(
         ):
             levels = ("minimal", "low", "medium", "high", "extra high", "max")
             index = levels.index(effort)
-            if effort == "minimal":
-                # 1-batch anchor: a full batch of thinking.
-                budget = min(batch_size, budget_limit)
-            elif effort == "max":
+            if effort == "max":
                 budget = budget_limit
             else:
-                # Each effort index n reserves n ubatch-sized chunks of the
-                # per-slot budget: n * budget_limit / ubatch_size.  Stays
-                # strictly below max for any positive ubatch_size.
-                budget = min(budget_limit, index * budget_limit // ubatch_size)
+                steps = len(levels) - 1
+                quantum = ubatch_size if budget_limit >= len(levels) * ubatch_size else 1
+                # 3072 covers the observed 2561 thinking / 2608 total-token turns.
+                minimum = min(
+                    max(3072, batch_size, len(levels) * ubatch_size),
+                    max(1, budget_limit // len(levels)),
+                )
+                minimum = ((minimum + quantum - 1) // quantum) * quantum
+                target = minimum ** (steps - index) * budget_limit**index
+                lower = minimum // quantum
+                upper = (budget_limit + quantum - 1) // quantum
+                # First whole quantum above the geometric target, without float rounding.
+                while lower < upper:
+                    middle = (lower + upper) // 2
+                    if (middle * quantum) ** steps >= target:
+                        upper = middle
+                    else:
+                        lower = middle + 1
+                budget = min(budget_limit, lower * quantum)
             rewritten["thinking_budget_tokens"] = max(1, budget)
         rewritten["reasoning_effort"] = effort
     else:
@@ -3415,11 +3427,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     active_profile=self.application.coordinator.active_profile,
                 )
                 try:
+                    if path in {"/v1/chat/completions", "/v1/completions"}:
+                        rewritten = ensure_single_system_message(rewritten)
+                        rewritten = enforce_output_limit(
+                            rewritten,
+                            self.application.max_output_tokens_for(profile),
+                            default=self.application.default_max_output_tokens_for(profile),
+                        )
                     rewritten = apply_reasoning_policy(
                         rewritten,
                         runtime=profile.runtime,
                         max_output_tokens=self.application.max_output_tokens_for(profile),
-                        request_max_output_tokens=_requested_output_tokens(payload),
+                        request_max_output_tokens=_requested_output_tokens(rewritten),
                         batch_size=profile.batch_size or 1,
                         ubatch_size=profile.ubatch_size or 1,
                     )
@@ -3459,13 +3478,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         message=f"model unavailable: {profile.alias}",
                     )
                     return
-                if path in {"/v1/chat/completions", "/v1/completions"}:
-                    rewritten = ensure_single_system_message(rewritten)
-                    rewritten = enforce_output_limit(
-                        rewritten,
-                        self.application.max_output_tokens_for(profile),
-                        default=self.application.default_max_output_tokens_for(profile),
-                    )
                 proxy_payload = rewritten
                 body = _json_bytes(rewritten)
             if path == "/v1/audio/transcriptions" and (

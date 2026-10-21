@@ -470,7 +470,8 @@ class ConfigureSafetyTests(unittest.TestCase):
             )
             model_entry = provider["models"][0]
             self.assertEqual(model_entry["contextWindow"], 32768)
-            self.assertEqual(model_entry["maxOutputTokens"], 32768)
+            self.assertEqual(model_entry["maxTokens"], 32768)
+            self.assertNotIn("maxOutputTokens", model_entry)
             self.assertNotIn("reasoning", model_entry)
             # A fresh install must not be pointed at the broker by default.
             self.assertFalse((agent_dir / "settings.json").exists())

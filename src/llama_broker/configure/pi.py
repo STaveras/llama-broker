@@ -148,7 +148,7 @@ class PiProvider(ToolProvider):
             "id": profile.alias,
             "name": profile.display_name,
             "contextWindow": slot_ctx,
-            "maxOutputTokens": slot_ctx,
+            "maxTokens": slot_ctx,
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
         }
         if "reasoning" in profile.capabilities:
