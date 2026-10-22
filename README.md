@@ -194,6 +194,7 @@ uv run --extra dev pytest -q
 | `POST /v1/chat/completions` | Send a chat request; supports streaming. |
 | `POST /v1/completions` | Send a text completion request. |
 | `POST /v1/audio/transcriptions` | Transcribe an audio file. |
+| `POST /v1/decisions` | OpenAI-compatible Decisions API, answered by the system 1 decision model (d1). |
 | `POST /v1/systemone` | Ask the optional system 1 decision model (d1) a question. |
 
 With the optional [system 1 decision model](docs/system1.md) enabled, clients

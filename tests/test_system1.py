@@ -603,8 +603,15 @@ class ResidentProfileTests(unittest.TestCase):
         resident = [m for m in models["data"] if m["id"] == "d1-3B"]
         self.assertEqual(len(resident), 1)
         self.assertEqual(resident[0]["capabilities"], ["decision"])
-        self.assertEqual(resident[0]["endpoints"], ["/v1/systemone"])
+        self.assertEqual(resident[0]["endpoints"], ["/v1/decisions", "/v1/systemone"])
         status, body = self._post({"model": "d1", "messages": []})
         self.assertEqual(status, 400)
-        self.assertIn("/v1/systemone", body["error"]["message"])
+        self.assertIn("/v1/decisions", body["error"]["message"])
+        # Any resident alias names the decision model, so the request gets
+        # past model resolution to the d1 backend (absent here: 502).
+        question = {"type": "predicate", "name": "q", "instructions": "?"}
+        status, body = self._post(
+            {"model": "d1", "input": "x", "questions": [question]}, path="/v1/decisions"
+        )
+        self.assertNotEqual(status, 404, body)
         self.assertEqual(self.controller.transitions, [])
