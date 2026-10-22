@@ -526,6 +526,13 @@ class ResidentProfileTests(unittest.TestCase):
         )
         assert config is not None
         self.assertEqual((config.profile, config.model), ("d1-3b", "d1-3B"))
+        self.assertFalse(config.routing.enabled)
+        routed = root / "routed.json"
+        routed.write_text(json.dumps({"routing": {"enabled": True}}), encoding="utf-8")
+        tuned = load_system1_config(routed, resident_profiles=registry.resident_profiles)
+        assert tuned is not None
+        self.assertEqual(tuned.profile, "d1-3b")
+        self.assertTrue(tuned.routing.enabled)
         off = root / "off.json"
         off.write_text(json.dumps({"enabled": False}), encoding="utf-8")
         self.assertIsNone(

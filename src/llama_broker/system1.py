@@ -266,14 +266,19 @@ def load_system1_config(
     except FileNotFoundError:
         if not residents:
             return None
-        text = json.dumps({"enabled": True})
+        # Implicit config: answer /v1/systemone, but leave "auto" routing
+        # off until someone writes routing descriptions and opts in, since a
+        # bad route can swap the active model out.
+        text = json.dumps({"enabled": True, "routing": {"enabled": False}})
     try:
         record = json.loads(text)
     except json.JSONDecodeError as error:
         raise System1ConfigError(f"{path}: invalid JSON: {error}") from error
     if not isinstance(record, Mapping):
         raise System1ConfigError(f"{path}: system1 configuration must be an object")
-    enabled = record.get("enabled", False)
+    # With a resident profile, system1.json only tunes system 1, so a file
+    # that omits "enabled" (e.g. just a routing block) keeps it on.
+    enabled = record.get("enabled", bool(residents))
     if not isinstance(enabled, bool):
         raise System1ConfigError("system1.enabled must be a boolean")
     if not enabled:
