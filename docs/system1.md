@@ -76,6 +76,55 @@ then add the resident profile above (or copy
 broker; `GET /health` shows a `system1` section with `ready: true` once d1 is
 serving.
 
+## OpenAI Decisions API
+
+`POST /v1/decisions` speaks OpenAI's
+[Decisions API](https://developers.openai.com/api/docs/guides/decisions), so
+an OpenAI SDK pointed at the broker (`base_url=http://127.0.0.1:11434/v1`,
+the broker API key) can call `client.decisions.create(...)` against d1. Set
+`model` to the decision model's name (`d1-3B`) or any alias of its resident
+profile; other model names get a 404 `model_not_found`. Like `/v1/systemone`
+it never waits on, or switches, the main profile.
+
+```sh
+curl -s http://127.0.0.1:11434/v1/decisions \
+  -H "Authorization: Bearer $(head -n1 ~/.config/llama-broker/api-keys)" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "d1-3B",
+    "input": "I was charged twice for my order.",
+    "questions": [
+      {"type": "predicate", "name": "refund", "instructions": "Is the customer asking for a refund?"},
+      {"type": "choice", "name": "team", "instructions": "Which team should handle this?",
+       "choices": [{"value": "billing", "description": "Payments"},
+                   {"value": "technical", "description": "Bugs"}]},
+      {"type": "score", "name": "urgency", "instructions": "How urgent is this?",
+       "levels": [{"label": "Can wait", "description": "No impact yet"},
+                  {"label": "Today", "description": "Needs a same-day answer"},
+                  {"label": "Blocking", "description": "Customer is stuck now"}]}
+    ]
+  }'
+```
+
+The broker translates each question to d1's shape and back:
+
+| OpenAI question | d1 question | Answer fields |
+|---|---|---|
+| `predicate` | `noul` | `probability` |
+| `choice` with `choices[{value, description}]` | `choice`, `criteria: {value: description}` | `choice`, `probabilities[{value, probability}]`, `confidence` |
+| `score` with `levels[{label, description}]`, lowest first | `score`, `criteria: ["label: description", ...]` | `score`, `probabilities[{value, label, probability}]`, `confidence` |
+
+`score` is the probability-weighted mean level index, as OpenAI defines it.
+`confidence` is d1's own value when it returns one, otherwise the top
+probability. A refusal from d1 comes back as `{"type": "refusal", "name": ...}`.
+`input` is a string or user messages with `input_text` and `input_image`
+parts; images may be data URLs or public `http(s)` URLs, which the broker
+downloads (up to 20 MiB, never from loopback or private addresses) because d1
+only takes data URLs. `file_id` images and `stream` are not supported. The
+response carries `id`, `object: "decision"`, `created_at`, `model` and
+`answers` in question order; there is no `usage` block, since d1 does not
+report token counts.
+
 ## Asking d1 directly
 
 `POST /v1/systemone` on the broker port forwards the body unchanged to d1 and

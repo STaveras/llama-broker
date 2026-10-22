@@ -71,8 +71,11 @@ from .transition_operations import (
 from .tools.broker_backend import BackendClient
 from .tools.broker_backend import make_connection
 from .broker_profiles import Profile, ProfileError, ProfileRegistry
+from . import decisions
+from .decisions import DecisionBackendError, DecisionRequestError
 from .system1 import (
     System1ConfigError,
+    System1Error,
     System1Service,
     System1Sidecar,
     load_system1_config,
@@ -2679,7 +2682,7 @@ class BrokerApplication:
             if resident is not None:
                 record = self._openai_model_record({}, profile=resident)
                 record["role"] = "resident"
-                record["endpoints"] = ["/v1/systemone"]
+                record["endpoints"] = ["/v1/decisions", "/v1/systemone"]
                 models.append(record)
         if self.system1 is not None:
             # Routing aliases are virtual models: d1 picks the real profile.
@@ -2697,6 +2700,24 @@ class BrokerApplication:
                 )
 
         return {"object": "list", "data": models}
+
+    def decision_model(self, name: Any) -> str | None:
+        """Return the model name ``/v1/decisions`` answers as, or ``None``.
+
+        A request may name the resident decision profile by id or any alias,
+        or the system 1 model name itself.
+        """
+
+        if self.system1 is None or not isinstance(name, str) or not name.strip():
+            return None
+        config = self.system1.config
+        if name.strip().casefold() == config.model.casefold():
+            return config.model
+        if config.profile is not None:
+            resident = self.registry.try_resolve_resident(name)
+            if resident is not None and resident.id == config.profile:
+                return config.model
+        return None
 
     def system1_route(self, payload: Mapping[str, Any]) -> Any:
         """Return d1's routing decision when *payload* names a routing alias."""
@@ -3394,6 +3415,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if path == "/v1/systemone":
             self._proxy_system1()
             return
+        if path == "/v1/decisions":
+            self._handle_decisions()
+            return
         proxy_payload: Mapping[str, Any] | None = None
         payload: Mapping[str, Any] | None = None
         self._system1_decision = None
@@ -3507,7 +3531,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         "error": {
                             "message": (
                                 f"{requested} is a resident decision model; "
-                                "send it questions on POST /v1/systemone"
+                                "send it questions on POST /v1/decisions or /v1/systemone"
                             ),
                             "type": "invalid_request_error",
                         }
@@ -4263,6 +4287,77 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             self.wfile.flush()
         self.close_connection = True
+
+    def _handle_decisions(self) -> None:
+        """Answer an OpenAI Decisions request with the resident d1 model.
+
+        Like ``/v1/systemone`` this never takes a profile lease or touches the
+        main backend; it only translates the request and response shapes.
+        """
+
+        service = self.application.system1
+        if service is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": {
+                        "message": "no decision model is enabled on this broker",
+                        "type": "not_found",
+                    }
+                },
+            )
+            return
+        try:
+            payload = json.loads(self._read_raw_body().decode("utf-8"))
+            if not isinstance(payload, Mapping):
+                raise DecisionRequestError("request body must be a JSON object")
+            if payload.get("stream"):
+                raise DecisionRequestError("stream is not supported", param="stream")
+            model = self.application.decision_model(payload.get("model"))
+            if model is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": {
+                            "message": (
+                                f"model {payload.get('model')!r} cannot answer decisions; "
+                                f"use {service.config.model!r}"
+                            ),
+                            "type": "invalid_request_error",
+                            "param": "model",
+                            "code": "model_not_found",
+                        }
+                    },
+                )
+                return
+            questions = decisions.parse_questions(payload.get("questions"))
+            state, images = decisions.parse_input(payload.get("input"))
+        except DecisionRequestError as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, error.as_error())
+            return
+        except (ValueError, UnicodeDecodeError) as error:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": {"message": str(error), "type": "invalid_request_error"}},
+            )
+            return
+        try:
+            answers = service.client.decide(
+                state,
+                decisions.systemone_request(state, images, questions)["questions"],
+                images=images,
+            )
+            result = decisions.decision_response(model, questions, answers)
+        except (System1Error, DecisionBackendError) as error:
+            _log(f"[broker] decisions failure: {error}")
+            self._send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": {"message": str(error), "type": "broker_proxy_error"}},
+            )
+            return
+        self._send_json(
+            HTTPStatus.OK, result, extra_headers={"X-Llama-Broker-System1": model}
+        )
 
     def _model_not_found(self, alias: str, *, message: str | None = None) -> None:
         self._send_json(
