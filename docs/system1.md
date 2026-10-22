@@ -30,8 +30,12 @@ client integrations leave it out of their model lists.
 }
 ```
 
-One resident decision profile turns system 1 on by itself, with the defaults
-below. `~/.config/llama-broker/system1.json` (override the path with
+One resident decision profile turns system 1 on by itself: `/v1/systemone`
+works, but automatic routing stays off until `system1.json` sets
+`"routing": {"enabled": true}` (write `routing.descriptions` first; with bare
+display names d1 tends to pick the smallest model, which would swap the active
+one out). With a resident profile, a `system1.json` that omits `enabled` keeps
+system 1 on. `~/.config/llama-broker/system1.json` (override the path with
 `LLAMA_BROKER_SYSTEM1_CONFIG`) is then optional: use it to tune `routing`,
 change `url`, name the resident with `"profile"` when there are several, or
 switch system 1 off with `"enabled": false`. Without a resident profile,
