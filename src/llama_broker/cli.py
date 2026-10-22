@@ -1317,7 +1317,19 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             print(f"ERROR: integration cannot establish safe manifest ownership: {error}", file=sys.stderr)
             return 1
 
-    ready = [item for item in inspections if item.status == "ready" and item.profile is not None]
+    # Resident decision profiles are sidecar backends, not switchable profile
+    # units.  Keep them in the inspection/report (and therefore preserve their
+    # validation status), but do not feed them to the generic profile-unit
+    # controller or client-provider adapter.  The latter only accepts the
+    # switchable profile registry and would otherwise reject a valid resident
+    # alias such as d1-3b at the integration boundary.
+    ready = [
+        item
+        for item in inspections
+        if item.status == "ready"
+        and item.profile is not None
+        and not item.profile.is_resident
+    ]
     if not ready:
         result = report_for(inspections)
         if getattr(args, "json", False):
@@ -1443,6 +1455,7 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             "reason": item.reason,
         }
         for item in planned
+        if item.profile is not None and not item.profile.is_resident
     ]
     cleanup_report: dict[str, object] | None = None
     if clean_requested:

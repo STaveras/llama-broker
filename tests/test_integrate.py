@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -208,6 +209,48 @@ class IntegrationTests(unittest.TestCase):
                 "/tmp/profiles.json",
             ]
         )
+
+    def test_integrate_ignores_resident_decision_profile_for_switchable_units(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = root / "llama-server"
+            runtime.write_text("#!/bin/sh\\nexit 0\\n", encoding="utf-8")
+            runtime.chmod(0o755)
+            model = root / "demo.gguf"
+            model.write_bytes(b"demo")
+            plan = build_setup_plan(discover_candidates([root]), runtime_path=runtime, model_path=model)
+            resident_model = root / "d1.gguf"
+            resident_model.write_bytes(b"d1")
+            resident: dict[str, object] = dict(plan.profile_record)
+            resident.update({
+                "id": "d1-3b", "alias": "d1-3B", "aliases": ["d1-3B", "d1"],
+                "display_name": "Liquid d1 3B", "role": "resident",
+                "capabilities": ["decision"], "model_path": str(resident_model),
+                "model_sha256": hashlib.sha256(b"d1").hexdigest(),
+            })
+            path = root / "profiles.json"
+            path.write_text(json.dumps({"schema_version": 1, "profiles": [plan.profile_record, resident]}), encoding="utf-8")
+            systemd_dir = root / "systemd"
+
+            class FakeController:
+                def unit_path(self, profile_id: str) -> Path:
+                    return systemd_dir / f"llama-broker-profile-{profile_id}.service"
+                def render_unit(self, profile_id: str) -> str:
+                    return f"[Unit]\\nDescription={profile_id}\\n"
+
+            args = argparse.Namespace(profiles=path, integrate_command="install", dry_run=False,
+                                     json=True, full_verify=True, clean=False, install_units=True,
+                                     tool_names=())
+            output = io.StringIO()
+            with (contextlib.redirect_stdout(output),
+                  patch.object(brokerctl, "create_production_controller", return_value=FakeController()),
+                  patch.object(brokerctl.broker_runtime, "SYSTEMD_USER_DIR", systemd_dir),
+                  patch.dict(os.environ, {"DBUS_SESSION_BUS_ADDRESS": ""}, clear=False)):
+                result = brokerctl._cmd_integrate(args)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(result, 3)
+            self.assertNotIn("d1-3b", [op.get("profile_id") for op in payload["operations"]])
+            self.assertEqual(next(item for item in payload["profiles"] if item["profile_id"] == "d1-3b")["status"], "ready")
 
     def test_integrate_reports_partial_success_without_calling_systemd(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
