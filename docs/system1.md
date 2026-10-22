@@ -86,6 +86,12 @@ the broker API key) can call `client.decisions.create(...)` against d1. Set
 profile; other model names get a 404 `model_not_found`. Like `/v1/systemone`
 it never waits on, or switches, the main profile.
 
+Resident decision profiles are intentionally not advertised by `GET /v1/models`:
+that endpoint lists callable completion/routing models, not the sidecar's
+administrative decision profile. The resident remains present in
+`brokerctl profile list` and in the registry's resident-profile listing, and its
+name or aliases remain valid for `POST /v1/decisions` and `POST /v1/systemone`.
+
 ```sh
 curl -s http://127.0.0.1:11434/v1/decisions \
   -H "Authorization: Bearer $(head -n1 ~/.config/llama-broker/api-keys)" \

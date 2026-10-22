@@ -573,7 +573,7 @@ class ResidentProfileTests(unittest.TestCase):
         self.assertEqual(verified, ["d1-3b"])
         self.assertEqual(commands[-1], ("systemctl", "--user", "restart", SYSTEM1_UNIT_NAME))
 
-    def test_http_lists_resident_and_points_completions_at_systemone(self) -> None:
+    def test_http_hides_resident_from_models_but_keeps_decisions_and_profiles(self) -> None:
         registry = self._registry(self.resident)
         config = load_system1_config(
             Path(self.tempdir.name) / "absent.json",
@@ -589,7 +589,7 @@ class ResidentProfileTests(unittest.TestCase):
             controller=self.controller,
             backend_host="127.0.0.1",
             backend_port=self.backend.server_port,
-            backend_timeout=10,
+            backend_timeout=0.1,
             max_body_bytes=1_000_000,
             security=SecurityConfig(api_key_file=self.auth_key_path),
             backend_alias_ready=self._active_alias_ready,
@@ -601,9 +601,8 @@ class ResidentProfileTests(unittest.TestCase):
         status, models = self._get("/v1/models")
         self.assertEqual(status, 200)
         resident = [m for m in models["data"] if m["id"] == "d1-3B"]
-        self.assertEqual(len(resident), 1)
-        self.assertEqual(resident[0]["capabilities"], ["decision"])
-        self.assertEqual(resident[0]["endpoints"], ["/v1/decisions", "/v1/systemone"])
+        self.assertEqual(resident, [])
+        self.assertEqual([profile.id for profile in registry.resident_profiles], ["d1-3b"])
         status, body = self._post({"model": "d1", "messages": []})
         self.assertEqual(status, 400)
         self.assertIn("/v1/decisions", body["error"]["message"])

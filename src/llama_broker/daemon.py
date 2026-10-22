@@ -2675,15 +2675,6 @@ class BrokerApplication:
             self._openai_model_record({}, profile=profile)
             for profile in visible_profiles.values()
         ]
-        if self.system1 is not None and self.system1.config.profile is not None:
-            # The resident decision profile is listed so clients can see it,
-            # but it answers only POST /v1/systemone, never completions.
-            resident = self.registry.try_resolve_resident(self.system1.config.profile)
-            if resident is not None:
-                record = self._openai_model_record({}, profile=resident)
-                record["role"] = "resident"
-                record["endpoints"] = ["/v1/decisions", "/v1/systemone"]
-                models.append(record)
         if self.system1 is not None:
             # Routing aliases are virtual models: d1 picks the real profile.
             for alias in self.system1.routing_aliases():
