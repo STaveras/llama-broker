@@ -126,6 +126,28 @@ profile ID or alias, or omit the model to use the active generation profile.
 For a missing or failing profile, run `brokerctl setup --check`, then
 `brokerctl verify` and inspect `journalctl --user -u llama-broker`.
 
+### Live profile reload
+
+By default the broker watches `~/.config/llama-broker/profiles.json` and, when
+its content changes, re-validates and hot-swaps the profile catalog — without
+restarting the generation backend, so in-flight requests keep serving on their
+existing profile snapshot. This makes "I added or edited a profile" a live
+change; you no longer need `systemctl --user restart llama-broker` for it.
+The reload reuses the same non-disruptive path as the manual
+`profile add/set/remove` mutations, so it inherits its guards: a reload that
+would remove the active profile is refused, and a failed swap rolls back to
+the previous registry.
+
+The watcher polls every 2 seconds (the manifest is small and the change is
+detected by a content fingerprint, not a timestamp, so atomic rewrites are
+handled). A malformed or mid-write file is logged and skipped, then retried on
+the next tick — it never aborts the daemon.
+
+To turn the watcher off (manual reload only), set
+`LLAMA_BROKER_MANIFEST_RELOAD_INTERVAL=0`. A full `systemctl --user restart
+llama-broker` is still the right tool when you *want* to drop in-flight state
+or change the runtime itself.
+
 ## Security and runtimes
 
 The default API binding is loopback. LAN access requires TLS and an API key;
