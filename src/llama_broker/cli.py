@@ -3592,7 +3592,7 @@ def _add_integrate_options(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="brokerctl",
-        description="Administrative CLI for broker-owned immutable backend profiles.",
+        description="Manage local model profiles, serving runtimes, and client integrations.",
     )
     parser.add_argument("--profiles", type=Path, default=PROFILES_PATH)
     parser.add_argument(
