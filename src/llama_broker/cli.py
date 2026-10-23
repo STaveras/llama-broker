@@ -3052,7 +3052,25 @@ def _cmd_profiles_template(args: argparse.Namespace) -> int:
 def _cmd_runtime_list(args: argparse.Namespace) -> int:
     """List registered runtimes and the profile-backed models selecting each."""
 
-    registry = ProfileRegistry.from_path(args.profiles)
+    try:
+        registry = ProfileRegistry.from_path(args.profiles)
+    except ProfileError as error:
+        if not args.profiles.exists():
+            detail = {
+                "schema_version": 2,
+                "object": "runtime_list",
+                "status": "unconfigured",
+                "data": [],
+                "message": f"No profile configuration yet at {args.profiles}.",
+                "howto": "Run `brokerctl setup` to discover and select a runtime and model.",
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(detail, indent=2, sort_keys=True))
+            else:
+                print(detail["message"])
+                print(detail["howto"])
+            return 1
+        raise
     catalog_builds = registry.runtime_builds
     runtime_rows: list[dict[str, object]] = []
     for runtime in list_runtimes():
