@@ -223,6 +223,13 @@ STOP_TIMEOUT = float(
 RECOVERY_INTERVAL = float(
     _env_value("LLAMA_BROKER_RECOVERY_INTERVAL", "LLM_BROKER_RECOVERY_INTERVAL", "2")
 )
+MANIFEST_RELOAD_INTERVAL = float(
+    _env_value(
+        "LLAMA_BROKER_MANIFEST_RELOAD_INTERVAL",
+        "LLM_BROKER_MANIFEST_RELOAD_INTERVAL",
+        "2",
+    )
+)
 RECOVERY_MAX_BACKOFF = float(
     _env_value("LLAMA_BROKER_RECOVERY_MAX_BACKOFF", "LLM_BROKER_RECOVERY_MAX_BACKOFF", "60")
 )
@@ -1859,6 +1866,9 @@ class BrokerApplication:
         self._operation_worker_stop = threading.Event()
         self._operation_worker_wake = threading.Event()
         self._operation_worker_thread: threading.Thread | None = None
+        self._manifest_watcher_stop = threading.Event()
+        self._manifest_watcher_thread: threading.Thread | None = None
+        self._last_manifest_identity: dict[str, Any] | None = None
         state_store = getattr(controller, "state_store", None)
         if state_store is None:
             self.operation_queue: TransitionQueue | PersistentTransitionQueue = TransitionQueue()
@@ -2340,6 +2350,60 @@ class BrokerApplication:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, RECOVERY_INTERVAL + 1.0))
         self._recovery_thread = None
+
+    def start_manifest_watcher(self) -> None:
+        """Start the background watcher that hot-reloads the profile manifest."""
+
+        if MANIFEST_RELOAD_INTERVAL <= 0:
+            return
+        if self._profiles_path is None:
+            return
+        if self._manifest_watcher_thread is not None and self._manifest_watcher_thread.is_alive():
+            return
+        self._manifest_watcher_stop.clear()
+        thread = threading.Thread(
+            target=self._manifest_watcher_loop,
+            name="llama-broker-manifest-watcher",
+            daemon=True,
+        )
+        self._manifest_watcher_thread = thread
+        thread.start()
+
+    def _manifest_watcher_loop(self) -> None:
+        while not self._manifest_watcher_stop.wait(MANIFEST_RELOAD_INTERVAL):
+            try:
+                self._maybe_reload_manifest()
+            except Exception:
+                _log("[broker] manifest reload check failed; retrying next tick")
+
+    def _maybe_reload_manifest(self) -> None:
+        if self.coordinator.shutting_down:
+            return
+        try:
+            current = ProfileRegistry.from_path(self._profiles_path)
+            identity = current.snapshot_revision_identity()
+        except Exception:
+            _log("[broker] manifest unreadable or invalid; skipping this tick")
+            return
+        if self._last_manifest_identity is None:
+            # First tick seeds the baseline; never submit for the initial state.
+            self._last_manifest_identity = identity
+            return
+        if identity == self._last_manifest_identity:
+            return
+        self._last_manifest_identity = identity
+        try:
+            self.submit_profile_reload_operation()
+            _log("[broker] manifest changed; queued profile/catalog reload")
+        except Exception as error:
+            _log(f"[broker] manifest reload submission failed: {error}")
+
+    def _stop_manifest_watcher(self) -> None:
+        self._manifest_watcher_stop.set()
+        thread = self._manifest_watcher_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, MANIFEST_RELOAD_INTERVAL + 1.0))
+        self._manifest_watcher_thread = None
 
     def restart_when_idle(self) -> Any:
         """Restart the active profile or recover the last failed target."""
@@ -3009,6 +3073,7 @@ class BrokerApplication:
                 self.coordinator.request_shutdown()
                 self._stop_operation_worker()
                 self._stop_recovery_watchdog()
+                self._stop_manifest_watcher()
                 self.coordinator.handoff_for_process_shutdown()
             except BaseException as error:
                 self._shutdown_error = error
@@ -4955,6 +5020,7 @@ def create_production_application(
         system1=system1,
     )
     application.start_recovery_watchdog()
+    application.start_manifest_watcher()
     return application, controller
 
 
