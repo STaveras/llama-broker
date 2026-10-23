@@ -18,6 +18,20 @@ from tests.fixtures import materialize_fixture
 
 
 class BrokerctlStatusTests(unittest.TestCase):
+    def test_top_level_version_is_available_without_a_command(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                brokerctl.build_parser().parse_args(["--version"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), "llama-broker 0.8.0.dev0")
+
+    def test_setup_referenced_paths_accepts_absent_profiles_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                brokerctl._setup_referenced_paths(Path(directory) / "profiles.json"), []
+            )
+
     def test_profiles_discover_json_has_schema_version(self) -> None:
         output = io.StringIO()
         with (

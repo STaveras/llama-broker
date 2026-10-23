@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
-from . import daemon as broker_runtime
+from . import __version__, daemon as broker_runtime
 from .backend_controller import BackendControllerError, _atomic_write
 from .broker_security import (
     ensure_security_material,
@@ -1684,8 +1684,8 @@ def _safe_manifest_profile_ids(payload: Mapping[str, Any]) -> frozenset[str]:
 
 def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
     references: list[Path] = []
+    payload: object = {}
     if profiles_path.is_file():
-        payload: object = {}
         try:
             payload = json.loads(profiles_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -3577,6 +3577,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Administrative CLI for broker-owned immutable backend profiles.",
     )
     parser.add_argument("--profiles", type=Path, default=PROFILES_PATH)
+    parser.add_argument(
+        "--version", action="version", version=f"llama-broker {__version__}",
+        help="show the installed package version and exit",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     model = subparsers.add_parser(
