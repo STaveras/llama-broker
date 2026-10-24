@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -230,6 +231,19 @@ MANIFEST_RELOAD_INTERVAL = float(
         "2",
     )
 )
+
+
+def _manifest_identity(profiles_path: Path | str) -> str:
+    """Fingerprint the raw manifest file so a change can be detected cheaply.
+
+    The watcher polls this hash instead of fully parsing the registry on every
+    tick: hashing the small manifest file is O(bytes) and catches edits to ANY
+    profile type (resident or switchable), whereas re-parsing + re-fingerprinting
+    the registry would re-verify pinned artifacts (re-hashing multi-GB model files
+    and Strata source checkouts) every interval. A same-content rewrite is
+    still coalesced by the reload path's own snapshot dedup.
+    """
+    return sha256(Path(profiles_path).read_bytes()).hexdigest()
 RECOVERY_MAX_BACKOFF = float(
     _env_value("LLAMA_BROKER_RECOVERY_MAX_BACKOFF", "LLM_BROKER_RECOVERY_MAX_BACKOFF", "60")
 )
@@ -1868,7 +1882,7 @@ class BrokerApplication:
         self._operation_worker_thread: threading.Thread | None = None
         self._manifest_watcher_stop = threading.Event()
         self._manifest_watcher_thread: threading.Thread | None = None
-        self._last_manifest_identity: dict[str, Any] | None = None
+        self._last_manifest_identity: str | None = None
         state_store = getattr(controller, "state_store", None)
         if state_store is None:
             self.operation_queue: TransitionQueue | PersistentTransitionQueue = TransitionQueue()
@@ -2360,6 +2374,7 @@ class BrokerApplication:
             return
         if self._manifest_watcher_thread is not None and self._manifest_watcher_thread.is_alive():
             return
+        self._seed_manifest_baseline()
         self._manifest_watcher_stop.clear()
         thread = threading.Thread(
             target=self._manifest_watcher_loop,
@@ -2368,6 +2383,20 @@ class BrokerApplication:
         )
         self._manifest_watcher_thread = thread
         thread.start()
+
+    def _seed_manifest_baseline(self) -> None:
+        """Record the manifest state that was already loaded at startup.
+
+        Seeding at start (rather than on the first tick) means an edit that
+        landed while the daemon was coming up is still detected on the first
+        tick, instead of becoming the baseline and being swallowed.
+        """
+        if self._profiles_path is None:
+            return
+        try:
+            self._last_manifest_identity = _manifest_identity(self._profiles_path)
+        except Exception:
+            self._last_manifest_identity = None
 
     def _manifest_watcher_loop(self) -> None:
         while not self._manifest_watcher_stop.wait(MANIFEST_RELOAD_INTERVAL):
@@ -2379,24 +2408,27 @@ class BrokerApplication:
     def _maybe_reload_manifest(self) -> None:
         if self.coordinator.shutting_down:
             return
+        if self._profiles_path is None:
+            return
         try:
-            current = ProfileRegistry.from_path(self._profiles_path)
-            identity = current.snapshot_revision_identity()
+            current = _manifest_identity(self._profiles_path)
         except Exception:
-            _log("[broker] manifest unreadable or invalid; skipping this tick")
+            # Unreadable manifest (mid-write, malformed, or transient I/O error):
+            # leave the baseline untouched so the last good state is retried next tick.
+            _log("[broker] manifest unreadable; skipping this tick")
             return
-        if self._last_manifest_identity is None:
-            # First tick seeds the baseline; never submit for the initial state.
-            self._last_manifest_identity = identity
+        if current == self._last_manifest_identity:
             return
-        if identity == self._last_manifest_identity:
-            return
-        self._last_manifest_identity = identity
+        # Submit first: a failed submit must keep the baseline at the last state
+        # we know is loaded, so the change is retried on the next tick instead of
+        # being dropped (the identity is only advanced on success below).
         try:
             self.submit_profile_reload_operation()
-            _log("[broker] manifest changed; queued profile/catalog reload")
         except Exception as error:
-            _log(f"[broker] manifest reload submission failed: {error}")
+            _log(f"[broker] manifest reload submission failed; will retry: {error}")
+            return
+        self._last_manifest_identity = current
+        _log("[broker] manifest changed; queued profile/catalog reload")
 
     def _stop_manifest_watcher(self) -> None:
         self._manifest_watcher_stop.set()

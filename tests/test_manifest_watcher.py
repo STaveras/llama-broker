@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import llama_broker.daemon as llama_broker
-from llama_broker.daemon import BrokerApplication
+from llama_broker.daemon import BrokerApplication, _manifest_identity
 from llama_broker.broker_profiles import ProfileRegistry
 
 
@@ -73,8 +75,8 @@ class ManifestWatcherTests(unittest.TestCase):
         self.model.write_bytes(b"main")
         self.profiles_path = root / "profiles.json"
         self.write_profiles([make_profile_record("main", "main", self.model)])
-        application = BrokerApplication(
-            registry=object(),  # type: ignore[arg-type]
+        self.application = BrokerApplication(
+            registry=ProfileRegistry.from_path(self.profiles_path),
             controller=TrivialController(),
             backend_host="127.0.0.1",
             backend_port=10000,
@@ -84,7 +86,6 @@ class ManifestWatcherTests(unittest.TestCase):
             start_operation_worker=False,
             profiles_path=self.profiles_path,
         )
-        self.application = application
 
     def tearDown(self) -> None:
         self.application._stop_manifest_watcher()
@@ -94,20 +95,106 @@ class ManifestWatcherTests(unittest.TestCase):
         envelope = {"schema_version": 1, "profiles": records}
         self.profiles_path.write_text(json.dumps(envelope), encoding="utf-8")
 
-    def assert_identity_loaded(self) -> None:
-        """The on-disk manifest must be a real, loadable revision identity."""
-        registry = ProfileRegistry.from_path(self.profiles_path)
-        identity = registry.snapshot_revision_identity()
-        self.assertIsInstance(identity, dict)
-        self.assertIn("fingerprint", identity)
+    def seed(self) -> None:
+        # Production seeds the baseline from the manifest loaded at startup; the
+        # tests reproduce that invariant by seeding from the current file.
+        self.application._seed_manifest_baseline()
 
-    def test_watcher_submits_reload_on_identity_change(self) -> None:
-        self.assert_identity_loaded()
+    def test_watcher_submits_reload_on_edit_and_advances_baseline(self) -> None:
+        self.seed()
         with patch.object(
             self.application, "submit_profile_reload_operation"
         ) as submit:
+            # Baseline already matches the file: no spurious submit.
             self.application._maybe_reload_manifest()
             self.assertEqual(submit.call_count, 0)
+            # A real edit (a new profile) must be detected and submitted once.
+            self.write_profiles(
+                [
+                    make_profile_record("main", "main", self.model),
+                    make_profile_record("extra", "extra", self.model),
+                ]
+            )
+            self.application._maybe_reload_manifest()
+            self.assertEqual(submit.call_count, 1)
+            # Baseline advanced to the new state: a repeat of the same file is a
+            # no-op (idempotent, no duplicate submit).
+            self.application._maybe_reload_manifest()
+            self.assertEqual(submit.call_count, 1)
+            # A further edit is detected again.
+            self.write_profiles(
+                [
+                    make_profile_record("main", "main", self.model),
+                    make_profile_record("extra", "extra", self.model),
+                    make_profile_record("third", "third", self.model),
+                ]
+            )
+            self.application._maybe_reload_manifest()
+            self.assertEqual(submit.call_count, 2)
+        submit.assert_called()
+
+    def test_watcher_noop_when_manifest_stable(self) -> None:
+        self.seed()
+        with patch.object(self.application, "submit_profile_reload_operation") as submit:
+            self.application._maybe_reload_manifest()
+            self.application._maybe_reload_manifest()
+            self.assertEqual(submit.call_count, 0)
+        submit.assert_not_called()
+
+    def test_malformed_manifest_is_not_applied_and_is_retried(self) -> None:
+        # A malformed file changes the hash, so the watcher tries to submit it, but
+        # the submit itself re-parses and fails — so the bad file is never applied
+        # and the baseline is not advanced (the change is retried on the next tick).
+        self.seed()
+        baseline = self.application._last_manifest_identity
+        self.assertIsNotNone(baseline)
+        self.profiles_path.write_text("{ not valid json", encoding="utf-8")
+        self.application._maybe_reload_manifest()
+        self.assertEqual(self.application._last_manifest_identity, baseline)
+        # Recovery: a valid edit is detected and applied (baseline advances).
+        self.write_profiles(
+            [
+                make_profile_record("main", "main", self.model),
+                make_profile_record("extra", "extra", self.model),
+            ]
+        )
+        self.application._maybe_reload_manifest()
+        self.assertEqual(
+            self.application._last_manifest_identity, _manifest_identity(self.profiles_path)
+        )
+
+    def test_failed_submit_does_not_advance_baseline(self) -> None:
+        self.seed()
+        self.write_profiles(
+            [
+                make_profile_record("main", "main", self.model),
+                make_profile_record("extra", "extra", self.model),
+            ]
+        )
+        baseline_after_seed = self.application._last_manifest_identity
+        with patch.object(
+            self.application, "submit_profile_reload_operation", side_effect=RuntimeError("nope")
+        ):
+            self.application._maybe_reload_manifest()
+            # A failed submit must keep the baseline at the last loaded state so the
+            # change is retried on the next tick (not dropped).
+            self.assertEqual(self.application._last_manifest_identity, baseline_after_seed)
+        # Recovery: once the submit succeeds, the baseline advances and it is applied.
+        with patch.object(self.application, "submit_profile_reload_operation") as submit:
+            self.application._maybe_reload_manifest()
+            self.assertEqual(submit.call_count, 1)
+            self.assertEqual(self.application._last_manifest_identity, _manifest_identity(self.profiles_path))
+        submit.assert_called_once()
+
+    def test_seeded_baseline_matches_loaded_manifest(self) -> None:
+        # The baseline seeded at startup equals the hash of the manifest that was
+        # loaded, so an edit that landed while the daemon was coming up is still
+        # detected on the first tick (not swallowed as the baseline).
+        self.seed()
+        self.assertEqual(
+            self.application._last_manifest_identity, _manifest_identity(self.profiles_path)
+        )
+        with patch.object(self.application, "submit_profile_reload_operation") as submit:
             self.write_profiles(
                 [
                     make_profile_record("main", "main", self.model),
@@ -118,26 +205,27 @@ class ManifestWatcherTests(unittest.TestCase):
             self.assertEqual(submit.call_count, 1)
         submit.assert_called_once()
 
-    def test_watcher_noop_when_identity_stable(self) -> None:
-        self.assert_identity_loaded()
-        with patch.object(self.application, "submit_profile_reload_operation") as submit:
-            self.application._maybe_reload_manifest()
-            self.application._maybe_reload_manifest()
-            self.assertEqual(submit.call_count, 0)
-        submit.assert_not_called()
-
-    def test_watcher_skips_malformed_manifest(self) -> None:
-        self.profiles_path.write_text("{ not valid json", encoding="utf-8")
-        with patch.object(self.application, "submit_profile_reload_operation") as submit:
-            self.application._maybe_reload_manifest()
-        self.assertEqual(submit.call_count, 0)
-        submit.assert_not_called()
-
     def test_disabled_watcher_starts_no_thread(self) -> None:
         self.assertIsNotNone(self.application._profiles_path)
         with patch.object(llama_broker, "MANIFEST_RELOAD_INTERVAL", 0.0):
             self.application.start_manifest_watcher()
         self.assertIsNone(self.application._manifest_watcher_thread)
+
+    def test_enabled_watcher_starts_daemon_thread(self) -> None:
+        # Deterministic wiring check: the watcher is started as a daemon thread with
+        # the correct target, no real thread (no sleep, no flakiness).
+        self.seed()
+        self.application._seed_manifest_baseline()
+        with patch.object(llama_broker, "MANIFEST_RELOAD_INTERVAL", 0.5):
+            with patch.object(llama_broker.threading, "Thread") as fake_thread:
+                self.application.start_manifest_watcher()
+        fake_thread.assert_called_once()
+        kwargs = fake_thread.call_args.kwargs
+        self.assertEqual(kwargs["name"], "llama-broker-manifest-watcher")
+        self.assertTrue(kwargs["daemon"])
+        self.assertEqual(kwargs["target"].__name__, "_manifest_watcher_loop")
+        self.assertIs(kwargs["target"].__self__, self.application)
+        fake_thread.return_value.start.assert_called_once()
 
 
 if __name__ == "__main__":
