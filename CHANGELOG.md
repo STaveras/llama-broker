@@ -1,8 +1,36 @@
 # Changelog
 
-## [0.8.0] - Unreleased
+## [0.8.0] - 2026-10-25
 
-Candidate metadata is `0.8.0.dev0`; stable `0.8.0` is proposed, not tagged.
+First consolidated package release after the retrospective source checkpoints.
+
+### Added and improved
+
+- Durable ordered profile operations with explicit status, wait and cancellation.
+- Bounded FIFO inference admission, SSE keepalives, CORS and connection recovery.
+- Artifact-first model bundles, runtime adapters and opt-in runtime build tooling.
+- Optional resident System 1 decision profiles and an OpenAI-compatible Decisions
+  API; decision-only profiles remain out of `/v1/models`.
+- First-run setup, console version reporting and package installation fixes.
+- Automatic profile-manifest reload without restarting the generation backend.
+
+### Fixed before release
+
+- Preserve edits made between initial manifest parsing and watcher startup by
+  fingerprinting the exact bytes parsed, rather than a later disk read.
+- Retry failed or cancelled asynchronous reloads without requiring another edit.
+  Pending requests are coalesced; only successfully applied registry bytes become
+  the baseline, including when the file changes again during application.
+
+### Qualification limits
+
+The release does not include experimental exclusive-maintenance code, local
+runtime qualification scripts, or new GPU runtime deployments. Hardware-specific
+builds, optional System 1 routing and runtime-bundle execution still require
+operator qualification; passing the offline suite is not GPU qualification.
+PyPI publication and repository visibility changes are separate operations.
+
+### Consolidation background
 This candidate consolidates the development line, including artifact-first
 model listing (JSON schema 2) and FIFO inference admission with SSE heartbeats.
 It adds scoped failed-transition reporting and explicit operation-wait guidance,

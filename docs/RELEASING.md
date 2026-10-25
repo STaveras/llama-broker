@@ -40,11 +40,12 @@ No hosted settings were configured by the local preparation.
 
 ## Next-release sequence
 
-The consolidation candidate uses `0.8.0.dev0` in both `pyproject.toml` and the
-root `uv.lock` entry. The older development snapshot carried `0.6.16`, while
-main carried the retrospective, notes-only `0.7.1`. Neither value is a suitable
-version for publishing the consolidated feature set. The proposed next stable
-version is `0.8.0`; assigning it requires a separate reviewed change.
+The consolidated release uses `0.8.0` in both `pyproject.toml` and the root
+`uv.lock` entry. Earlier preparation used `0.8.0.dev0`; the older development
+snapshot carried `0.6.16`, while main carried the retrospective, notes-only
+`0.7.1`. Release `v0.8.0` requires the matching tag at the qualified main commit.
+The sequence below documents the qualification and integration procedure; it
+is not a claim that PyPI publication or hardware qualification has occurred.
 
 1. Review the isolated consolidation candidate and its branch/history evidence.
    After explicit integration approval, integrate it into `development` and
