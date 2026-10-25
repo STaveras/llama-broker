@@ -156,10 +156,12 @@ def create_migration_backup(path: Path | str) -> Path:
 
 def _load_manifest_payload(
     path: Path | str, *, migrate: bool = True
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], str | None]:
     manifest_path = Path(path)
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        raw = manifest_path.read_bytes()
+        identity = hashlib.sha256(raw).hexdigest()
+        payload = json.loads(raw.decode("utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ProfileError(f"cannot read profile manifest {manifest_path}: {error}") from error
     if not isinstance(payload, dict):
@@ -184,11 +186,14 @@ def _load_manifest_payload(
             except Exception as error:
                 raise ProfileError(f"profile manifest migration failed: {error}") from error
             payload = migrated
+            # Migration publishes new bytes; do not claim their identity without
+            # reading them in a subsequent load. The watcher will reconcile.
+            identity = None
     else:
         raise ProfileError(f"unsupported profile manifest schema_version: {schema!r}")
     payload = copy.deepcopy(payload)
     payload.pop("default_profile", None)
-    return manifest_path, payload
+    return manifest_path, payload, identity
 
 
 def load_manifest_source(
@@ -200,7 +205,7 @@ def load_manifest_source(
 ) -> dict[str, Any]:
     """Load the persisted manifest while preserving explicit inheritance links."""
 
-    manifest_path, payload = _load_manifest_payload(path, migrate=migrate)
+    manifest_path, payload, _identity = _load_manifest_payload(path, migrate=migrate)
     try:
         resolve_manifest_inheritance(payload)
         if validate:
@@ -217,9 +222,14 @@ def load_manifest_source(
 def load_manifest(path: Path | str) -> dict[str, Any]:
     """Load the effective manifest with local inheritance fully resolved."""
 
-    _manifest_path, payload = _load_manifest_payload(path)
+    return load_manifest_snapshot(path)[0]
+
+
+def load_manifest_snapshot(path: Path | str) -> tuple[dict[str, Any], str | None]:
+    """Resolve a manifest and fingerprint the exact source bytes parsed."""
+    _manifest_path, payload, identity = _load_manifest_payload(path)
     try:
-        return resolve_manifest_inheritance(payload)
+        return resolve_manifest_inheritance(payload), identity
     except ValueError as error:
         raise ProfileError(str(error)) from error
 

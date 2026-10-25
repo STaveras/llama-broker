@@ -1883,6 +1883,7 @@ class BrokerApplication:
         self._manifest_watcher_stop = threading.Event()
         self._manifest_watcher_thread: threading.Thread | None = None
         self._last_manifest_identity: str | None = None
+        self._manifest_reload_request_id: str | None = None
         state_store = getattr(controller, "state_store", None)
         if state_store is None:
             self.operation_queue: TransitionQueue | PersistentTransitionQueue = TransitionQueue()
@@ -2385,18 +2386,8 @@ class BrokerApplication:
         thread.start()
 
     def _seed_manifest_baseline(self) -> None:
-        """Record the manifest state that was already loaded at startup.
-
-        Seeding at start (rather than on the first tick) means an edit that
-        landed while the daemon was coming up is still detected on the first
-        tick, instead of becoming the baseline and being swallowed.
-        """
-        if self._profiles_path is None:
-            return
-        try:
-            self._last_manifest_identity = _manifest_identity(self._profiles_path)
-        except Exception:
-            self._last_manifest_identity = None
+        """Use the bytes actually parsed, never a later read of the source file."""
+        self._last_manifest_identity = self.registry.manifest_identity
 
     def _manifest_watcher_loop(self) -> None:
         while not self._manifest_watcher_stop.wait(MANIFEST_RELOAD_INTERVAL):
@@ -2410,6 +2401,15 @@ class BrokerApplication:
             return
         if self._profiles_path is None:
             return
+        if self._manifest_reload_request_id is not None:
+            operation = self.operation_status(self._manifest_reload_request_id)
+            if operation["status"] not in {"succeeded", "failed", "cancelled"}:
+                return
+            self._manifest_reload_request_id = None
+        # Only a successful registry swap changes this identity. Failed or
+        # cancelled requests leave it untouched and are retried on the next tick.
+        # A concurrent file edit after parsing is not mistaken for applied state.
+        self._last_manifest_identity = self.registry.manifest_identity
         try:
             current = _manifest_identity(self._profiles_path)
         except Exception:
@@ -2419,15 +2419,14 @@ class BrokerApplication:
             return
         if current == self._last_manifest_identity:
             return
-        # Submit first: a failed submit must keep the baseline at the last state
-        # we know is loaded, so the change is retried on the next tick instead of
-        # being dropped (the identity is only advanced on success below).
         try:
-            self.submit_profile_reload_operation()
+            request = self.submit_profile_reload_operation()
         except Exception as error:
             _log(f"[broker] manifest reload submission failed; will retry: {error}")
             return
-        self._last_manifest_identity = current
+        # Track acceptance separately from application, and coalesce ticks until
+        # this exact request reaches a terminal state (no HTTP waiter required).
+        self._manifest_reload_request_id = request.request_id
         _log("[broker] manifest changed; queued profile/catalog reload")
 
     def _stop_manifest_watcher(self) -> None:

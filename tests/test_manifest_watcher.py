@@ -89,6 +89,7 @@ class ManifestWatcherTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.application._stop_manifest_watcher()
+        self.application._stop_operation_worker()
         self.tempdir.cleanup()
 
     def write_profiles(self, records: list[dict[str, object]]) -> None:
@@ -102,36 +103,26 @@ class ManifestWatcherTests(unittest.TestCase):
 
     def test_watcher_submits_reload_on_edit_and_advances_baseline(self) -> None:
         self.seed()
-        with patch.object(
-            self.application, "submit_profile_reload_operation"
-        ) as submit:
-            # Baseline already matches the file: no spurious submit.
-            self.application._maybe_reload_manifest()
-            self.assertEqual(submit.call_count, 0)
-            # A real edit (a new profile) must be detected and submitted once.
-            self.write_profiles(
-                [
-                    make_profile_record("main", "main", self.model),
-                    make_profile_record("extra", "extra", self.model),
-                ]
-            )
-            self.application._maybe_reload_manifest()
-            self.assertEqual(submit.call_count, 1)
-            # Baseline advanced to the new state: a repeat of the same file is a
-            # no-op (idempotent, no duplicate submit).
-            self.application._maybe_reload_manifest()
-            self.assertEqual(submit.call_count, 1)
-            # A further edit is detected again.
-            self.write_profiles(
-                [
-                    make_profile_record("main", "main", self.model),
-                    make_profile_record("extra", "extra", self.model),
-                    make_profile_record("third", "third", self.model),
-                ]
-            )
-            self.application._maybe_reload_manifest()
-            self.assertEqual(submit.call_count, 2)
-        submit.assert_called()
+        baseline = self.application._last_manifest_identity
+        self.application._maybe_reload_manifest()
+        self.assertEqual(self.application.operation_queue.list_executions(), ())
+        self.write_profiles([
+            make_profile_record("main", "main", self.model),
+            make_profile_record("extra", "extra", self.model),
+        ])
+        self.application._maybe_reload_manifest()
+        self.application._maybe_reload_manifest()
+        self.assertEqual(len(self.application.operation_queue.list_executions()), 1)
+        self.assertEqual(self.application._last_manifest_identity, baseline)
+        self.complete_reload()
+        self.assertEqual(self.application._last_manifest_identity, _manifest_identity(self.profiles_path))
+        self.assertIsNotNone(self.application.registry.try_resolve("extra"))
+
+    def complete_reload(self) -> None:
+        request = self.application.operation_queue.list_executions()[0].request_ids[0]
+        self.application.start_operation_worker()
+        self.assertEqual(self.application.wait_for_operation(request, 5)["status"], "succeeded")
+        self.application._maybe_reload_manifest()
 
     def test_watcher_noop_when_manifest_stable(self) -> None:
         self.seed()
@@ -151,7 +142,7 @@ class ManifestWatcherTests(unittest.TestCase):
         self.profiles_path.write_text("{ not valid json", encoding="utf-8")
         self.application._maybe_reload_manifest()
         self.assertEqual(self.application._last_manifest_identity, baseline)
-        # Recovery: a valid edit is detected and applied (baseline advances).
+        # Recovery: acceptance alone does not advance the applied baseline.
         self.write_profiles(
             [
                 make_profile_record("main", "main", self.model),
@@ -159,6 +150,8 @@ class ManifestWatcherTests(unittest.TestCase):
             ]
         )
         self.application._maybe_reload_manifest()
+        self.assertEqual(self.application._last_manifest_identity, baseline)
+        self.complete_reload()
         self.assertEqual(
             self.application._last_manifest_identity, _manifest_identity(self.profiles_path)
         )
@@ -179,12 +172,11 @@ class ManifestWatcherTests(unittest.TestCase):
             # A failed submit must keep the baseline at the last loaded state so the
             # change is retried on the next tick (not dropped).
             self.assertEqual(self.application._last_manifest_identity, baseline_after_seed)
-        # Recovery: once the submit succeeds, the baseline advances and it is applied.
-        with patch.object(self.application, "submit_profile_reload_operation") as submit:
-            self.application._maybe_reload_manifest()
-            self.assertEqual(submit.call_count, 1)
-            self.assertEqual(self.application._last_manifest_identity, _manifest_identity(self.profiles_path))
-        submit.assert_called_once()
+        # Recovery must pass through a real successful registry swap.
+        self.application._maybe_reload_manifest()
+        self.assertEqual(self.application._last_manifest_identity, baseline_after_seed)
+        self.complete_reload()
+        self.assertEqual(self.application._last_manifest_identity, _manifest_identity(self.profiles_path))
 
     def test_seeded_baseline_matches_loaded_manifest(self) -> None:
         # The baseline seeded at startup equals the hash of the manifest that was

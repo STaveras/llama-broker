@@ -731,6 +731,7 @@ class ProfileRegistry:
             {key: profile for key, profile in aliases.items() if profile.is_resident}
         )
         self._runtime_catalog = runtime_catalog
+        self.manifest_identity: str | None = None
 
     @classmethod
     def from_path(
@@ -738,9 +739,9 @@ class ProfileRegistry:
     ) -> "ProfileRegistry":
         manifest_path = Path(path)
         try:
-            from .profile_config import load_manifest
+            from .profile_config import load_manifest_snapshot
 
-            payload = load_manifest(manifest_path)
+            payload, identity = load_manifest_snapshot(manifest_path)
         except ProfileError:
             raise
         except OSError as exc:
@@ -801,7 +802,9 @@ class ProfileRegistry:
         ids = [profile.id for profile in parsed_profiles]
         if len(ids) != len(set(ids)):
             raise ProfileError("duplicate profile id")
-        return cls(parsed_profiles, runtime_catalog=runtime_catalog)
+        registry = cls(parsed_profiles, runtime_catalog=runtime_catalog)
+        registry.manifest_identity = identity
+        return registry
 
     @property
     def profiles(self) -> tuple[Profile, ...]:
