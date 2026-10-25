@@ -21,6 +21,7 @@ Usage:
     brokerctl profile edit [MODEL]         Open the field-oriented profile editor
     brokerctl profile add MODEL            Inspect a candidate (non-mutating)
     brokerctl runtime list                 List runtimes and their profiles
+    brokerctl clean [CATEGORY ...]         List unused models/runtimes/backups; --apply cleans
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
-from . import daemon as broker_runtime
+from . import __version__, daemon as broker_runtime
 from .backend_controller import BackendControllerError, _atomic_write
 from .broker_security import (
     ensure_security_material,
@@ -60,6 +61,7 @@ from .broker_profiles import (
     launch_environment,
 )
 from .discovery import discover_backends
+from .model_bundles import discover_model_bundles
 from .profile_config import (
     ApplyError,
     apply_manifest_transaction,
@@ -74,8 +76,30 @@ from .runtime_builds import (
     runtime_build_label,
 )
 from .runtimes import get_runtime_info, list_runtimes, runtime_names
+from .runtime_control import (RuntimeControlError, project_add, project_list, project_fetch,
+                              project_commits, bundle_plan, bundle_build, bundle_list, bundle_verify)
+from .runtime_control_ui import bundle_table_rows, select_source, project_branches
 from .integration import filtered_manifest, inspect_manifest, report_for
-from .paths import MODELS_DIR, RUNTIME_CATALOG_PATH, RUNTIMES_DIR
+from .hygiene import (
+    CATEGORIES as CLEAN_CATEGORIES,
+    DEFAULT_CATEGORIES as DEFAULT_CLEAN_CATEGORIES,
+    ApplyResult,
+    CleanOptions,
+    CleanPlan,
+    CleanRoots,
+    HygieneError,
+    apply_plan,
+    build_plan,
+    still_unreferenced,
+)
+from .paths import (
+    CONFIG_DIR,
+    MODELS_DIR,
+    RUNTIME_CATALOG_PATH,
+    RUNTIME_PROVENANCE_INDEX_PATH,
+    RUNTIMES_DIR,
+    XDG_CACHE_HOME,
+)
 from .setup_wizard import (
     apply_profile_plan,
     build_setup_plan,
@@ -259,6 +283,18 @@ def _verify_profile(profile: Profile) -> list[str]:
     ]
     if profile.mmproj_path is not None and profile.mmproj_sha256 is not None:
         checks.append((profile.mmproj_path, profile.mmproj_sha256, "mmproj"))
+    for path_field, hash_field, label in (
+        ("strata_artifacts_manifest_path", "strata_artifacts_manifest_sha256", "Strata manifest"),
+        ("strata_launch_config_path", "strata_launch_config_sha256", "Strata launch config"),
+    ):
+        path = getattr(profile, path_field, None)
+        digest = getattr(profile, hash_field, None)
+        if path is not None and isinstance(digest, str):
+            checks.append((Path(path), digest, label))
+    checks.extend(
+        (Path(path), digest, "Strata artifact")
+        for path, digest in getattr(profile, "strata_artifact_files", ())
+    )
     for path, expected, kind in checks:
         try:
             actual = _hash_file(path)
@@ -270,6 +306,168 @@ def _verify_profile(profile: Profile) -> list[str]:
                 f"{profile.id} {kind} SHA mismatch: expected {expected}, got {actual} ({path})"
             )
     return failures
+
+
+CLEAN_KEEP_FILENAME = "clean-keep"
+
+
+def _format_bytes(count: int) -> str:
+    value = float(count)
+    for unit in ("B", "KiB", "MiB"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"
+
+
+def _clean_roots(profiles_path: Path) -> CleanRoots:
+    return CleanRoots(
+        profiles_path=profiles_path,
+        catalog_path=RUNTIME_CATALOG_PATH,
+        provenance_path=RUNTIME_PROVENANCE_INDEX_PATH,
+        models_dir=MODELS_DIR,
+        runtimes_dir=RUNTIMES_DIR,
+        config_dir=CONFIG_DIR,
+        cache_home=XDG_CACHE_HOME,
+        home=Path.home(),
+    )
+
+
+def _clean_keep_paths(extra: Sequence[str]) -> tuple[Path, ...]:
+    """Paths `clean` must never touch: --keep plus CONFIG_DIR/clean-keep."""
+    lines = list(extra)
+    keep_file = CONFIG_DIR / CLEAN_KEEP_FILENAME
+    if keep_file.is_file():
+        lines.extend(
+            line.strip()
+            for line in keep_file.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    paths = tuple(Path(line).expanduser() for line in lines)
+    for path in paths:
+        if not path.is_absolute():
+            raise HygieneError(f"keep path must be absolute: {path}")
+    return paths
+
+
+def _interactive_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _print_clean_plan(plan: CleanPlan, categories: Sequence[str], *, applying: bool) -> None:
+    print("brokerctl clean")
+    for category in CLEAN_CATEGORIES:
+        if category not in categories:
+            if category == "caches":
+                print("\ncaches: not checked (add `caches` to include package caches)")
+            continue
+        items = [c for c in plan.candidates if c.category == category]
+        action = items[0].action if items else ""
+        print(f"\n{category}" + (f" ({action})" if action else ": nothing to clean"))
+        for item in items:
+            print(f"  {_format_bytes(item.size_bytes):>10}  {item.path}")
+            print(f"  {'':>10}  {item.reason}")
+    if plan.skipped:
+        print("\nleft alone:")
+        for skipped in plan.skipped:
+            print(f"  {skipped.category:<9} {skipped.path}  ({skipped.reason})")
+    if not applying and plan.candidates:
+        print(
+            f"\nWould archive {_format_bytes(plan.total_bytes('archive'))} "
+            f"and delete {_format_bytes(plan.total_bytes('delete'))}."
+        )
+        if any(c.category == "models" and c.action == "delete" for c in plan.candidates):
+            print("Model files are deleted permanently; add --archive-dir DIR to keep a copy.")
+
+
+def _print_clean_result(result: ApplyResult) -> None:
+    archived = sum(int(entry["size_bytes"]) for entry in result.archived)
+    deleted = sum(int(entry["size_bytes"]) for entry in result.deleted)
+    print(f"\nArchived {len(result.archived)} item(s), {_format_bytes(archived)}"
+          + (f" to {result.run_dir} (see MANIFEST.json)" if result.run_dir else ""))
+    print(f"Deleted {len(result.deleted)} item(s), {_format_bytes(deleted)}")
+    for entry in result.skipped:
+        print(f"  skipped {entry['path']}: {entry['reason']}")
+    for entry in result.failed:
+        print(f"  FAILED {entry['path']}: {entry['error']} (original kept)", file=sys.stderr)
+
+
+def _confirm_clean(plan: CleanPlan) -> bool:
+    """Ask before acting on a dry run's plan; anything but yes declines."""
+    steps = []
+    for action, verb in (("archive", "archive"), ("delete", "permanently delete")):
+        items = [c for c in plan.candidates if c.action == action]
+        if items:
+            steps.append(f"{verb} {len(items)} item(s), {_format_bytes(plan.total_bytes(action))}")
+    question = " and ".join(steps)
+    try:
+        answer = input(f"\n{question[0].upper()}{question[1:]}? [y/N] ").strip().casefold()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _cmd_clean(args: argparse.Namespace) -> int:
+    categories = tuple(dict.fromkeys(args.categories)) or DEFAULT_CLEAN_CATEGORIES
+    unknown = [category for category in categories if category not in CLEAN_CATEGORIES]
+    if unknown:
+        raise HygieneError(
+            f"unknown clean category {', '.join(unknown)}; choose from {', '.join(CLEAN_CATEGORIES)}"
+        )
+    if args.min_size_mib < 0 or args.min_age_days < 0 or args.keep_backups < 0:
+        raise HygieneError("--min-size-mib, --min-age-days and --keep-backups cannot be negative")
+    # Deleting is the default; an archive directory opts models and backups
+    # into being copied off first.
+    archive_value = args.archive_dir or os.environ.get("LLAMA_BROKER_ARCHIVE_DIR")
+    archive_dir = Path(archive_value).expanduser() if archive_value else None
+    options = CleanOptions(
+        categories=categories,
+        min_size_bytes=args.min_size_mib * 1024 * 1024,
+        min_age_seconds=args.min_age_days * 86400.0,
+        keep_backups=args.keep_backups,
+        keep_paths=_clean_keep_paths(args.keep),
+        archive=archive_dir is not None,
+    )
+    roots = _clean_roots(args.profiles)
+    plan = build_plan(roots, options)
+
+    def apply() -> ApplyResult:
+        return apply_plan(
+            plan,
+            archive_dir=archive_dir,
+            still_unreferenced=still_unreferenced(roots, options),
+            log=(lambda _message: None) if args.json else (lambda message: print(message, file=sys.stderr)),
+        )
+
+    result = apply() if args.apply else None
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "dry_run": result is None,
+            "categories": list(categories),
+            "candidates": [candidate.as_mapping() for candidate in plan.candidates],
+            "skipped": [skipped.as_mapping() for skipped in plan.skipped],
+            "totals": {
+                "archive_bytes": plan.total_bytes("archive"),
+                "delete_bytes": plan.total_bytes("delete"),
+            },
+            "result": result.as_mapping() if result is not None else None,
+        }, indent=2, sort_keys=True))
+        return 1 if result is not None and result.failed else 0
+
+    _print_clean_plan(plan, categories, applying=args.apply)
+    if result is not None:
+        _print_clean_result(result)
+    if result is None and plan.candidates:
+        # A dry run at a terminal offers to go ahead; scripts get the plan only.
+        if not _interactive_terminal():
+            print("\nRun the same command with --apply to do this.")
+        elif _confirm_clean(plan):
+            result = apply()
+            _print_clean_result(result)
+        else:
+            print("Nothing changed.")
+    return 1 if result is not None and result.failed else 0
 
 
 PROFILE_MUTATION_REMINDER = (
@@ -331,7 +529,29 @@ def _refresh_live_profile_registry(profiles_path: Path) -> None:
     if not _is_authoritative_manifest(profiles_path):
         return
     try:
-        _broker_admin("/admin/autotune/reload", {})
+        submitted = _broker_admin("/admin/autotune/reload", {"wait": False})
+        operation = submitted.get("operation")
+        request_id = operation.get("request_id") if isinstance(operation, Mapping) else None
+        if not isinstance(request_id, str) or not request_id:
+            raise BackendControllerError(
+                "live broker did not return a profile reload request ID"
+            )
+        while True:
+            result = _broker_admin_get(f"/admin/operations/{request_id}")
+            operation = result.get("operation")
+            if not isinstance(operation, Mapping):
+                raise BackendControllerError(
+                    f"profile reload status is unavailable for request {request_id}"
+                )
+            status = operation.get("status")
+            if status in {"succeeded", "failed", "cancelled"}:
+                if status != "succeeded":
+                    detail = operation.get("error") or operation.get("error_type") or status
+                    raise BackendControllerError(
+                        f"profile reload request {request_id} {status}: {detail}"
+                    )
+                return
+            time.sleep(0.5)
     except Exception as error:
         raise ApplyError(f"live broker profile registry refresh failed: {error}") from error
 
@@ -405,6 +625,8 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         "role": "role",
         "alias": "alias",
         "server-binary": "server_binary",
+        "strata-artifacts-manifest": "strata_artifacts_manifest_path",
+        "strata-launch-config": "strata_launch_config_path",
         "model": "model_path",
         "model-sha256": "model_sha256",
         "context": "context_size",
@@ -459,7 +681,10 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
         record[key] = value
     elif field == "gpu-layers":
         record[key] = _validate_gpu_layers(raw_value)
-    elif field in {"server-binary", "model", "mmproj"}:
+    elif field in {
+        "server-binary", "model", "mmproj",
+        "strata-artifacts-manifest", "strata-launch-config",
+    }:
         value = raw_value.strip()
         if field == "mmproj" and not value:
             record.pop("mmproj_path", None)
@@ -476,6 +701,10 @@ def _set_scalar_field(record: dict[str, object], field: str, raw_value: str) -> 
             record["server_sha256"] = sha256_file(path)
         elif field == "model":
             record["model_sha256"] = sha256_file(path)
+        elif field == "strata-artifacts-manifest":
+            record["strata_artifacts_manifest_sha256"] = sha256_file(path)
+        elif field == "strata-launch-config":
+            record["strata_launch_config_sha256"] = sha256_file(path)
         else:
             record["mmproj_sha256"] = sha256_file(path)
             capabilities = set(record.get("capabilities", ["text"]))
@@ -510,6 +739,14 @@ def _remove_optional_field(record: dict[str, object], field: str) -> None:
         return
     if field == "model-draft":
         record.pop("model_draft", None)
+        return
+    if field == "strata-artifacts-manifest":
+        record.pop("strata_artifacts_manifest_path", None)
+        record.pop("strata_artifacts_manifest_sha256", None)
+        return
+    if field == "strata-launch-config":
+        record.pop("strata_launch_config_path", None)
+        record.pop("strata_launch_config_sha256", None)
         return
     if field in {"environment", "env"}:
         environment = dict(record.get("environment", {}))
@@ -594,6 +831,68 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
     if selected_build is None:
         selected_build = template_build
 
+    strata_manifest_path: Path | None = None
+    strata_launch_path: Path | None = None
+    strata_launch_config: dict[str, Any] | None = None
+    strata_context_size: int | None = None
+    strata_default_alias: str | None = None
+    if selected_build is not None and selected_build.runtime == "strata":
+        raw_manifest_path = getattr(args, "strata_artifacts_manifest", None)
+        raw_launch_path = getattr(args, "strata_launch_config", None)
+        if not raw_manifest_path or not raw_launch_path:
+            raise ProfileError(
+                "Strata profile add requires --strata-artifacts-manifest and --strata-launch-config"
+            )
+        strata_manifest_path = _normalise_existing_path(
+            str(raw_manifest_path), "strata-artifacts-manifest"
+        )
+        strata_launch_path = _normalise_existing_path(
+            str(raw_launch_path), "strata-launch-config"
+        )
+        try:
+            strata_launch_config = json.loads(strata_launch_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ProfileError(f"cannot read Strata launch config: {error}") from error
+        if not isinstance(strata_launch_config, dict):
+            raise ProfileError("Strata launch config must be a JSON object")
+        strata_default_alias = strata_launch_config.get("model_name")
+        engine_args = strata_launch_config.get("engine_args")
+        if not isinstance(strata_default_alias, str) or not strata_default_alias.strip():
+            raise ProfileError("Strata launch config requires a non-empty model_name")
+        if not isinstance(engine_args, list) or not all(isinstance(value, str) for value in engine_args):
+            raise ProfileError("Strata launch config engine_args must be a string list")
+        try:
+            context_index = engine_args.index("--max-context")
+            strata_context_size = int(engine_args[context_index + 1])
+        except (ValueError, IndexError) as error:
+            raise ProfileError("Strata launch config requires --max-context") from error
+        if engine_args.count("--max-context") != 1 or strata_context_size <= 0:
+            raise ProfileError("Strata launch config has invalid --max-context")
+        manifest = json.loads(strata_manifest_path.read_text(encoding="utf-8"))
+        try:
+            first_shard = manifest["model"]["shards"][0]["path"]
+            expected_model = (strata_manifest_path.parent / first_shard).resolve()
+        except (KeyError, IndexError, TypeError, AttributeError) as error:
+            raise ProfileError("Strata artifact manifest has no first model shard") from error
+        selected_model = _normalise_existing_path(str(args.model), "model")
+        if selected_model != expected_model:
+            raise ProfileError("--model must be the first shard pinned by the Strata artifact manifest")
+        requested_aliases = [item.strip() for item in (args.alias or []) if item.strip()]
+        if requested_aliases and requested_aliases[0] != strata_default_alias:
+            raise ProfileError("Strata profile alias must match launch config model_name")
+        if args.context is not None and args.context != strata_context_size:
+            raise ProfileError("--context must match Strata launch config --max-context")
+        if args.parallel not in (None, 1):
+            raise ProfileError("Strata profile parallel must be 1")
+        if args.role not in (None, "persistent"):
+            raise ProfileError("Strata profiles must be persistent")
+        if any(getattr(args, field, None) is not None for field in (
+            "batch", "ubatch", "cache_k", "cache_v", "flash", "gpu_layers", "restore"
+        )):
+            raise ProfileError("Strata profiles do not accept llama.cpp-only options")
+        if args.mmproj or args.env or args.extra_args:
+            raise ProfileError("Strata profiles do not accept vision, profile environment, or extra args")
+
     if selected_build is not None:
         if requested_server_path is not None and (
             requested_server_path != selected_build.server_binary
@@ -614,9 +913,10 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
             for field in tuple(record):
                 if field not in editable_fields:
                     record.pop(field, None)
-            # Extra arguments are runtime-specific; callers can add new ones
-            # through --arg after the target runtime has been selected.
-            record["extra_args"] = []
+            if selected_build.runtime == "strata":
+                record.pop("extra_args", None)
+            else:
+                record["extra_args"] = []
         record.update(
             {
                 "runtime": selected_build.runtime,
@@ -656,7 +956,8 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
         )
 
     model_path = _normalise_existing_path(args.model, "model")
-    aliases = [item.strip() for item in (args.alias or [profile_id]) if item.strip()]
+    default_alias = strata_default_alias if strata_default_alias is not None else profile_id
+    aliases = [item.strip() for item in (args.alias or [default_alias]) if item.strip()]
     if not aliases:
         raise ProfileError("at least one non-empty alias is required")
 
@@ -674,6 +975,38 @@ def _build_added_profile(args: argparse.Namespace, data: dict[str, object]) -> d
         record.pop(key, None)
     record["model_path"] = str(model_path)
     record["model_sha256"] = sha256_file(model_path)
+    if selected_build is not None and selected_build.runtime == "strata":
+        assert strata_manifest_path is not None and strata_launch_path is not None
+        assert strata_context_size is not None
+        record["strata_artifacts_manifest_path"] = str(strata_manifest_path)
+        record["strata_artifacts_manifest_sha256"] = sha256_file(strata_manifest_path)
+        record["strata_launch_config_path"] = str(strata_launch_path)
+        record["strata_launch_config_sha256"] = sha256_file(strata_launch_path)
+        record["context_size"] = strata_context_size
+        record["parallel"] = 1
+        record["capabilities"] = ["text"]
+        record["native_vision"] = False
+        record.pop("extra_args", None)
+        record["safety"] = {
+            "service": {
+                "type": "exec",
+                "memory_max_mib": 20_480,
+                "memory_swap_max_mib": 1_024,
+                "tasks_max": 512,
+                "kill_signal": "SIGINT",
+                "timeout_stop_sec": 20,
+            },
+            "admission": {
+                "min_ram_available_mib": 6_144,
+                "max_swap_used_mib": 1_024,
+                "max_swap_growth_mib": 128,
+                "min_total_vram_mib": 12_000,
+                "min_free_vram_before_start_mib": 8_192,
+                "driver_vram_reserve_mib": 512,
+                "vision_vram_reserve_mib": 0,
+                "safety_vram_reserve_mib": 1_024,
+            },
+        }
 
     if args.context is not None:
         record["context_size"] = args.context
@@ -718,6 +1051,8 @@ EDITABLE_FIELDS = [
     ("runtime", "Serving runtime", str),
     ("context_size", "Context window size", int),
     ("parallel", "Parallel requests (slots)", int),
+    ("strata_artifacts_manifest_path", "Strata artifact manifest path", str),
+    ("strata_launch_config_path", "Strata launch config path", str),
     ("tensor_parallel_size", "vLLM tensor parallel size", int),
     ("gpu_memory_utilization", "vLLM GPU memory utilization", float),
     ("kv_cache_dtype", "vLLM KV cache dtype", str),
@@ -732,6 +1067,11 @@ EDITABLE_FIELDS = [
     ("fit_target_mib", "Fit target MiB", int),
     ("fit_ctx", "Fit context size", int),
 ]
+
+STRATA_HASHED_PATH_FIELDS = {
+    "strata_artifacts_manifest_path": "strata_artifacts_manifest_sha256",
+    "strata_launch_config_path": "strata_launch_config_sha256",
+}
 
 FIT_ONLY_FIELDS = (
     "fit_target_mib",
@@ -810,6 +1150,26 @@ def _interactive_edit(
         flag_value = flags.get(field_key)
 
         if flag_mode and flag_value is None:
+            continue
+
+        if field_key in STRATA_HASHED_PATH_FIELDS:
+            raw_path = flag_value
+            if raw_path is None:
+                raw_path = input(f"  {field_label} [{current or ''}]: ").strip()
+            raw_path = raw_path.strip()
+            hash_key = STRATA_HASHED_PATH_FIELDS[field_key]
+            if not raw_path:
+                profile_data.pop(field_key, None)
+                profile_data.pop(hash_key, None)
+                changed = True
+                continue
+            path = _normalise_existing_path(raw_path, field_key)
+            digest = sha256_file(path)
+            if profile_data.get(field_key) != str(path) or profile_data.get(hash_key) != digest:
+                profile_data[field_key] = str(path)
+                profile_data[hash_key] = digest
+                changed = True
+                print(f"  {field_label}: pinned {path}")
             continue
 
         if flag_value is not None:
@@ -957,7 +1317,19 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             print(f"ERROR: integration cannot establish safe manifest ownership: {error}", file=sys.stderr)
             return 1
 
-    ready = [item for item in inspections if item.status == "ready" and item.profile is not None]
+    # Resident decision profiles are sidecar backends, not switchable profile
+    # units.  Keep them in the inspection/report (and therefore preserve their
+    # validation status), but do not feed them to the generic profile-unit
+    # controller or client-provider adapter.  The latter only accepts the
+    # switchable profile registry and would otherwise reject a valid resident
+    # alias such as d1-3b at the integration boundary.
+    ready = [
+        item
+        for item in inspections
+        if item.status == "ready"
+        and item.profile is not None
+        and not item.profile.is_resident
+    ]
     if not ready:
         result = report_for(inspections)
         if getattr(args, "json", False):
@@ -1083,6 +1455,7 @@ def _cmd_integrate(args: argparse.Namespace) -> int:
             "reason": item.reason,
         }
         for item in planned
+        if item.profile is not None and not item.profile.is_resident
     ]
     cleanup_report: dict[str, object] | None = None
     if clean_requested:
@@ -1311,8 +1684,8 @@ def _safe_manifest_profile_ids(payload: Mapping[str, Any]) -> frozenset[str]:
 
 def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
     references: list[Path] = []
+    payload: object = {}
     if profiles_path.is_file():
-        payload: object = {}
         try:
             payload = json.loads(profiles_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1339,7 +1712,7 @@ def _setup_referenced_paths(profiles_path: Path) -> list[Path]:
     try:
         if RUNTIME_CATALOG_PATH.is_file() and profiles_path.is_file() and strict_schema:
             registry = ProfileRegistry.from_path(profiles_path, allow_missing_artifacts=True)
-            for profile in registry.profiles:
+            for profile in (*registry.profiles, *registry.resident_profiles):
                 references.extend(
                     path
                     for path in (
@@ -1625,7 +1998,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             if registry is None:
                 registry = ProfileRegistry.from_path(args.profiles)
             all_failures = []
-            for profile in registry.profiles:
+            for profile in (*registry.profiles, *registry.resident_profiles):
                 failures = _verify_profile(profile)
                 if failures:
                     all_failures.extend(failures)
@@ -1890,55 +2263,50 @@ def _model_payload(profile: Profile) -> dict[str, object]:
 
 
 def _cmd_model_list(args: argparse.Namespace) -> int:
-    """List client-facing model references backed by canonical profiles."""
+    """List managed on-disk model artifacts; profiles are a separate command."""
 
-    registry = ProfileRegistry.from_path(args.profiles)
-    models = [_model_payload(profile) for profile in registry.profiles]
+    bundles = discover_model_bundles(getattr(args, "scan_path", None) or [MODELS_DIR])
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {"schema_version": 1, "object": "model_list", "data": models},
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        # Schema 2 makes ``data`` truthful: entries are artifact bundles, not
+        # profile selectors. Profile references remain available to lifecycle
+        # commands and ``brokerctl profile list``.
+        print(json.dumps({"schema_version": 2, "object": "model_list", "data": bundles}, indent=2, sort_keys=True))
         return 0
-
-    if not models:
-        print("No models configured.")
-        return 0
-
-    rows = [
-        (
-            profile.alias,
-            profile.display_name,
-            profile.runtime,
-            ", ".join(sorted(profile.capabilities)),
-            f"{profile.context_size:,}",
-            profile.parallel,
-        )
-        for profile in registry.profiles
-    ]
-    print(
-        _render_table(
-            (
-                "PROFILE",
-                "MODEL",
-                "RUNTIME",
-                "CAPABILITIES",
-                "CONTEXT",
-                "SLOTS",
-            ),
-            rows,
-            width=_terminal_width(getattr(args, "width", None)),
-        )
-    )
+    _print_model_bundles(bundles, args)
+    if not bundles:
+        print("No managed model artifacts found.")
     return 0
+
+
+def _print_model_bundles(bundles: Sequence[Mapping[str, Any]], args: argparse.Namespace) -> None:
+    if not bundles:
+        return
+    width = _terminal_width(getattr(args, "width", None))
+
+    def line(value: str, prefix: str = "", continuation: str = "") -> None:
+        for index, part in enumerate(_wrap_cell(value, max(1, width - len(prefix)))):
+            print((prefix if index == 0 else continuation) + part)
+
+    print()
+    line("Local model bundles (file presence only):")
+    for bundle in bundles:
+        line(f"{bundle['name']} [{bundle['format']}, {bundle['status']}] ({bundle['size']:,} bytes)")
+        if getattr(args, "verbose", False):
+            line(f"root: {bundle['bundle_root']}", "  ", "  ")
+            line(f"file reference: {bundle['path']}", "  ", "  ")
+        children = [f"{item['relative_path']} ({item['size']:,} bytes)" for item in bundle["files"]]
+        children.extend(f"{name} [missing or unfinished]" for name in bundle["missing_files"])
+        for index, child in enumerate(children):
+            last = index == len(children) - 1
+            line(child, "└── " if last else "├── ", "    " if last else "│   ")
+        for issue in bundle["issues"]:
+            line(issue, "  ! ", "    ")
+
 
 def _cmd_profiles_list(args: argparse.Namespace) -> int:
     """List profiles with status."""
     registry = ProfileRegistry.from_path(args.profiles)
-    for profile in registry.profiles:
+    for profile in (*registry.profiles, *registry.resident_profiles):
         caps = ",".join(sorted(profile.capabilities))
         slot_ctx = profile.slot_context_window
         print(
@@ -2684,7 +3052,25 @@ def _cmd_profiles_template(args: argparse.Namespace) -> int:
 def _cmd_runtime_list(args: argparse.Namespace) -> int:
     """List registered runtimes and the profile-backed models selecting each."""
 
-    registry = ProfileRegistry.from_path(args.profiles)
+    try:
+        registry = ProfileRegistry.from_path(args.profiles)
+    except ProfileError as error:
+        if not args.profiles.exists():
+            detail = {
+                "schema_version": 2,
+                "object": "runtime_list",
+                "status": "unconfigured",
+                "data": [],
+                "message": f"No profile configuration yet at {args.profiles}.",
+                "howto": "Run `brokerctl setup` to discover and select a runtime and model.",
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(detail, indent=2, sort_keys=True))
+            else:
+                print(detail["message"])
+                print(detail["howto"])
+            return 1
+        raise
     catalog_builds = registry.runtime_builds
     runtime_rows: list[dict[str, object]] = []
     for runtime in list_runtimes():
@@ -2711,6 +3097,7 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
                     "source_repository": (
                         str(build.source_repository) if build.source_repository else None
                     ),
+                    "source_url": build.source_url,
                     "provenance_file": (
                         str(build.provenance_file) if build.provenance_file else None
                     ),
@@ -2761,7 +3148,7 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
     # One row per (family, bundle) pair so the table reads:
     # family -> bundle -> the profiles using that bundle. The family cell
     # spans its bundle rows (blanked on continuation rows).
-    rows: list[tuple[str, str, str]] = []
+    rows: list[tuple[str, str, str, str]] = []
     for row in runtime_rows:
         family = str(row["name"])
         family_profiles = [
@@ -2790,6 +3177,10 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
             profiles_by_bundle.setdefault(
                 profile.runtime_build or "(none)", []
             ).append(profile.alias)
+        sources = {
+            str(build["id"]): str(build.get("source_url") or "(unknown)")
+            for build in row["builds"]
+        }
         for bundle in bundles:
             aliases = profiles_by_bundle.get(bundle)
             rows.append(
@@ -2797,23 +3188,52 @@ def _cmd_runtime_list(args: argparse.Namespace) -> int:
                     family,
                     bundle,
                     ", ".join(aliases) if aliases else "(none)",
+                    sources.get(bundle, "(unknown)"),
                 )
             )
     # Blank the family cell on continuation rows (one family per visual block).
-    rendered: list[tuple[str, str, str]] = []
+    rendered: list[tuple[str, str, str, str]] = []
     last_family: str | None = None
-    for family, bundle, profiles in rows:
+    for family, bundle, profiles, source in rows:
         rendered.append(
-            ("" if family == last_family else family, bundle, profiles)
+            ("" if family == last_family else family, bundle, profiles, source)
         )
         last_family = family
     print(
         _render_table(
-            ("RUNTIME", "BUNDLE", "PROFILES"),
+            ("RUNTIME", "BUNDLE", "PROFILES", "SOURCE URL"),
             rendered,
             width=_terminal_width(getattr(args, "width", None)),
         )
     )
+    return 0
+
+
+def _cmd_runtime_control(args: argparse.Namespace) -> int:
+    root = Path(args.control_root).expanduser().resolve()
+    if args.runtime_command == "project":
+        if args.project_command == "add": result = project_add(root, args.name, args.url, default_branch=args.default_branch)
+        elif args.project_command == "list": result = project_list(root)
+        elif args.project_command == "fetch": result = project_fetch(root, args.name)
+        elif args.project_command == "branches": result = project_branches(root, args.name)
+        else: result = project_commits(root, args.name, args.ref)
+    else:
+        if args.bundle_command == "plan":
+            selection = select_source(root, args.name) if args.select else {}
+            result = bundle_plan(root, args.name, branch=args.branch, commit=args.commit or selection.get("commit"), allow_network=args.allow_network, recipe=args.recipe, cuda_arch=args.cuda_arch)
+        elif args.bundle_command == "build":
+            if args.select and not args.build:
+                raise RuntimeControlError("--select only chooses a source; add --build to execute")
+            selection = select_source(root, args.name) if args.select else {}
+            result = bundle_build(root, args.name, branch=args.branch, commit=args.commit or selection.get("commit"), allow_network=args.allow_network, jobs=args.jobs, recipe=args.recipe, cuda_arch=args.cuda_arch)
+        elif args.bundle_command == "list":
+            manifests = bundle_list(root)
+            if getattr(args, "json", False): result = manifests
+            else:
+                print(_render_table(("FAMILY", "SOURCE URL", "COMMIT", "SUBJECT", "STATUS"), bundle_table_rows(manifests), width=_terminal_width(getattr(args, "width", None))))
+                return 0
+        else: result = bundle_verify(root, args.name)
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
@@ -2949,6 +3369,8 @@ def _cmd_profiles_edit(args: argparse.Namespace) -> int:
     flags = {
         "runtime": args.runtime,
         "runtime_build": args.runtime_build,
+        "strata_artifacts_manifest_path": args.strata_artifacts_manifest_path,
+        "strata_launch_config_path": args.strata_launch_config_path,
         "context_size": args.context_size,
         "parallel": args.parallel,
         "tensor_parallel_size": args.tensor_parallel_size,
@@ -3170,19 +3592,25 @@ def _add_integrate_options(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="brokerctl",
-        description="Administrative CLI for broker-owned immutable backend profiles.",
+        description="Manage local model profiles, serving runtimes, and client integrations.",
     )
     parser.add_argument("--profiles", type=Path, default=PROFILES_PATH)
+    parser.add_argument(
+        "--version", action="version", version=f"llama-broker {__version__}",
+        help="show the installed package version and exit",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     model = subparsers.add_parser(
-        "model", help="inspect profile-backed client-facing models"
+        "model", help="inspect profile-backed models and local model bundles"
     )
     model_sub = model.add_subparsers(dest="model_command", required=True)
     model_list = model_sub.add_parser(
-        "list", help="list canonical model references from the profile manifest"
+        "list", help="list canonical profile references and local model bundle files"
     )
     model_list.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+    model_list.add_argument("-v", "--verbose", action="store_true", help="include full bundle roots and file references in the tree")
+    model_list.add_argument("--scan-path", type=Path, action="append", help="scan this local model directory (repeatable; default: models directory)")
     model_list.add_argument(
         "--width",
         type=int,
@@ -3201,13 +3629,65 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--raw", action="store_true", help="output raw JSON")
     restart = subparsers.add_parser("restart", help="reload active model or start a new one")
     restart.add_argument("model", nargs="?")
+    restart.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
 
     unload = subparsers.add_parser("unload", help="unload the active model (stop the backend)")
     unload.add_argument("--raw", action="store_true", help="output raw JSON")
 
+    operation = subparsers.add_parser(
+        "operation", aliases=["operations"], help="inspect, wait for, or cancel a transition request"
+    )
+    operation_sub = operation.add_subparsers(dest="operation_command", required=True)
+    operation_status = operation_sub.add_parser("status", help="show one transition request")
+    operation_status.add_argument("request_id")
+    operation_sub.add_parser("list", help="list pending and recently completed operations")
+    operation_sub.add_parser("tui", help="open the interactive operation monitor")
+    operation_wait = operation_sub.add_parser("wait", help="wait for one transition request to finish")
+    operation_wait.add_argument("request_id")
+    operation_wait.add_argument("--timeout", type=float, default=3600.0)
+    operation_wait.add_argument("--interval", type=float, default=0.5)
+    operation_cancel = operation_sub.add_parser("cancel", help="cancel one transition request")
+    operation_cancel.add_argument("request_id")
+
     verify = subparsers.add_parser("verify", help="verify pinned runtime/model/projector SHA-256")
     verify.add_argument("model", nargs="?")
     verify.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
+
+    clean = subparsers.add_parser(
+        "clean",
+        help="list unused models, orphaned runtime bundles and old backups; --apply cleans them",
+        description=(
+            "Lists unused models, orphaned runtime bundles and old manifest backups, "
+            "then asks before cleaning them (scripts and --json only get the list). "
+            "--apply cleans without asking. Cleaning deletes; with --archive-dir, models "
+            "and backups are copied there and verified first. Package caches are "
+            "included only when `caches` is named."
+        ),
+    )
+    clean.add_argument(
+        "categories",
+        nargs="*",
+        metavar="CATEGORY",
+        help=f"any of {', '.join(CLEAN_CATEGORIES)} (default: {', '.join(DEFAULT_CLEAN_CATEGORIES)})",
+    )
+    clean.add_argument("--apply", action="store_true", help="clean the listed items without asking")
+    clean.add_argument(
+        "--archive-dir",
+        type=Path,
+        help="copy models and backups here before removing them, instead of deleting; "
+        "must be on another disk (or set LLAMA_BROKER_ARCHIVE_DIR)",
+    )
+    clean.add_argument("--min-size-mib", type=int, default=256, help="ignore smaller unused model files (default 256)")
+    clean.add_argument("--min-age-days", type=float, default=7.0, help="leave anything modified more recently (default 7)")
+    clean.add_argument("--keep-backups", type=int, default=10, help="newest backups kept per manifest (default 10)")
+    clean.add_argument(
+        "--keep",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=f"never touch PATH (repeatable; also read from {CONFIG_DIR / CLEAN_KEEP_FILENAME})",
+    )
+    clean.add_argument("--json", action="store_true", help="emit a versioned machine-readable report")
 
     # Public setup is the discovery wizard. It never selects a runtime profile
     # implicitly.
@@ -3276,6 +3756,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="target output width in columns; the table wraps to fit instead of overflowing the terminal (default: detected terminal width)",
     )
+    runtime.add_argument("--control-root", type=Path, default=Path.home() / ".local/share/llama-broker/runtime-control")
+    project = runtime_sub.add_parser("project", help="register and inspect reviewed source projects")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+    pa = project_sub.add_parser("add"); pa.add_argument("name"); pa.add_argument("url"); pa.add_argument("--default-branch")
+    project_sub.add_parser("list")
+    pf = project_sub.add_parser("fetch"); pf.add_argument("name")
+    pb = project_sub.add_parser("branches"); pb.add_argument("name")
+    pc = project_sub.add_parser("commits"); pc.add_argument("name"); pc.add_argument("--ref")
+    bundle = runtime_sub.add_parser("bundle", help="plan, build, list, or verify staged CPU/CUDA bundles")
+    bundle_sub = bundle.add_subparsers(dest="bundle_command", required=True)
+    for command in ("plan", "build"):
+        bp = bundle_sub.add_parser(command); bp.add_argument("name"); bp.add_argument("--branch"); bp.add_argument("--commit"); bp.add_argument("--recipe", choices=("cmake-cpu", "cmake-cuda"), default="cmake-cpu"); bp.add_argument("--cuda-arch"); bp.add_argument("--select", action="store_true", help="interactively select branch and commit (TTY only)"); bp.add_argument("--allow-network", action="store_true")
+        if command == "build":
+            bp.add_argument("--build", action="store_true", help="execute the build after interactive selection")
+            bp.add_argument("--jobs", type=int, default=2)
+    bl = bundle_sub.add_parser("list"); bl.add_argument("--json", action="store_true"); bl.add_argument("--width", type=int)
+    bv = bundle_sub.add_parser("verify"); bv.add_argument("name")
 
     security = subparsers.add_parser(
         "security", help="provision and rotate deployment-owned API-key and TLS material"
@@ -3367,6 +3864,8 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("model", nargs="?", help="profile id or alias (default: first profile)")
     edit.add_argument("--runtime", choices=runtime_names(), help="set serving runtime")
     edit.add_argument("--runtime-build", help="select a concrete cataloged runtime build")
+    edit.add_argument("--strata-artifacts-manifest-path", help="set Strata artifact manifest path")
+    edit.add_argument("--strata-launch-config-path", help="set Strata launch config path")
     edit.add_argument("--context-size", help="set context_size")
     edit.add_argument("--parallel", help="set parallel requests")
     edit.add_argument("--tensor-parallel-size", help="set vLLM tensor parallel size")
@@ -3396,7 +3895,9 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--display-name", help="human-readable display name")
     add.add_argument("--role", choices=sorted(ALLOWED_ROLES), default=None)
     add.add_argument("--runtime-build", help="select a concrete cataloged runtime build")
-    add.add_argument("--server-binary", help="absolute llama-server binary path")
+    add.add_argument("--server-binary", help="absolute pinned runtime server binary path")
+    add.add_argument("--strata-artifacts-manifest", help="pinned Strata artifact manifest")
+    add.add_argument("--strata-launch-config", help="pinned Strata launch config")
     add.add_argument("--context", type=int, help="context size")
     add.add_argument("--parallel", type=int, help="parallel slots")
     add.add_argument("--batch", type=int, help="batch size")
@@ -3467,10 +3968,24 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
         return
 
     operation = state.get("operation")
+    accepted = isinstance(operation, dict) and operation.get("status") in {
+        "accepted",
+        "queued",
+        "preflight",
+        "committed",
+    }
     if isinstance(operation, dict):
         print(f"Request:   {operation.get('status', 'unknown')}")
-        if "target" in operation:
+        request_id = operation.get("request_id")
+        execution_id = operation.get("execution_id")
+        if isinstance(request_id, str):
+            print(f"Request ID: {request_id}")
+        if isinstance(execution_id, str):
+            print(f"Execution ID: {execution_id}")
+        if operation.get("target") is not None:
             print(f"Target:    {operation['target']}")
+        if accepted and isinstance(request_id, str):
+            print(f"Wait:      brokerctl operation wait {request_id}")
     print(f"Broker:    {state.get('status', 'unknown')}")
     backend = state.get("backend")
     if not isinstance(backend, dict):
@@ -3479,7 +3994,6 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
 
     profile = backend.get("profile")
     phase = backend.get("phase", "unknown")
-    accepted = isinstance(operation, dict) and operation.get("status") == "accepted"
     if accepted:
         print(
             f"Backend:   transition pending (current: {profile if profile else 'none'})"
@@ -3494,6 +4008,138 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
         print(f"Generation: {backend['generation']}")
     if "host" in backend and "port" in backend:
         print(f"Endpoint:  {backend['host']}:{backend['port']}")
+
+
+def _crash_loop_lines(live_state: dict[str, object]) -> list[str]:
+    """Describe profiles the broker's crash-loop guard is refusing or watching."""
+    crash_loops = live_state.get("crash_loops")
+    if not isinstance(crash_loops, dict):
+        return []
+    lines = []
+    for profile_id, entry in sorted(crash_loops.items()):
+        if not isinstance(entry, dict):
+            continue
+        cause = entry.get("last_cause") or "unknown cause"
+        crashes = entry.get("crashes", 0)
+        if entry.get("tripped"):
+            lines.append(
+                f"Crash loop: {profile_id} refused for {entry.get('retry_after', 0)}s "
+                f"after {crashes} crashes (`brokerctl restart` retries now); last: {cause}"
+            )
+        elif entry.get("probation"):
+            lines.append(f"Crash loop: {profile_id} on probation; last: {cause}")
+    return lines
+
+
+def _human_restart_summary(state: dict[str, object]) -> str:
+    """One human-readable line per aspect of a restart request response."""
+    operation = state.get("operation")
+    target = None
+    if isinstance(operation, dict):
+        candidate = operation.get("target")
+        if isinstance(candidate, str) and candidate:
+            target = candidate
+    backend = state.get("backend")
+    if not isinstance(backend, dict):
+        backend = {}
+    profile = backend.get("profile")
+    current = profile if isinstance(profile, str) else None
+    if target is None and current is not None:
+        target = current
+    target_text = target if isinstance(target, str) else "(none)"
+    phase = backend.get("phase")
+    phase_text = phase if isinstance(phase, str) else "unknown"
+    return (
+        f"Requested: restart {target_text}\n"
+        f"Target:    {target_text}\n"
+        f"Phase:     {phase_text}"
+    )
+
+
+def _cmd_operation(args: argparse.Namespace) -> int:
+    """Inspect, cancel, or explicitly wait for broker operation requests."""
+    if args.operation_command == "list":
+        result = _broker_admin_get("/admin/operations")
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.operation_command == "tui":
+        from .broker_tui import OperationsTUIModel, run_operations_tui
+
+        registry = ProfileRegistry.from_path(args.profiles, allow_missing_artifacts=True)
+
+        def wait_for_tui_operation(request_id: str) -> Mapping[str, Any]:
+            deadline = time.monotonic() + 3600.0
+            while True:
+                result = _broker_admin_get(f"/admin/operations/{request_id}")
+                operation = result.get("operation")
+                if not isinstance(operation, Mapping):
+                    return result
+                if operation.get("status") in {"succeeded", "failed", "cancelled"}:
+                    return result
+                if not operation.get("waiting", True):
+                    return result
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return result
+                time.sleep(min(0.5, remaining))
+
+        model = OperationsTUIModel(
+            profiles=(profile.id for profile in registry.profiles),
+            list_operations=lambda: _broker_admin_get("/admin/operations"),
+            refresh_profiles=lambda: (
+                profile.id
+                for profile in ProfileRegistry.from_path(
+                    args.profiles, allow_missing_artifacts=True
+                ).profiles
+            ),
+            submit_load=lambda profile_id: _broker_admin(
+                "/admin/switch", {"model": profile_id, "wait": False}
+            ),
+            submit_restart=lambda: _broker_admin("/admin/restart", {"wait": False}),
+            submit_stop=lambda: _broker_admin("/admin/stop", {"wait": False}),
+            submit_reload=lambda: _broker_admin(
+                "/admin/autotune/reload", {"wait": False}
+            ),
+            status_operation=lambda request_id: _broker_admin_get(
+                f"/admin/operations/{request_id}"
+            ),
+            cancel_operation=lambda request_id: _broker_admin(
+                f"/admin/operations/{request_id}/cancel", {}
+            ),
+            wait_operation=wait_for_tui_operation,
+        )
+        return run_operations_tui(model)
+    request_id = args.request_id
+    endpoint = f"/admin/operations/{request_id}"
+    if args.operation_command == "status":
+        result = _broker_admin_get(endpoint)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.operation_command == "cancel":
+        result = _broker_admin(f"{endpoint}/cancel", {})
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.operation_command != "wait":
+        raise BackendControllerError("unknown operation command")
+    if args.timeout <= 0 or args.interval <= 0:
+        print("operation wait timeout and interval must be positive", file=sys.stderr)
+        return 2
+
+    deadline = time.monotonic() + args.timeout
+    while True:
+        result = _broker_admin_get(endpoint)
+        operation = result.get("operation")
+        if not isinstance(operation, dict):
+            raise BackendControllerError("broker returned malformed operation status")
+        status = operation.get("status")
+        if status in {"succeeded", "failed", "cancelled"} or not operation.get("waiting", True):
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if status == "succeeded" else (1 if status in {"failed", "cancelled"} else 0)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 124
+        time.sleep(min(args.interval, remaining))
 
 
 def _normalise_cli_argv(argv: list[str] | None) -> list[str] | None:
@@ -3534,8 +4180,10 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_security_revoke(args)
         if args.command == "model" and args.model_command == "list":
             return _cmd_model_list(args)
-        if args.command == "runtime" and args.runtime_command == "list":
-            return _cmd_runtime_list(args)
+        if args.command == "runtime":
+            if args.runtime_command == "list":
+                return _cmd_runtime_list(args)
+            return _cmd_runtime_control(args)
         if args.command == "profile":
             if args.profiles_command == "list":
                 return _cmd_profiles_list(args)
@@ -3566,6 +4214,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.profiles_command == "template":
                 return _cmd_profiles_template(args)
 
+        if args.command in {"operation", "operations"}:
+            return _cmd_operation(args)
+        if args.command == "clean":
+            return _cmd_clean(args)
+
         # Original commands
         registry = ProfileRegistry.from_path(
             args.profiles, allow_missing_artifacts=args.command == "status"
@@ -3577,8 +4230,7 @@ def main(argv: list[str] | None = None) -> int:
             phase = state.get("phase", "unknown")
             profile_id = state.get("profile")
             # Durable state is useful when the broker is stopped, but the live
-            # health snapshot is the source of truth for leases and transitions
-            # only when the private backend is reachable.
+            # health snapshot is the source of truth for leases and transitions.
             backend_parts = urlsplit(effective_backend_url(load_security_config()))
             backend_host = backend_parts.hostname or "127.0.0.1"
             backend_port = backend_parts.port or 10000
@@ -3591,7 +4243,13 @@ def main(argv: list[str] | None = None) -> int:
             except BackendControllerError:
                 pass
             live_backend = live_state.get("backend")
-            if isinstance(live_backend, dict) and backend_ready:
+            live_leases = live_state.get("leases")
+            if isinstance(live_leases, dict) and live_leases.get("transitioning"):
+                # Older daemons cache the last completed backend phase while
+                # loading; an open TCP port does not make that phase current.
+                phase = "switching"
+                backend_ready = False
+            elif isinstance(live_backend, dict) and backend_ready:
                 profile_id = live_backend.get("profile", profile_id)
                 phase = live_backend.get("phase", phase)
                 if "ready" in live_backend:
@@ -3630,6 +4288,8 @@ def main(argv: list[str] | None = None) -> int:
             observed_phase = "stale" if stale_active else phase
             broker_health = live_state.get("status", "unavailable")
             print(f"Broker:    {observed_phase} (port 11434; health: {broker_health})")
+            for line in _crash_loop_lines(live_state):
+                print(line)
 
             # Backend status
             if stale_active:
@@ -3654,12 +4314,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Context:   {profile.context_size:,} tokens total; {profile.context_size // profile.parallel:,} per slot")
                     leases = live_state.get("leases")
                     leases = leases if isinstance(leases, dict) else {}
-                    active = int(leases.get("active_requests", 0) or 0)
+                    # Leases count in-flight broker requests, not backend slots:
+                    # /slots and /props probes hold a lease, and requests beyond
+                    # the profile's parallel limit wait in the backend's queue.
+                    active = int(leases.get("inference_requests", leases.get("active_requests", 0)) or 0)
                     pending = int(leases.get("pending_requests", 0) or 0)
                     pending_transitions = int(leases.get("queued_transitions", 0) or 0)
-                    utilisation = min(active / profile.parallel, 1.0) if profile.parallel else 0.0
-                    print(f"Requests:  active={active} pending={pending} (pending transitions={pending_transitions})")
-                    print(f"Slots:     {active}/{profile.parallel} in use ({utilisation:.0%})")
+                    slots = max(int(profile.parallel or 0), 0)
+                    in_use = min(active, slots)
+                    pending += active - in_use
+                    utilisation = in_use / slots if slots else 0.0
+                    print(f"Requests:  active={in_use} pending={pending} (pending transitions={pending_transitions})")
+                    print(f"Slots:     {in_use}/{slots} in use ({utilisation:.0%})")
                     if runtime_configuration_pending:
                         print("Runtime configuration pending")
                 else:
@@ -3675,6 +4341,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("Backend:   (none)")
             else:
                 print(f"Backend:   {phase}")
+                if phase == "failed":
+                    if state.get("target_profile"):
+                        print(f"Target:    {state['target_profile']}")
+                    if state.get("error"):
+                        print(f"Error:     {state['error']}")
 
             # JSON detail if requested. Include the live snapshot when one was
             # available so scripts can consume the same context shown above.
@@ -3688,15 +4359,16 @@ def main(argv: list[str] | None = None) -> int:
             profile = registry.resolve(args.model)
             print(controller.render_unit(profile.id), end="")
             return 0
-        if args.command in ("load", "start", "restart"):
+        if args.command in {"load", "start", "restart"}:
             if args.command == "restart":
-                payload = (
-                    {}
-                    if args.model is None
-                    else {"model": registry.resolve(args.model).id}
-                )
+                payload: dict[str, object] = {"wait": False}
+                if args.model is not None:
+                    payload["model"] = registry.resolve(args.model).id
                 state = _broker_admin("/admin/restart", payload)
-                print(json.dumps(state, indent=2, sort_keys=True))
+                if args.json:
+                    print(json.dumps(state, indent=2, sort_keys=True))
+                else:
+                    print(_human_restart_summary(state))
                 return 0
             profile = registry.resolve(args.model)
             state = _broker_admin(
@@ -3706,12 +4378,14 @@ def main(argv: list[str] | None = None) -> int:
             _print_admin_state(state, raw=args.raw)
             return 0
         if args.command == "unload":
-            state = _broker_admin("/admin/stop", {})
+            state = _broker_admin("/admin/stop", {"wait": False})
             _print_admin_state(state, raw=args.raw)
             return 0
         if args.command == "verify":
             profiles = (
-                [registry.resolve(args.model)] if args.model else list(registry.profiles)
+                [registry.try_resolve_resident(args.model) or registry.resolve(args.model)]
+                if args.model
+                else [*registry.profiles, *registry.resident_profiles]
             )
             failures: list[str] = []
             results: list[dict[str, object]] = []

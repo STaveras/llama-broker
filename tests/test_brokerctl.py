@@ -4,6 +4,7 @@ import io
 import json
 import shutil
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -18,6 +19,23 @@ from tests.fixtures import materialize_fixture
 
 
 class BrokerctlStatusTests(unittest.TestCase):
+    def test_top_level_version_is_available_without_a_command(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                brokerctl.build_parser().parse_args(["--version"])
+        self.assertEqual(raised.exception.code, 0)
+        project = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        self.assertEqual(output.getvalue().strip(), f"llama-broker {project['project']['version']}")
+
+    def test_setup_referenced_paths_accepts_absent_profiles_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                brokerctl._setup_referenced_paths(Path(directory) / "profiles.json"), []
+            )
+
     def test_profiles_discover_json_has_schema_version(self) -> None:
         output = io.StringIO()
         with (
@@ -39,7 +57,7 @@ class BrokerctlStatusTests(unittest.TestCase):
         ):
             result = brokerctl.main(["model", "list", "--json"])
         self.assertEqual(result, 0)
-        self.assertEqual(json.loads(output.getvalue())["schema_version"], 1)
+        self.assertEqual(json.loads(output.getvalue())["schema_version"], 2)
 
     def test_status_json_has_schema_version(self) -> None:
         controller = Mock()
@@ -76,6 +94,99 @@ class BrokerctlStatusTests(unittest.TestCase):
         self.assertIn("Broker:    stale", output.getvalue())
         self.assertIn("Backend:   unavailable", output.getvalue())
         self.assertIn("persisted profile: example-9b", output.getvalue())
+
+    def test_status_preserves_switching_while_live_backend_snapshot_is_inactive(self) -> None:
+        controller = Mock()
+        controller.state.return_value = {
+            "generation": 11,
+            "profile": None,
+            "phase": "switching",
+            "target_profile": "main",
+        }
+        live_state = {
+            "status": "ok",
+            "backend": {"profile": None, "phase": "inactive", "ready": False},
+            "leases": {"transitioning": True, "transition_target": "main"},
+        }
+
+        for json_output in (False, True):
+            with self.subTest(json_output=json_output):
+                output = io.StringIO()
+                with (
+                    patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+                    patch.object(brokerctl, "create_production_controller", return_value=controller),
+                    patch.object(brokerctl, "_broker_admin_get", return_value=live_state),
+                    patch.object(brokerctl, "backend_endpoint_ready", return_value=True),
+                    redirect_stdout(output),
+                ):
+                    result = brokerctl.main(["status", "--json"] if json_output else ["status"])
+
+                self.assertEqual(result, 1)
+                if json_output:
+                    detail = json.loads(output.getvalue())
+                    self.assertEqual(detail["observed_phase"], "switching")
+                    self.assertFalse(detail["backend_ready"])
+                else:
+                    self.assertIn("Broker:    switching", output.getvalue())
+                    self.assertIn("Backend:   switching", output.getvalue())
+
+    def test_status_reports_current_interrupted_transition_without_history_errors(self) -> None:
+        failure = "Llama-Broker startup was interrupted"
+        controller = Mock()
+        controller.state.return_value = {
+            "generation": 12,
+            "profile": None,
+            "phase": "failed",
+            "target_profile": "main",
+            "error": failure,
+            "operations": {"executions": {"old": {"error": "old timeout"}}},
+        }
+        for json_output in (False, True):
+            with self.subTest(json_output=json_output):
+                output = io.StringIO()
+                with (
+                    patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+                    patch.object(brokerctl, "create_production_controller", return_value=controller),
+                    patch.object(brokerctl, "_broker_admin_get", side_effect=brokerctl.BackendControllerError("offline")),
+                    patch.object(brokerctl, "backend_endpoint_ready", return_value=False),
+                    redirect_stdout(output),
+                ):
+                    result = brokerctl.main(["status", "--json"] if json_output else ["status"])
+
+                self.assertEqual(result, 1)
+                if json_output:
+                    detail = json.loads(output.getvalue())
+                    self.assertEqual(detail["error"], failure)
+                    self.assertEqual(detail["target_profile"], "main")
+                else:
+                    self.assertIn("Backend:   failed", output.getvalue())
+                    self.assertIn("Target:    main", output.getvalue())
+                    self.assertIn(f"Error:     {failure}", output.getvalue())
+                    self.assertNotIn("old timeout", output.getvalue())
+
+    def test_status_does_not_report_previous_failure_during_new_transition(self) -> None:
+        controller = Mock()
+        controller.state.return_value = {
+            "phase": "failed", "profile": None,
+            "target_profile": "old", "error": "previous failure",
+        }
+        output = io.StringIO()
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "create_production_controller", return_value=controller),
+            patch.object(brokerctl, "_broker_admin_get", return_value={
+                "status": "degraded",
+                "backend": {"profile": None, "phase": "switching", "ready": False},
+                "leases": {"transitioning": True, "transition_target": "main"},
+            }),
+            patch.object(brokerctl, "backend_endpoint_ready", return_value=False),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(brokerctl.main(["status"]), 1)
+
+        self.assertIn("Backend:   switching", output.getvalue())
+        self.assertNotIn("previous failure", output.getvalue())
+        self.assertNotIn("Target:    old", output.getvalue())
 
     def test_status_includes_live_context_and_slot_utilisation(self) -> None:
         controller = Mock()
@@ -118,6 +229,56 @@ class BrokerctlStatusTests(unittest.TestCase):
         self.assertIn("Requests:  active=1 pending=2 (pending transitions=1)", rendered)
         self.assertIn("Slots:     1/2 in use (50%)", rendered)
 
+    def _render_status(self, *, parallel: int, leases: dict[str, int]) -> str:
+        controller = Mock()
+        controller.state.return_value = {"generation": 11, "profile": "main", "phase": "active"}
+        profile = SimpleNamespace(
+            id="main",
+            display_name="Main model",
+            runtime="llamacpp",
+            server_binary="llama-server",
+            context_size=65536,
+            parallel=parallel,
+        )
+        registry = Mock()
+        registry.try_resolve.return_value = profile
+        output = io.StringIO()
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=registry),
+            patch.object(brokerctl, "create_production_controller", return_value=controller),
+            patch.object(brokerctl, "_broker_admin_get", return_value={
+                "status": "ok",
+                "backend": {"profile": "main", "phase": "active", "ready": True},
+                "leases": leases,
+            }),
+            patch.object(brokerctl, "backend_endpoint_ready", return_value=True),
+            patch.object(brokerctl, "get_runtime_info", return_value=SimpleNamespace(
+                name="llamacpp", binaries=("llama-server",)
+            )),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(brokerctl.main(["status"]), 0)
+        return output.getvalue()
+
+    def test_status_never_reports_more_slots_in_use_than_parallel(self) -> None:
+        rendered = self._render_status(
+            parallel=1,
+            leases={"active_requests": 2, "inference_requests": 2, "queued_transitions": 0},
+        )
+
+        self.assertIn("Requests:  active=1 pending=1 (pending transitions=0)", rendered)
+        self.assertIn("Slots:     1/1 in use (100%)", rendered)
+        self.assertNotIn("2/1", rendered)
+
+    def test_status_excludes_slot_probes_from_slot_usage(self) -> None:
+        rendered = self._render_status(
+            parallel=1,
+            leases={"active_requests": 2, "inference_requests": 1, "queued_transitions": 0},
+        )
+
+        self.assertIn("Requests:  active=1 pending=0 (pending transitions=0)", rendered)
+        self.assertIn("Slots:     1/1 in use (100%)", rendered)
+
 
 class BrokerctlLifecycleSafetyTests(unittest.TestCase):
     def test_load_pretty_prints_admin_state_by_default(self) -> None:
@@ -134,7 +295,9 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
                     "ready": True,
                 },
                 "operation": {
-                    "status": "accepted",
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
                     "target": "vision",
                     "type": "switch",
                 },
@@ -156,8 +319,11 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
         admin.assert_called_once_with("/admin/switch", {"model": "vision", "wait": False})
         self.assertEqual(
             output.getvalue(),
-            "Request:   accepted\n"
+            "Request:   queued\n"
+            "Request ID: request-1\n"
+            "Execution ID: execution-1\n"
             "Target:    vision\n"
+            "Wait:      brokerctl operation wait request-1\n"
             "Broker:    ok\n"
             "Backend:   transition pending (current: main)\n"
             "Phase:     transition_pending\n"
@@ -216,7 +382,7 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
             result = brokerctl.main(["unload"])
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/stop", {})
+        admin.assert_called_once_with("/admin/stop", {"wait": False})
         self.assertEqual(
             output.getvalue(),
             "Broker:    ok\n"
@@ -248,17 +414,30 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), state)
 
     def test_restart_without_model_requests_admin_restart(self) -> None:
-        admin = Mock(return_value={"status": "ok"})
+        state = {
+            "status": "ok",
+            "operation": {"request_id": "request-1", "status": "queued"},
+            "backend": {"profile": "main", "phase": "inactive"},
+        }
+        admin = Mock(return_value=state)
+        output = io.StringIO()
+
         with (
             patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
             patch.object(brokerctl, "create_production_controller", return_value=Mock()),
             patch.object(brokerctl, "_broker_admin", admin),
-            redirect_stdout(io.StringIO()),
+            redirect_stdout(output),
         ):
             result = brokerctl.main(["restart"])
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/restart", {})
+        admin.assert_called_once_with("/admin/restart", {"wait": False})
+        self.assertEqual(
+            output.getvalue(),
+            "Requested: restart main\n"
+            "Target:    main\n"
+            "Phase:     inactive\n",
+        )
 
     def test_restart_with_model_requests_admin_restart_for_target(self) -> None:
         admin = Mock(return_value={"status": "ok"})
@@ -273,7 +452,169 @@ class BrokerctlLifecycleSafetyTests(unittest.TestCase):
             result = brokerctl.main(["restart", "vision"])
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/restart", {"model": "vision"})
+        admin.assert_called_once_with("/admin/restart", {"model": "vision", "wait": False})
+
+    def test_crash_loop_lines_describe_refused_and_probation_profiles(self) -> None:
+        live_state = {
+            "crash_loops": {
+                "main": {
+                    "crashes": 3,
+                    "last_cause": "signal (SIGABRT): CUDA error: device not ready",
+                    "tripped": True,
+                    "retry_after": 240,
+                    "probation": False,
+                },
+                "vision": {
+                    "crashes": 1,
+                    "last_cause": "signal (SIGSEGV)",
+                    "tripped": False,
+                    "retry_after": 0,
+                    "probation": True,
+                },
+                "quiet": {"crashes": 1, "tripped": False, "probation": False},
+            }
+        }
+
+        self.assertEqual(
+            brokerctl._crash_loop_lines(live_state),
+            [
+                "Crash loop: main refused for 240s after 3 crashes "
+                "(`brokerctl restart` retries now); last: signal (SIGABRT): CUDA error: device not ready",
+                "Crash loop: vision on probation; last: signal (SIGSEGV)",
+            ],
+        )
+        self.assertEqual(brokerctl._crash_loop_lines({}), [])
+
+    def test_restart_json_emits_full_state(self) -> None:
+        state = {
+            "status": "ok",
+            "operation": {"request_id": "request-1", "status": "queued"},
+            "backend": {"profile": "main", "phase": "inactive"},
+        }
+        admin = Mock(return_value=state)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "create_production_controller", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin", admin),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["restart", "--json"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), state)
+
+    def test_operation_status_reads_one_request_from_admin_api(self) -> None:
+        state = {
+            "operation": {
+                "request_id": "request-1",
+                "execution_id": "execution-1",
+                "status": "queued",
+                "waiting": True,
+            }
+        }
+        read = Mock(return_value=state)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin_get", read),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["operation", "status", "request-1"])
+
+        self.assertEqual(result, 0)
+        read.assert_called_once_with("/admin/operations/request-1")
+        self.assertEqual(json.loads(output.getvalue()), state)
+
+    def test_operation_cancel_posts_to_request_cancel_route(self) -> None:
+        response = {
+            "cancelled": True,
+            "operation": {"request_id": "request-1", "status": "cancelled"},
+        }
+        post = Mock(return_value=response)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin", post),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["operation", "cancel", "request-1"])
+
+        self.assertEqual(result, 0)
+        post.assert_called_once_with("/admin/operations/request-1/cancel", {})
+        self.assertEqual(json.loads(output.getvalue()), response)
+
+    def test_operation_list_queries_admin_operations_endpoint(self) -> None:
+        state = {"operations": []}
+        read = Mock(return_value=state)
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl, "_broker_admin_get", read),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(["operation", "list"])
+
+        self.assertEqual(result, 0)
+        read.assert_called_once_with("/admin/operations")
+        self.assertEqual(json.loads(output.getvalue()), state)
+
+    def test_operation_tui_submits_async_load_with_ids(self) -> None:
+        registry = Mock()
+        registry.profiles = [SimpleNamespace(id="vision")]
+        post = Mock(
+            return_value={
+                "operation": {
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
+                }
+            }
+        )
+        list_read = Mock(return_value={"operations": []})
+        tui_result: list[int] = []
+
+        def run_tui(model: object) -> int:
+            self.assertEqual(model.profiles, ("vision",))  # type: ignore[attr-defined]
+            model.submit_profile_load("vision")  # type: ignore[attr-defined]
+            tui_result.append(0)
+            return 0
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=registry),
+            patch.object(brokerctl, "_broker_admin", post),
+            patch.object(brokerctl, "_broker_admin_get", list_read),
+            patch("llama_broker.broker_tui.run_operations_tui", side_effect=run_tui),
+        ):
+            result = brokerctl.main(["operation", "tui"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(tui_result, [0])
+        post.assert_called_once_with("/admin/switch", {"model": "vision", "wait": False})
+
+    def test_operation_wait_polls_until_terminal_status(self) -> None:
+        read = Mock(side_effect=(
+            {"operation": {"request_id": "request-1", "status": "queued", "waiting": True}},
+            {"operation": {"request_id": "request-1", "status": "succeeded", "waiting": True}},
+        ))
+        output = io.StringIO()
+
+        with (
+            patch.object(brokerctl.ProfileRegistry, "from_path", return_value=Mock()),
+            patch.object(brokerctl, "_broker_admin_get", read),
+            patch.object(brokerctl.time, "sleep"),
+            redirect_stdout(output),
+        ):
+            result = brokerctl.main(
+                ["operation", "wait", "request-1", "--timeout", "2", "--interval", "0.01"]
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(json.loads(output.getvalue())["operation"]["status"], "succeeded")
 
     def test_admin_connection_failure_never_falls_back_to_direct_controller(self) -> None:
         connection = Mock()
@@ -911,10 +1252,15 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
 
     def test_live_profile_mutation_refreshes_broker_registry(self) -> None:
         output = io.StringIO()
-        admin = Mock(return_value={"status": "ok"})
+        admin = Mock(
+            return_value={"operation": {"request_id": "request-1", "status": "queued"}}
+        )
+        status = Mock(return_value={"operation": {"request_id": "request-1", "status": "succeeded"}})
         with (
             patch.object(brokerctl, "PROFILES_PATH", self.profiles),
             patch.object(brokerctl, "_broker_admin", admin),
+            patch.object(brokerctl, "_broker_admin_get", status),
+            patch.object(brokerctl.time, "sleep"),
             redirect_stdout(output),
         ):
             result = brokerctl.main(
@@ -930,7 +1276,8 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        admin.assert_called_once_with("/admin/autotune/reload", {})
+        admin.assert_called_once_with("/admin/autotune/reload", {"wait": False})
+        status.assert_called_once_with("/admin/operations/request-1")
 
     def test_live_profile_mutation_rolls_back_if_registry_refresh_fails(self) -> None:
         before = self.profiles.read_bytes()
@@ -1409,20 +1756,18 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
             profiles = materialize_fixture(Path(tempdir))
             output = io.StringIO()
             with redirect_stdout(output):
-                result = brokerctl.main(["--profiles", str(profiles), "model", "list"])
+                result = brokerctl.main([
+                    "--profiles", str(profiles), "model", "list",
+                    "--scan-path", str(profiles.parent / "models"),
+                ])
 
         self.assertEqual(result, 0)
         rendered = output.getvalue()
-        self.assertIn("MODEL", rendered)
-        self.assertIn("PROFILE", rendered)
-        self.assertIn("RUNTIME", rendered)
-        self.assertIn("fixture-text-7b", rendered)
-        self.assertIn("fixture-vision-12b", rendered)
-        self.assertIn("llamacpp", rendered)
-        self.assertNotIn("model_path", rendered)
-        self.assertNotIn(tempdir, rendered)
+        self.assertTrue(rendered)
+        self.assertIn("Local model bundles", rendered)
+        self.assertIn("mmproj", rendered)
 
-    def test_model_list_json_advertises_only_canonical_model_ids(self) -> None:
+    def test_model_list_json_advertises_artifact_bundles(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             from tests.fixtures import materialize_fixture  # noqa: PLC0415
 
@@ -1430,17 +1775,21 @@ class BrokerctlCommandLayoutTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 result = brokerctl.main(
-                    ["--profiles", str(profiles), "model", "list", "--json"]
+                    [
+                        "--profiles", str(profiles), "model", "list", "--json",
+                        "--scan-path", str(profiles.parent / "models"),
+                    ]
                 )
 
         self.assertEqual(result, 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["object"], "model_list")
         self.assertTrue(payload["data"])
-        for model in payload["data"]:
-            self.assertIn("id", model)
-            self.assertNotIn("profile", model)
-            self.assertNotIn("aliases", model)
+        for bundle in payload["data"]:
+            self.assertIn("path", bundle)
+            self.assertIn("files", bundle)
+            self.assertIn("format", bundle)
+            self.assertNotIn("id", bundle)
 
     def test_profile_list_reports_total_and_slot_context(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

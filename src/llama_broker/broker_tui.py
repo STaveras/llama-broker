@@ -55,13 +55,13 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("display_name", "Display name", "text"),
     EditorField("alias", "Primary alias", "text"),
     EditorField("aliases", "Additional aliases", "csv"),
-    EditorField("role", "Role", "select", options=("persistent", "transient")),
+    EditorField("role", "Role", "select", options=("persistent", "transient", "resident")),
     EditorField("runtime_family", "Runtime family", "select"),
     EditorField("runtime_build", "Backend build", "select"),
     EditorField("runtime", "Serving runtime", "select", options=runtime_names()),
-    EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools")),
+    EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools", "reasoning", "decision")),
     EditorField("context_size", "Context size", "int"),
-    EditorField("parallel", "Parallel slots", "select", options=("1", "2")),
+    EditorField("parallel", "Parallel slots", "int"),
     EditorField("batch_size", "Batch size", "int"),
     EditorField("ubatch_size", "Micro-batch size", "int"),
     EditorField(
@@ -84,10 +84,12 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("kv_cache_dtype", "vLLM KV cache dtype", "text", advanced=True),
     EditorField("tool_call_parser", "vLLM tool-call parser", "text", advanced=True),
     EditorField("tool_parser_plugin", "vLLM tool parser plugin", "path", advanced=True),
-    EditorField("chat_template", "vLLM chat template", "path", advanced=True),
+    EditorField("chat_template", "External chat template", "path", advanced=True),
     EditorField("limit_mm_per_prompt", "vLLM media limits (JSON)", "json", advanced=True),
     EditorField("allowed_local_media_path", "vLLM local media path", "path", advanced=True),
     EditorField("server_binary", "Runtime binary", "path", advanced=True),
+    EditorField("strata_artifacts_manifest_path", "Strata artifact manifest", "path", advanced=True),
+    EditorField("strata_launch_config_path", "Strata launch config", "path", advanced=True),
     EditorField("model_path", "Model file", "path", advanced=True),
     EditorField("model_draft", "Draft model file", "path", advanced=True),
     EditorField(
@@ -172,7 +174,7 @@ def _edit_simple_fields(
     values: dict[str, Any] = {}
     values["display_name"] = _default_text(input_fn, "Display name", current.get("display_name", ""))
     values["alias"] = _default_text(input_fn, "Alias", current.get("alias", ""))
-    values["role"] = _default_text(input_fn, "Role (persistent/transient)", current.get("role", "persistent"))
+    values["role"] = _default_text(input_fn, "Role (persistent/transient/resident)", current.get("role", "persistent"))
     values["capabilities"] = _default_text(
         input_fn, "Capabilities (comma-separated)", ",".join(current.get("capabilities", ["text"]))
     )
@@ -363,6 +365,9 @@ _SPECULATIVE_COUNT_FIELDS = _SPECULATIVE_EDITOR_FIELDS - {"spec_type"}
 _MANAGED_SPECULATIVE_FLAGS = frozenset(
     ("--spec-type", "--draft-max", "--spec-draft-n-max", "--draft-min")
 )
+# Flags the editor derives from structured fields instead of letting them be
+# hand-edited inside the raw extra_args JSON.
+_MANAGED_FLAG_GROUPS = _MANAGED_SPECULATIVE_FLAGS | {"--reasoning"}
 
 
 def _extra_arg_value(extra_args: Any, flag: str) -> str:
@@ -394,6 +399,25 @@ def _without_managed_speculative_args(extra_args: Any) -> list[str]:
     while index < len(extra_args):
         token = extra_args[index]
         if token in _MANAGED_SPECULATIVE_FLAGS:
+            index += 1
+            if index < len(extra_args) and not extra_args[index].startswith("--"):
+                index += 1
+            continue
+        result.append(token)
+        index += 1
+    return result
+
+
+def _without_managed_args(extra_args: Any) -> list[str]:
+    """Strip every flag group the editor derives from structured fields."""
+
+    if not isinstance(extra_args, list):
+        return []
+    result: list[str] = []
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token in _MANAGED_FLAG_GROUPS:
             index += 1
             if index < len(extra_args) and not extra_args[index].startswith("--"):
                 index += 1
@@ -452,7 +476,15 @@ class TUIModel:
     }
     _OPTIONAL_INTEGER_FIELDS = {"ctx_checkpoints", "cache_ram_mib"}
     _BOOLEAN_FIELDS = {"native_vision", "fit"}
-    _PATH_FIELDS = {"server_binary", "model_path", "mmproj_path", "model_draft"}
+    _PATH_FIELDS = {
+        "server_binary",
+        "model_path",
+        "mmproj_path",
+        "model_draft",
+        "chat_template",
+        "strata_artifacts_manifest_path",
+        "strata_launch_config_path",
+    }
 
     def __init__(self, manifest: Mapping[str, Any]):
         self.manifest = copy.deepcopy(dict(manifest))
@@ -568,13 +600,19 @@ class TUIModel:
         )
 
     def _apply_build(self, draft: dict[str, Any], build: Any) -> dict[str, Any]:
-        updated = clone_record(draft)
+        allowed_fields = get_runtime_info(build.runtime).editable_fields
+        updated = {
+            key: value
+            for key, value in clone_record(draft).items()
+            if key in allowed_fields
+        }
         updated.update(
             {
                 "runtime": build.runtime,
                 "runtime_build": build.id,
                 "server_binary": str(build.server_binary),
                 "server_sha256": build.server_sha256,
+                "environment": dict(build.environment),
             }
         )
         return updated
@@ -588,6 +626,8 @@ class TUIModel:
         family = inferred.runtime if inferred is not None else "(custom/manual)"
         fields = []
         for field in EDITOR_FIELDS:
+            if runtime == "strata" and field.key == "environment":
+                continue
             if field.key == "runtime_family":
                 field = replace(field, options=self._family_options())
             elif field.key == "runtime_build":
@@ -648,7 +688,7 @@ class TUIModel:
         if key in {"environment", "safety"}:
             return json.dumps(current.get(key, {}), sort_keys=True)
         if key == "extra_args":
-            return json.dumps(_without_managed_speculative_args(current.get(key, [])))
+            return json.dumps(_without_managed_args(current.get(key, [])))
         if key in _SPECULATIVE_FLAG_BY_FIELD:
             value = (
                 _draft_max_value(current.get("extra_args", []))
@@ -727,7 +767,12 @@ class TUIModel:
                     preserved.append(token)
                     if index + 1 < len(current_args) and not str(current_args[index + 1]).startswith("--"):
                         preserved.append(current_args[index + 1])
-            draft["extra_args"] = list(raw_args) + preserved
+            raw_args = _without_managed_args(raw_args)
+            capabilities = draft.get("capabilities", [])
+            runtime = get_runtime_info(str(draft.get("runtime", "llamacpp")))
+            draft["extra_args"] = runtime.sync_capability_edit(
+                draft, [*raw_args, *preserved], capabilities if isinstance(capabilities, list) else []
+            )
         elif key == "runtime_family":
             selected = self._family_for_value(value)
             if not selected or selected == "(custom/manual)":
@@ -771,10 +816,14 @@ class TUIModel:
                     draft = apply_simple_fields(draft, {key: ""})
                 else:
                     draft.pop(key, None)
-                    if key == "model_path":
-                        draft.pop("model_sha256", None)
-                    if key == "server_binary":
-                        draft.pop("server_sha256", None)
+                    hash_key = {
+                        "model_path": "model_sha256",
+                        "server_binary": "server_sha256",
+                        "strata_artifacts_manifest_path": "strata_artifacts_manifest_sha256",
+                        "strata_launch_config_path": "strata_launch_config_sha256",
+                    }.get(key)
+                    if hash_key:
+                        draft.pop(hash_key, None)
                 self._publish(draft)
                 return draft
             path = Path(raw).expanduser()
@@ -788,9 +837,25 @@ class TUIModel:
                 draft = apply_simple_fields(draft, {key: str(path)})
             else:
                 draft[key] = str(path)
-                hash_key = "model_sha256" if key == "model_path" else "server_sha256" if key == "server_binary" else None
+                hash_key = {
+                    "model_path": "model_sha256",
+                    "server_binary": "server_sha256",
+                    "strata_artifacts_manifest_path": "strata_artifacts_manifest_sha256",
+                    "strata_launch_config_path": "strata_launch_config_sha256",
+                }.get(key)
                 if hash_key:
                     draft[hash_key] = sha256_file(path)
+        elif key == "capabilities":
+            raw_caps = value if isinstance(value, (list, tuple, set, frozenset)) else str(value)
+            if isinstance(raw_caps, (list, tuple, set, frozenset)):
+                capabilities = [str(item).strip() for item in raw_caps if str(item).strip()]
+            else:
+                capabilities = [item.strip() for item in raw_caps.split(",") if item.strip()]
+            runtime = get_runtime_info(str(draft.get("runtime", "llamacpp")))
+            synced_extra_args = runtime.sync_capability_edit(draft, draft.get("extra_args", []), capabilities)
+            if "extra_args" in runtime.editable_fields:
+                draft["extra_args"] = synced_extra_args
+            draft["capabilities"] = capabilities
         elif key in SIMPLE_FIELDS:
             draft = apply_simple_fields(draft, {key: value})
             if key == "alias":
@@ -1137,7 +1202,11 @@ def _curses_checklist(
     import curses
 
     choices = list(options)
-    selected = {str(item) for item in (current or [])}
+    # Universal base capability: always present and non-removable, so the
+    # checklist cannot produce an invalid capabilities list (e.g. dropping
+    # "text").
+    locked = {"text"} if "text" in choices else set()
+    selected = {"text"} | {str(item) for item in (current or [])}
     cursor = 0
     while True:
         stdscr.erase()
@@ -1145,8 +1214,11 @@ def _curses_checklist(
         stdscr.addnstr(0, 0, f"{label} — choose values", max(width - 1, 1), curses.A_BOLD)
         stdscr.addnstr(1, 0, "↑/↓ move  Space toggle  Enter accept  Esc cancel", max(width - 1, 1))
         for row, choice in enumerate(choices, 3):
-            marker = "[x]" if choice in selected else "[ ]"
             attr = curses.A_REVERSE if row - 3 == cursor else 0
+            if choice in locked:
+                stdscr.addnstr(row, 2, f"[x] {choice} (always on)", max(width - 3, 1), curses.A_DIM | attr)
+                continue
+            marker = "[x]" if choice in selected else "[ ]"
             stdscr.addnstr(row, 2, f"{marker} {choice}", max(width - 3, 1), attr)
         key = _read_curses_key(stdscr)
         if key == 27:
@@ -1157,8 +1229,10 @@ def _curses_checklist(
             cursor = (cursor + 1) % len(choices)
         elif key == ord(" "):
             choice = choices[cursor]
+            if choice in locked:
+                continue
             if choice in selected:
-                selected.remove(choice)
+                selected.discard(choice)
             else:
                 selected.add(choice)
         elif key in (10, 13):
@@ -1176,7 +1250,11 @@ def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
     if field.kind == "select":
         value, cancelled = _curses_select(stdscr, field.label, value, field.options)
     elif field.kind == "multi":
-        value, cancelled = _curses_checklist(stdscr, field.label, current.get(field.key, []), field.options)
+        options = field.options
+        if field.key == "capabilities":
+            runtime = get_runtime_info(str(current.get("runtime", "llamacpp")))
+            options = tuple(option for option in field.options if option in runtime.capabilities)
+        value, cancelled = _curses_checklist(stdscr, field.label, current.get(field.key, []), options)
     elif field.kind == "toggle":
         value = not bool(value)
     else:
@@ -1215,6 +1293,225 @@ def _format_field_value(value: Any) -> str:
     return str(value)
 
 
+class OperationsTUIModel:
+    """Testable state model for the broker transition-operations view."""
+
+    def __init__(
+        self,
+        *,
+        profiles: Iterable[str],
+        list_operations: Callable[[], Mapping[str, Any]],
+        refresh_profiles: Callable[[], Iterable[str]] | None = None,
+        submit_load: Callable[[str], Mapping[str, Any]],
+        submit_restart: Callable[[], Mapping[str, Any]],
+        submit_stop: Callable[[], Mapping[str, Any]],
+        submit_reload: Callable[[], Mapping[str, Any]],
+        status_operation: Callable[[str], Mapping[str, Any]],
+        cancel_operation: Callable[[str], Mapping[str, Any]],
+        wait_operation: Callable[[str], Mapping[str, Any]],
+    ) -> None:
+        self.profiles = tuple(profiles)
+        self._refresh_profiles = refresh_profiles
+        self._list_operations = list_operations
+        self._submit_load = submit_load
+        self._submit_restart = submit_restart
+        self._submit_stop = submit_stop
+        self._submit_reload = submit_reload
+        self._status_operation = status_operation
+        self._cancel_operation = cancel_operation
+        self._wait_operation = wait_operation
+        self.entries: list[dict[str, Any]] = []
+        self.selected_index = 0
+        self.selected_request_id: str | None = None
+        self.status_message = ""
+        self.refresh()
+
+    @property
+    def selected(self) -> dict[str, Any] | None:
+        if not self.entries:
+            return None
+        self.selected_index = max(0, min(self.selected_index, len(self.entries) - 1))
+        return self.entries[self.selected_index]
+
+    def refresh(self) -> list[dict[str, Any]]:
+        if self._refresh_profiles is not None:
+            self.profiles = tuple(self._refresh_profiles())
+        raw_entries = self._list_operations().get("operations", [])
+        if not isinstance(raw_entries, list):
+            raise ValueError("operation list response is malformed")
+        rows: list[dict[str, Any]] = []
+        for entry in raw_entries:
+            if not isinstance(entry, Mapping):
+                continue
+            execution = entry.get("execution")
+            requests = entry.get("requests", [])
+            if not isinstance(execution, Mapping):
+                continue
+            if not isinstance(requests, list) or not requests:
+                rows.append(dict(execution))
+                continue
+            for request in requests:
+                if isinstance(request, Mapping):
+                    rows.append({**dict(execution), **dict(request)})
+        self.entries = rows
+        if self.selected_request_id is not None:
+            for index, row in enumerate(rows):
+                if row.get("request_id") == self.selected_request_id:
+                    self.selected_index = index
+                    break
+            else:
+                self.selected_index = min(self.selected_index, max(len(rows) - 1, 0))
+        else:
+            self.selected_index = min(self.selected_index, max(len(rows) - 1, 0))
+        return self.entries
+
+    def move(self, delta: int) -> None:
+        if self.entries:
+            self.selected_index = (self.selected_index + delta) % len(self.entries)
+            request_id = self.entries[self.selected_index].get("request_id")
+            self.selected_request_id = request_id if isinstance(request_id, str) else None
+
+    def submit_profile_load(self, profile_id: str) -> Mapping[str, Any]:
+        if profile_id not in self.profiles:
+            raise ValueError(f"unknown profile: {profile_id}")
+        return self._remember(self._submit_load(profile_id), "load")
+
+    def submit_restart(self) -> Mapping[str, Any]:
+        return self._remember(self._submit_restart(), "restart")
+
+    def submit_stop(self) -> Mapping[str, Any]:
+        return self._remember(self._submit_stop(), "stop")
+
+    def submit_reload(self) -> Mapping[str, Any]:
+        return self._remember(self._submit_reload(), "reload")
+
+    def status_selected(self) -> Mapping[str, Any]:
+        result = self._status_operation(self._require_selected_request())
+        operation = result.get("operation")
+        if isinstance(operation, Mapping):
+            self.status_message = self._describe(operation)
+        self.refresh()
+        return result
+
+    def cancel_selected(self) -> Mapping[str, Any]:
+        result = self._cancel_operation(self._require_selected_request())
+        operation = result.get("operation")
+        self.status_message = self._describe(operation) if isinstance(operation, Mapping) else "Cancel sent."
+        self.refresh()
+        return result
+
+    def wait_selected(self) -> Mapping[str, Any]:
+        result = self._wait_operation(self._require_selected_request())
+        operation = result.get("operation")
+        self.status_message = self._describe(operation) if isinstance(operation, Mapping) else "Wait completed."
+        self.refresh()
+        return result
+
+    def _remember(self, result: Mapping[str, Any], action: str) -> Mapping[str, Any]:
+        operation = result.get("operation")
+        if not isinstance(operation, Mapping):
+            raise ValueError(f"broker did not return an operation ID for {action}")
+        request_id = operation.get("request_id")
+        execution_id = operation.get("execution_id")
+        if isinstance(request_id, str):
+            self.selected_request_id = request_id
+        self.status_message = (
+            f"{action} request {request_id or '(missing ID)'}; "
+            f"execution {execution_id or '(missing ID)'}"
+        )
+        self.refresh()
+        return result
+
+    def _require_selected_request(self) -> str:
+        row = self.selected
+        request_id = row.get("request_id") if row is not None else self.selected_request_id
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("select an operation request first")
+        self.selected_request_id = request_id
+        return request_id
+
+    @staticmethod
+    def _describe(operation: Mapping[str, Any]) -> str:
+        return (
+            f"{operation.get('status', 'unknown')} — request "
+            f"{operation.get('request_id', '?')} / execution "
+            f"{operation.get('execution_id', '?')}"
+        )
+
+
+def run_operations_tui(model: OperationsTUIModel) -> int:
+    """Run the asynchronous load/restart/unload operation monitor."""
+    import curses
+
+    def draw(stdscr: Any) -> int:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            stdscr.addnstr(0, 0, "Llama-Broker transition operations", max(width - 1, 1), curses.A_BOLD)
+            stdscr.addnstr(
+                1,
+                0,
+                "↑/↓ select  l load  R restart  u unload  g reload  s status  c cancel  w wait  r refresh  q quit",
+                max(width - 1, 1),
+            )
+            visible = max(height - 5, 1)
+            start = max(0, min(model.selected_index - visible // 2, max(len(model.entries) - visible, 0)))
+            for row, entry in enumerate(model.entries[start : start + visible], 3):
+                index = start + row - 3
+                marker = ">" if index == model.selected_index else " "
+                request_id = str(entry.get("request_id", "-"))
+                execution_id = str(entry.get("execution_id", "-"))
+                target = str(entry.get("target") or "-")
+                line = (
+                    f"{marker} {entry.get('status', 'unknown'):<10} "
+                    f"{entry.get('type', 'operation'):<8} {target:<20} "
+                    f"req {request_id[:10]} exec {execution_id[:10]}"
+                )
+                attr = curses.A_REVERSE if index == model.selected_index else 0
+                stdscr.addnstr(row, 0, line, max(width - 1, 1), attr)
+            stdscr.addnstr(max(height - 2, 0), 0, model.status_message, max(width - 1, 1), curses.A_BOLD)
+            stdscr.refresh()
+            key = _read_curses_key(stdscr)
+            try:
+                if key in (ord("q"), 27):
+                    return 0
+                if key in (curses.KEY_UP, ord("k")):
+                    model.move(-1)
+                elif key in (curses.KEY_DOWN, ord("j")):
+                    model.move(1)
+                elif key == ord("r"):
+                    model.refresh()
+                    model.status_message = "Operation list refreshed."
+                elif key == ord("l"):
+                    if not model.profiles:
+                        model.status_message = "No profile IDs are available."
+                        continue
+                    selected, cancelled = _curses_select(stdscr, "Load profile", model.profiles[0], model.profiles)
+                    if not cancelled:
+                        model.submit_profile_load(str(selected))
+                elif key == ord("R"):
+                    model.submit_restart()
+                elif key == ord("u"):
+                    model.submit_stop()
+                elif key == ord("g"):
+                    model.submit_reload()
+                elif key == ord("s"):
+                    model.status_selected()
+                elif key == ord("c"):
+                    model.cancel_selected()
+                elif key == ord("w"):
+                    model.wait_selected()
+            except Exception as error:
+                model.status_message = f"Operation request failed: {error}"
+
+    return curses.wrapper(draw)
+
+
 def run_tui(
     profiles_path: Path | str,
     selector: str | None = None,
@@ -1224,6 +1521,8 @@ def run_tui(
     """Run a field-oriented full-screen profile editor (stdlib only)."""
 
     import curses
+    import threading
+    import time
 
     path = Path(profiles_path)
     manifest = load_manifest_source(path, allow_missing_artifacts=True)
@@ -1242,7 +1541,28 @@ def run_tui(
             pass
         stdscr.keypad(True)
         status = ""
+        apply_finished: threading.Event | None = None
+        apply_completion: dict[str, BaseException | None] = {}
+        pending_manifest: dict[str, Any] | None = None
+        apply_started_at = 0.0
         while True:
+            if apply_finished is not None and apply_finished.is_set():
+                error = apply_completion.get("error")
+                if error is not None:
+                    status = f"Cannot save: {error}"
+                else:
+                    assert pending_manifest is not None
+                    model.manifest = pending_manifest
+                    model.base_manifest = copy.deepcopy(pending_manifest)
+                    model.dirty = False
+                    status = "Saved profile configuration."
+                apply_finished = None
+                pending_manifest = None
+            if apply_finished is not None:
+                status = (
+                    f"Applying changes ({int(time.monotonic() - apply_started_at)}s); "
+                    "please wait."
+                )
             stdscr.erase()
             height, width = stdscr.getmaxyx()
             current = model.current
@@ -1279,8 +1599,16 @@ def run_tui(
 
             if status:
                 stdscr.addnstr(max(height - 3, 0), 0, status, max(width - 1, 1), curses.A_BOLD)
-            stdscr.addnstr(max(height - 2, 0), 0, "Enter opens a text box/dropdown; changes stay in memory until Save.", max(width - 1, 1))
+            footer = (
+                "Apply is running; wait here for its result."
+                if apply_finished is not None
+                else "Press s to save config and refresh aliases."
+            )
+            stdscr.addnstr(max(height - 2, 0), 0, footer, max(width - 1, 1))
+            stdscr.timeout(250 if apply_finished is not None else -1)
             key = _read_curses_key(stdscr)
+            if apply_finished is not None:
+                continue
             if key in (ord("q"), 27):
                 if model.dirty:
                     if not _curses_confirm(stdscr, "Discard unsaved changes?", default=False):
@@ -1324,18 +1652,49 @@ def run_tui(
                             status = "Save cancelled; external conflicts remain."
                             continue
                     validate_manifest(merged, directory=path.parent)
-                    if not _curses_confirm(stdscr, "Apply changes?", default=True):
+                    if not _curses_confirm(stdscr, "Save profile config?", default=True):
                         status = "Save cancelled."
                         continue
                     if apply_callback is not None:
                         changed_ids = {str(current.get("id"))}
-                        apply_callback(merged, changed_ids)
-                    else:
-                        write_manifest_atomically(path, merged)
+                        finished_event = threading.Event()
+                        apply_finished = finished_event
+                        apply_completion = {}
+                        pending_manifest = merged
+                        apply_started_at = time.monotonic()
+
+                        def apply_in_background(
+                            callback: ApplyCallback = apply_callback,
+                            draft: dict[str, Any] = merged,
+                            ids: set[str] = changed_ids,
+                            completion: dict[str, BaseException | None] = apply_completion,
+                            finished: threading.Event = finished_event,
+                        ) -> None:
+                            try:
+                                callback(draft, ids)
+                            except BaseException as error:
+                                completion["error"] = error
+                            finally:
+                                finished.set()
+
+                        thread = threading.Thread(
+                            target=apply_in_background,
+                            name="llama-broker-profile-apply",
+                            daemon=False,
+                        )
+                        try:
+                            thread.start()
+                        except BaseException:
+                            apply_finished = None
+                            pending_manifest = None
+                            raise
+                        status = "Applying profile changes..."
+                        continue
+                    write_manifest_atomically(path, merged)
                     model.manifest = merged
                     model.base_manifest = copy.deepcopy(merged)
                     model.dirty = False
-                    status = "Applied successfully."
+                    status = "Saved profile configuration."
                 except Exception as error:
                     status = f"Cannot save: {error}"
         return 0

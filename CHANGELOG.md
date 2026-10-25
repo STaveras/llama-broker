@@ -1,28 +1,52 @@
-# Retrospective changelog
+# Changelog
 
-Current assigned version: **0.7.1**.
+## [0.8.0] - 2026-10-25
+
+First consolidated package release after the retrospective source checkpoints.
+
+### Added and improved
+
+- Durable ordered profile operations with explicit status, wait and cancellation.
+- Bounded FIFO inference admission, SSE keepalives, CORS and connection recovery.
+- Artifact-first model bundles, runtime adapters and opt-in runtime build tooling.
+- Optional resident System 1 decision profiles and an OpenAI-compatible Decisions
+  API; decision-only profiles remain out of `/v1/models`.
+- First-run setup, console version reporting and package installation fixes.
+- Automatic profile-manifest reload without restarting the generation backend.
+
+### Fixed before release
+
+- Preserve edits made between initial manifest parsing and watcher startup by
+  fingerprinting the exact bytes parsed, rather than a later disk read.
+- Retry failed or cancelled asynchronous reloads without requiring another edit.
+  Pending requests are coalesced; only successfully applied registry bytes become
+  the baseline, including when the file changes again during application.
+
+### Qualification limits
+
+The release does not include experimental exclusive-maintenance code, local
+runtime qualification scripts, or new GPU runtime deployments. Hardware-specific
+builds, optional System 1 routing and runtime-bundle execution still require
+operator qualification; passing the offline suite is not GPU qualification.
+PyPI publication and repository visibility changes are separate operations.
+
+### Consolidation background
+This candidate consolidates the development line, including artifact-first
+model listing (JSON schema 2) and FIFO inference admission with SSE heartbeats.
+It adds scoped failed-transition reporting and explicit operation-wait guidance,
+removes a conflicting tools/JSON grammar in autotune probes, and stages the
+reviewed opt-in runtime bundle control plane. Follow-up fixes bound build
+commands with partial log lines and validate interactive source selections.
+Positive sandbox/CUDA tests require host capabilities; no production GPU,
+FreeToken, Basalt deployment, or system1 routing qualification is claimed.
+
+## Retrospective changelog
+
+Current assigned version: **0.6.16**.
 
 These versions were assigned retrospectively to existing first-parent main checkpoints. Dates below are original committer calendar dates, not verified publication dates. Entries describe the changes at each checkpoint; reading through this file gives the cumulative history. Subsequent entries may supersede earlier behavior. Side branches inherit the latest assigned checkpoint on their first-parent lineage; this file does not claim to describe additional unmerged branch work. Existing older changelog version/date/publication claims are superseded by this evidence-based chronology.
 
 Historical checkpoints were not executed individually during this preparation. Current-main verification results and limitations are recorded in the separate preparation report. A second preparation pass intentionally sanitizes code/configuration and aligns package versions. Historical publication workflows are disabled; the newest main/development snapshots include the replacement manual release workflow. No retrospective tag qualifies a package for publication.
-
-## [0.7.1] - 2026-09-26 — Current workflow documentation
-
-Original checkpoint: `7e72f29b40b5c3d487f2f80b378c9e6725fe9caa`.
-
-- Rewrite README around installation, setup/integration, model loading, client connection, service troubleshooting, and key rotation using the current singular profile command surface.
-- Document canonical model/runtime/catalog defaults and overrides, one-backend request slots, active-profile routing, API routes, and supported versus experimental runtimes. The original commit changes README only.
-
-## [0.7.0] - 2026-09-26 — Development integration
-
-Original checkpoint: `3e6606c2dea66ef2c6ac8f72c1c169abb2f195a8`.
-
-- Merge development while retaining both parents. Introduce schema-v2 profiles backed by an external runtime catalog with deployment-revision checks, derived launch fields, runtime provenance, and temporary ID aliases.
-- Adopt configurable XDG-aware canonical model/runtime stores and state migration; add an explicit model-store plan/stage/verify/apply/cleanup tool with hash/drift checks, paired-state backups and separate cleanup confirmation.
-- Make setup catalog-first with one-time inventory, revalidate selected artifacts before publication, preserve schema-v2 catalog identities, and handle rollback/concurrent replacement safely.
-- Expand profile add/edit/runtime-list support, terminal-width-aware tables, profile render namespacing, unit cleanup reporting, registry refresh on live mutations, and Hermes public-alias integration.
-- Add speculative-decoding editor fields, optional draft/MoE cache degradation, authenticated readiness checks, cached artifact checks, administrative-restart interruption/recovery, and experimental reasoning-effort scaling.
-- Scope forced CUDA graph disabling to autotune launches, expand offline regression coverage, update release-build workflows, and document future transition design decisions without treating those future decisions as delivered behavior.
 
 ## [0.6.16] - 2026-08-27 — Profile editor row and dirty-state fixes
 

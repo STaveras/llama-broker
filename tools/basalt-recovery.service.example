@@ -1,0 +1,8 @@
+[Unit]
+Description=Independent bounded Basalt rollback recovery
+
+[Service]
+Type=oneshot
+# Supply an independently verified local restore command; it is not bundled.
+ExecStart=/path/to/operator-provided-restore
+TimeoutStartSec=120

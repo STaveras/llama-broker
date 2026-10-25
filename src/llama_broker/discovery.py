@@ -180,7 +180,14 @@ def _probe_endpoint(base_url: str, timeout: float = 2.0) -> Optional[DiscoveredE
         par = item.get("parallel") or total_slots
 
         # Calculate slot context
-        if slot_ctx:
+        model_slot_ctx = item.get("slot_context_window")
+        if (
+            isinstance(model_slot_ctx, int)
+            and not isinstance(model_slot_ctx, bool)
+            and model_slot_ctx > 0
+        ):
+            s_ctx = model_slot_ctx
+        elif slot_ctx:
             s_ctx = slot_ctx
         elif ctx and par and par > 1:
             s_ctx = ctx // par

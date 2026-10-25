@@ -9,16 +9,152 @@ from unittest.mock import Mock, patch
 
 from llama_broker.broker_tui import (
     EDITOR_FIELDS,
+    OperationsTUIModel,
     TUIModel,
+    _curses_checklist,
     _curses_prompt,
     _curses_select,
     _read_curses_key,
     run_guided_wizard,
+    run_operations_tui,
 )
 from llama_broker.profile_config import load_manifest_source, merge_manifest_drafts, validate_manifest
 
 
 class BrokerTUIModelTests(unittest.TestCase):
+    def test_operations_tui_tracks_request_and_execution_ids(self) -> None:
+        list_operations = Mock(
+            return_value={
+                "operations": [
+                    {
+                        "execution": {
+                            "execution_id": "execution-1",
+                            "type": "switch",
+                            "target": "vision",
+                            "status": "queued",
+                        },
+                        "requests": [
+                            {
+                                "request_id": "request-1",
+                                "execution_id": "execution-1",
+                                "status": "queued",
+                                "waiting": True,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        submit = Mock(
+            return_value={
+                "operation": {
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
+                }
+            }
+        )
+        cancel = Mock(
+            return_value={"operation": {"request_id": "request-1", "status": "cancelled"}}
+        )
+        wait = Mock(
+            return_value={"operation": {"request_id": "request-1", "status": "succeeded"}}
+        )
+        model = OperationsTUIModel(
+            profiles=("vision",),
+            list_operations=list_operations,
+            submit_load=submit,
+            submit_restart=Mock(return_value={}),
+            submit_stop=Mock(return_value={}),
+            submit_reload=Mock(return_value={"operation": {}}),
+            status_operation=Mock(return_value={}),
+            cancel_operation=cancel,
+            wait_operation=wait,
+        )
+
+        model.submit_profile_load("vision")
+        self.assertEqual(model.selected_request_id, "request-1")
+        self.assertIn("execution-1", model.status_message)
+        self.assertEqual(model.refresh()[0]["execution_id"], "execution-1")
+        model.cancel_selected()
+        cancel.assert_called_once_with("request-1")
+        model.wait_selected()
+        wait.assert_called_once_with("request-1")
+
+    def test_operations_tui_keyboard_load_returns_through_async_submission(self) -> None:
+        import curses
+
+        class FakeWindow:
+            def erase(self) -> None:
+                pass
+
+            def getmaxyx(self) -> tuple[int, int]:
+                return (20, 100)
+
+            def addnstr(self, *_args: object) -> None:
+                pass
+
+            def refresh(self) -> None:
+                pass
+
+            def keypad(self, _enabled: bool) -> None:
+                pass
+
+        submit = Mock(
+            return_value={
+                "operation": {
+                    "request_id": "request-1",
+                    "execution_id": "execution-1",
+                    "status": "queued",
+                }
+            }
+        )
+        model = OperationsTUIModel(
+            profiles=("vision",),
+            list_operations=Mock(return_value={"operations": []}),
+            submit_load=submit,
+            submit_restart=Mock(return_value={"operation": {}}),
+            submit_stop=Mock(return_value={"operation": {}}),
+            submit_reload=Mock(return_value={"operation": {}}),
+            status_operation=Mock(return_value={}),
+            cancel_operation=Mock(return_value={}),
+            wait_operation=Mock(return_value={}),
+        )
+        fake_window = FakeWindow()
+        with (
+            patch.object(curses, "wrapper", side_effect=lambda callback: callback(fake_window)),
+            patch("llama_broker.broker_tui._read_curses_key", side_effect=[ord("l"), ord("q")]),
+            patch("llama_broker.broker_tui._curses_select", return_value=("vision", False)),
+        ):
+            result = run_operations_tui(model)
+
+        self.assertEqual(result, 0)
+        submit.assert_called_once_with("vision")
+        self.assertEqual(model.selected_request_id, "request-1")
+
+    def test_operations_tui_refreshes_profile_choices_after_catalog_reload(self) -> None:
+        profile_provider = Mock(side_effect=(
+            ("vision",),
+            ("vision", "new-profile"),
+        ))
+        model = OperationsTUIModel(
+            profiles=("vision",),
+            list_operations=Mock(return_value={"operations": []}),
+            refresh_profiles=profile_provider,
+            submit_load=Mock(return_value={"operation": {}}),
+            submit_restart=Mock(return_value={"operation": {}}),
+            submit_stop=Mock(return_value={"operation": {}}),
+            submit_reload=Mock(return_value={"operation": {}}),
+            status_operation=Mock(return_value={}),
+            cancel_operation=Mock(return_value={}),
+            wait_operation=Mock(return_value={}),
+        )
+
+        model.refresh()
+
+        self.assertEqual(model.profiles, ("vision", "new-profile"))
+        self.assertEqual(profile_provider.call_count, 2)
+
     def test_runtime_family_reveals_backend_build_and_applies_catalog_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             binary = Path(tempdir) / "llama-server"
@@ -504,9 +640,102 @@ class BrokerTUIModelTests(unittest.TestCase):
         self.assertEqual(profile["context_size"], 131072)
         self.assertEqual(conflicts, ["profiles[one].context_size"])
 
+    def test_runtime_capability_choices_keep_llamacpp_reasoning(self) -> None:
+        from llama_broker.runtimes.registry import get_runtime_info
+        self.assertIn("reasoning", get_runtime_info("llamacpp").capabilities)
+        self.assertEqual(get_runtime_info("strata").capabilities, ("text",))
+
+    def test_strata_supported_capability_edit_does_not_create_extra_args(self) -> None:
+        model = TUIModel({"profiles": [{"id": "one", "alias": "one", "runtime": "strata", "capabilities": ["text"]}]})
+        model.set_field("capabilities", ["text"])
+        self.assertNotIn("extra_args", model.current)
+
     def test_capabilities_editor_exposes_tools(self) -> None:
         field = next(item for item in EDITOR_FIELDS if item.key == "capabilities")
         self.assertIn("tools", field.options)
+
+    def test_enabling_reasoning_capability_syncs_launch_flag(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "capabilities": ["text"],
+                        "extra_args": ["--no-warmup"],
+                    }
+                ]
+            }
+        )
+        model.set_field("capabilities", ["text", "reasoning"])
+        self.assertEqual(model.current["capabilities"], ["text", "reasoning"])
+        self.assertEqual(
+            model.current["extra_args"], ["--no-warmup", "--reasoning", "on"]
+        )
+
+    def test_strata_rejects_reasoning_without_dirtying_draft(self) -> None:
+        model = TUIModel({"profiles": [{"id": "one", "alias": "one", "runtime": "strata", "capabilities": ["text"]}]})
+        before = model.current
+        with self.assertRaisesRegex(ValueError, "reasoning.*strata|strata.*reasoning"):
+            model.set_field("capabilities", ["text", "reasoning"])
+        self.assertEqual(model.current, before)
+        self.assertNotIn("extra_args", model.current)
+
+    def test_vllm_reasoning_does_not_gain_llamacpp_flag(self) -> None:
+        model = TUIModel({"profiles": [{"id": "one", "alias": "one", "runtime": "vllm", "capabilities": ["text"]}]})
+        with self.assertRaisesRegex(ValueError, "reasoning.*vllm|vllm.*reasoning"):
+            model.set_field("capabilities", ["text", "reasoning"])
+        self.assertNotIn("extra_args", model.current)
+
+    def test_disabling_reasoning_capability_drops_launch_flag(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "capabilities": ["text", "reasoning"],
+                        "extra_args": ["--no-warmup", "--reasoning", "off"],
+                    }
+                ]
+            }
+        )
+        model.set_field("capabilities", ["text"])
+        self.assertEqual(model.current["capabilities"], ["text"])
+        self.assertEqual(model.current["extra_args"], ["--no-warmup"])
+
+    def test_checklist_always_preserves_text_capability(self) -> None:
+        # The capabilities checklist must never drop the universal "text"
+        # capability, even if the user unchecks it before accepting.
+        import curses
+
+        stdscr = Mock()
+        stdscr.getmaxyx.return_value = (24, 80)
+        keys = iter([ord(" "), 13])  # attempt to toggle text (locked), then accept
+        with patch("llama_broker.broker_tui._read_curses_key", side_effect=lambda _: next(keys)):
+            value, cancelled = _curses_checklist(
+                stdscr, "Capabilities", ["text", "reasoning"], ("text", "reasoning")
+            )
+        self.assertFalse(cancelled)
+        # text is locked, so attempting to toggle it off is a no-op and the
+        # accepted value keeps every originally-selected capability.
+        self.assertEqual(value, ["text", "reasoning"])
+
+    def test_reasoning_flag_not_shown_in_raw_extra_args_editor(self) -> None:
+        model = TUIModel(
+            {
+                "profiles": [
+                    {
+                        "id": "one",
+                        "alias": "one",
+                        "capabilities": ["text", "reasoning"],
+                        "extra_args": ["--no-warmup", "--reasoning", "on"],
+                    }
+                ]
+            }
+        )
+        shown = json.loads(model.field_value("extra_args"))
+        self.assertEqual(shown, ["--no-warmup"])
 
     def test_selection_wraps_and_simple_update_is_shared(self) -> None:
         manifest = {

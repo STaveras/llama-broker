@@ -38,6 +38,41 @@ Only the publishing job has `id-token: write`. Environment reviewers and the
 trusted publisher must be configured separately before enabling publication.
 No hosted settings were configured by the local preparation.
 
+## Next-release sequence
+
+The consolidated release uses `0.8.0` in both `pyproject.toml` and the root
+`uv.lock` entry. Earlier preparation used `0.8.0.dev0`; the older development
+snapshot carried `0.6.16`, while main carried the retrospective, notes-only
+`0.7.1`. Release `v0.8.0` requires the matching tag at the qualified main commit.
+The sequence below documents the qualification and integration procedure; it
+is not a claim that PyPI publication or hardware qualification has occurred.
+
+1. Review the isolated consolidation candidate and its branch/history evidence.
+   After explicit integration approval, integrate it into `development` and
+   run hosted CI on Python 3.11, 3.12, 3.13 and 3.14. Reconcile any intervening
+   development changes and repeat the isolated suite and history scan.
+2. Keep unqualified FreeToken, reasoning, GPU deployment and system1 work
+   separate. Runtime bundle staging remains experimental; CPU/inert CUDA
+   compilation does not establish driver or inference qualification.
+3. In a release preparation change, set both version records to `0.8.0`, update
+   the unreleased notes, build fresh wheel/sdist artifacts and validate their
+   metadata and public contents. Review the exact new history relative to main.
+4. After approval, integrate the tested development/release preparation result
+   into `main`. Build and validate again from that exact commit. A future
+   matching `v0.8.0` tag must point to that main commit; tag creation and manual
+   release/publish dispatch are separate operator decisions.
+
+A local development artifact can be checked without creating a tag:
+
+```sh
+uv run --extra dev python -m build
+uv run python tools/check_release.py --development --dist dist
+```
+
+Source-tree scanning does not inspect archives or deleted historical blobs;
+review both distributions and all newly reachable history separately. Do not
+fix private history by merging and deleting a sensitive file in a later commit.
+
 # Local configuration
 
 Use `brokerctl setup` and the bundled `profiles.example.json` to create local

@@ -10,8 +10,10 @@ from unittest.mock import patch
 from llama_broker import backend_controller
 
 from llama_broker.backend_controller import (
+    ActivationPreemptedError,
     AdmissionError,
     BackendController,
+    BackendExit,
     CommandError,
     ConfigurationError,
     LifecycleCancelledError,
@@ -21,10 +23,14 @@ from llama_broker.backend_controller import (
     ServiceStateSnapshot,
     ServiceOwnershipError,
     SwitchError,
+    backend_error_lines,
+    systemd_backend_exit_probe,
     systemd_service_inventory_probe,
     systemd_service_state_probe,
 )
 from llama_broker.broker_profiles import AdmissionSafetyBudget, SafetyBudget, ServiceSafetyBudget
+from llama_broker.daemon import _prepare_durable_state
+from llama_broker.transition_operations import PersistentTransitionQueue
 
 
 def fake_safety() -> SafetyBudget:
@@ -93,6 +99,10 @@ class Harness:
                 sub_state="running",
                 main_pid=4242,
                 control_pid=0,
+            )
+        if command[:4] == ("systemctl", "--user", "--no-block", "stop"):
+            self.service_states[command[4]] = ServiceStateSnapshot(
+                active_state="deactivating", sub_state="stop-sigterm", main_pid=4343, control_pid=0
             )
         if command[:3] == ("systemctl", "--user", "stop"):
             state = self.service_states.get(command[3])
@@ -202,8 +212,78 @@ class BackendControllerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_render_unit_emits_optional_memory_high(self) -> None:
+        profile = replace(self.main, safety=replace(
+            self.main.safety,
+            service=replace(self.main.safety.service, memory_high_mib=18_432),
+        ))
+        self.controller.profiles[profile.id] = profile
+        rendered = self.controller.render_unit(profile.id)
+        self.assertIn("MemoryHigh=18432M", rendered)
+
+    def test_render_unit_omits_absent_memory_high(self) -> None:
+        self.assertNotIn("MemoryHigh=", self.controller.render_unit(self.main.id))
+
     def read_state(self) -> dict:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def test_replace_profiles_refreshes_readiness_alias_mapping(self) -> None:
+        class AliasProbe:
+            def __init__(self, aliases: set[str]) -> None:
+                self.aliases = aliases
+
+            def __call__(self, alias: str, _timeout: float) -> bool:
+                return alias in self.aliases
+
+            def replace_profiles(self, profiles) -> None:
+                self.aliases = {profile.alias for profile in profiles.values()}
+
+        old_profile = self.main
+        new_profile = replace(old_profile, alias="qwen3.8-flash-next-iq2-xs")
+        probe = AliasProbe({old_profile.alias})
+        self.controller.readiness_probe = probe
+
+        self.controller.replace_profiles({new_profile.id: new_profile})
+
+        self.assertTrue(probe(new_profile.alias, 0.1))
+
+    def test_recovery_from_corrupt_state_uses_actual_active_unit(self) -> None:
+        main_unit = self.controller.unit_name("main-27b")
+        self.harness.service_inventory_units.add(main_unit)
+        self.harness.service_states[main_unit] = ServiceStateSnapshot(
+            active_state="active",
+            sub_state="running",
+            main_pid=4242,
+            control_pid=0,
+        )
+        self.harness.probe_results[self.main.alias] = True
+        self.state_path.write_text("{corrupt state", encoding="utf-8")
+
+        recovered = self.controller.reconcile_from_runtime()
+
+        self.assertEqual(recovered["phase"], "active")
+        self.assertEqual(recovered["profile"], "main-27b")
+        self.assertEqual(recovered["generation"], 0)
+        self.assertEqual(self.harness.commands, [])
+
+    def test_recovery_from_ambiguous_active_units_fails_stale_without_stopping(self) -> None:
+        main_unit = self.controller.unit_name("main-27b")
+        vision_unit = self.controller.unit_name("qwen-vision")
+        self.harness.service_inventory_units.update({main_unit, vision_unit})
+        for unit in (main_unit, vision_unit):
+            self.harness.service_states[unit] = ServiceStateSnapshot(
+                active_state="active",
+                sub_state="running",
+                main_pid=4242,
+                control_pid=0,
+            )
+        self.state_path.write_text("{corrupt state", encoding="utf-8")
+
+        recovered = self.controller.reconcile_from_runtime()
+
+        self.assertEqual(recovered["phase"], "stale")
+        self.assertIsNone(recovered["profile"])
+        self.assertEqual(self.harness.commands, [])
 
     def test_failed_unit_without_process_is_quiescent(self) -> None:
         state = ServiceStateSnapshot(
@@ -214,6 +294,59 @@ class BackendControllerTest(unittest.TestCase):
         )
 
         self.assertTrue(state.is_quiescent)
+
+    def test_startup_recovery_backs_up_corrupt_state_and_reconciles_runtime(self) -> None:
+        main_unit = self.controller.unit_name("main-27b")
+        self.harness.service_inventory_units.add(main_unit)
+        self.harness.service_states[main_unit] = ServiceStateSnapshot(
+            active_state="active",
+            sub_state="running",
+            main_pid=4242,
+            control_pid=0,
+        )
+        self.harness.probe_results[self.main.alias] = True
+        corrupt = b'{"phase":"broken"\n'
+        self.state_path.write_bytes(corrupt)
+
+        repaired = _prepare_durable_state(self.controller)
+
+        self.assertTrue(repaired)
+        backups = list(self.root.glob("state.json.corrupt.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), corrupt)
+        state = self.read_state()
+        self.assertEqual((state["phase"], state["profile"]), ("active", "main-27b"))
+        self.assertTrue(state["operations"]["reconciliation_required"])
+        self.assertIn("resubmitted", state["recovery"]["warning"])
+        self.assertEqual(self.harness.commands, [])
+
+    def test_startup_recovery_discards_unsupported_operation_schema(self) -> None:
+        self.controller._write_state(
+            {"generation": 9, "profile": "main-27b", "phase": "active"}
+        )
+        state = self.read_state()
+        state["operations"] = {"schema_version": 999, "queue": ["old"]}
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        main_unit = self.controller.unit_name("main-27b")
+        self.harness.service_inventory_units.add(main_unit)
+        self.harness.service_states[main_unit] = ServiceStateSnapshot(
+            active_state="active",
+            sub_state="running",
+            main_pid=4242,
+            control_pid=0,
+        )
+        self.harness.probe_results[self.main.alias] = True
+
+        repaired = _prepare_durable_state(self.controller)
+
+        self.assertTrue(repaired)
+        backups = list(self.root.glob("state.json.corrupt.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text())["operations"]["schema_version"], 999)
+        state = self.read_state()
+        self.assertEqual(state["profile"], "main-27b")
+        self.assertEqual(state["operations"]["executions"], {})
+        self.assertTrue(PersistentTransitionQueue(self.controller.state_store).needs_reconciliation)
 
     def test_raw_subprocess_timeout_is_wrapped_as_controller_error(self) -> None:
         def time_out(command: tuple[str, ...]) -> None:
@@ -387,6 +520,129 @@ class BackendControllerTest(unittest.TestCase):
         self.assertEqual(command[:4], ("systemctl", "--user", "show", "llama-broker-profile-main.service"))
         self.assertTrue(run.call_args.kwargs["check"])
         self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_backend_error_lines_prefers_llama_cpp_error_records(self) -> None:
+        journal = [
+            "0.03.327.665 I srv  llama_server: listening on https://0.0.0.0:10000",
+            "/src/ggml/src/ggml-cuda/ggml-cuda.cu:109: CUDA error",
+            "1.18.294.224 E CUDA error: device not ready",
+            "1.18.294.242 E   current device: 0, in function alloc at /src/ggml-cuda.cu:652",
+            "1.18.294.243 E   cuMemSetAccess(start_ptr, reserve_size, &access, 1)",
+            "1.18.294.250 E   one line too many",
+            "[New LWP 565863]",
+            "#5  0x000071d6af142b2b in ggml_abort () from libggml-base.so.0",
+        ]
+
+        self.assertEqual(
+            backend_error_lines(journal),
+            (
+                "CUDA error: device not ready",
+                "current device: 0, in function alloc at /src/ggml-cuda.cu:652",
+                "cuMemSetAccess(start_ptr, reserve_size, &access, 1)",
+            ),
+        )
+
+    def test_backend_error_lines_falls_back_to_error_words_and_truncates(self) -> None:
+        journal = [
+            "Loading model",
+            "Traceback (most recent call last):",
+            "warning: ignore this error",
+            "#0 abort () in libc",
+            "RuntimeError: " + "x" * 400,
+        ]
+
+        lines = backend_error_lines(journal)
+
+        self.assertEqual(lines[0], "Traceback (most recent call last):")
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines[1]), 240)
+        self.assertTrue(lines[1].endswith("..."))
+
+    def test_systemd_backend_exit_probe_reports_signal_and_journal_errors(self) -> None:
+        show = SimpleNamespace(stdout=(
+            "ActiveState=failed\nResult=signal\nExecMainCode=2\nExecMainStatus=6\n"
+            "InvocationID=c95ff89c149b4de194f7f50333225b56\n"
+        ))
+        journal = SimpleNamespace(stdout="1.18.294.224 E CUDA error: device not ready\n")
+        with patch.object(
+            backend_controller.subprocess, "run", side_effect=[show, journal]
+        ) as run:
+            backend_exit = systemd_backend_exit_probe("llama-broker-profile-main.service")
+
+        self.assertEqual(
+            backend_exit,
+            BackendExit(
+                result="signal",
+                exit_status="SIGABRT",
+                detail=("CUDA error: device not ready",),
+            ),
+        )
+        assert backend_exit is not None
+        self.assertTrue(backend_exit.crashed)
+        self.assertEqual(
+            backend_exit.summary(), "signal (SIGABRT): CUDA error: device not ready"
+        )
+        journal_command = run.call_args_list[1].args[0]
+        self.assertEqual(journal_command[:2], ("journalctl", "--user"))
+        self.assertIn("_SYSTEMD_INVOCATION_ID=c95ff89c149b4de194f7f50333225b56", journal_command)
+
+    def test_systemd_backend_exit_probe_waits_for_running_units(self) -> None:
+        show = SimpleNamespace(stdout="ActiveState=deactivating\nResult=success\n")
+        with patch.object(backend_controller.subprocess, "run", return_value=show) as run:
+            self.assertIsNone(systemd_backend_exit_probe("llama-broker-profile-main.service"))
+        run.assert_called_once()
+
+    def test_systemd_backend_exit_probe_describes_exit_codes_without_journal(self) -> None:
+        show = SimpleNamespace(stdout=(
+            "ActiveState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=1\n"
+            "InvocationID=\n"
+        ))
+        with patch.object(backend_controller.subprocess, "run", return_value=show) as run:
+            backend_exit = systemd_backend_exit_probe("llama-broker-profile-main.service")
+
+        self.assertEqual(backend_exit, BackendExit(result="exit-code", exit_status="exit 1"))
+        run.assert_called_once()
+
+    def test_clean_stop_is_not_a_crash(self) -> None:
+        self.assertFalse(BackendExit(result="success", exit_status="exit 0").crashed)
+
+    def test_describe_exit_waits_for_the_unit_to_settle(self) -> None:
+        backend_exit = BackendExit(result="signal", exit_status="SIGABRT")
+        answers = [None, None, backend_exit]
+        units: list[str] = []
+
+        def probe(unit_name: str) -> BackendExit | None:
+            units.append(unit_name)
+            return answers.pop(0)
+
+        self.controller.exit_probe = probe
+
+        self.assertEqual(
+            self.controller.describe_exit("main-27b", settle_timeout=5, poll_interval=0.001),
+            backend_exit,
+        )
+        self.assertEqual(units, [self.controller.unit_name("main-27b")] * 3)
+
+    def test_describe_exit_gives_up_while_the_unit_keeps_running(self) -> None:
+        self.controller.exit_probe = lambda _unit: None
+        self.assertIsNone(
+            self.controller.describe_exit("main-27b", settle_timeout=0.01, poll_interval=0.001)
+        )
+
+    def test_describe_exit_without_a_probe_reports_nothing(self) -> None:
+        self.assertIsNone(self.controller.describe_exit("main-27b"))
+
+    def test_systemd_alias_probe_reports_canonical_id(self) -> None:
+        completed = SimpleNamespace(stdout=(
+            "Id=llama-broker-profile-main.service\n"
+            "ActiveState=deactivating\nSubState=stop-sigterm\n"
+            "MainPID=42\nControlPID=0\n"
+        ))
+        with patch.object(backend_controller.subprocess, "run", return_value=completed) as run:
+            snapshot = systemd_service_state_probe("llama-server.service")
+        self.assertEqual(snapshot.unit_id, "llama-broker-profile-main.service")
+        self.assertIn("--property=Id", run.call_args.args[0])
+        self.assertFalse(snapshot.is_quiescent)
 
     def test_systemd_service_inventory_probe_keeps_only_exact_prefix_units(self) -> None:
         completed = SimpleNamespace(
@@ -582,8 +838,81 @@ class BackendControllerTest(unittest.TestCase):
         self.assertEqual(self.harness.probes[-1], ("qwen3.5-9b-vision", 45.0))
         self.assertEqual(state, {"generation": 2, "profile": "qwen-vision", "phase": "active"})
 
-    def test_switch_verifies_artifacts_before_starting_unit(self) -> None:
+    def test_backend_lifecycle_write_preserves_namespaced_operations_state(self) -> None:
+        operations = {
+            "schema_version": 1,
+            "queue": ["execution-1"],
+            "requests": {"request-1": {"execution_id": "execution-1"}},
+        }
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "generation": 0,
+                    "profile": None,
+                    "phase": "inactive",
+                    "operations": operations,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.controller.switch("main-27b")
+
+        self.assertEqual(self.read_state()["operations"], operations)
+
+    def test_commit_callback_runs_immediately_before_prior_backend_stop(self) -> None:
+        self.controller.switch("main-27b")
+        committed = False
+        original_runner = self.controller.command_runner
+
+        def run(command: tuple[str, ...]) -> object:
+            if command[:3] == ("systemctl", "--user", "stop"):
+                self.assertTrue(committed)
+            return original_runner(command)
+
+        self.controller.command_runner = run
+
+        def commit() -> None:
+            nonlocal committed
+            committed = True
+
+        self.controller.switch("qwen-vision", commit_callback=commit)
+
+        self.assertTrue(committed)
+        self.assertEqual(self.controller.state()["profile"], "qwen-vision")
+
+    def test_cancelled_commit_leaves_prior_backend_and_state_untouched(self) -> None:
+        self.controller.switch("main-27b")
+        commands_before = list(self.harness.commands)
+
+        def cancel() -> None:
+            raise LifecycleCancelledError("request cancelled before commit")
+
+        with self.assertRaises(LifecycleCancelledError):
+            self.controller.switch("qwen-vision", commit_callback=cancel)
+
+        self.assertEqual(self.controller.state()["profile"], "main-27b")
+        self.assertEqual(self.controller.state()["phase"], "active")
+        self.assertEqual(self.harness.commands, commands_before)
+
+    def test_successful_switch_skips_artifact_verification(self) -> None:
+        self.controller.switch("main-27b")
+
         def reject(_profile: FakeProfile) -> None:
+            self.fail("successful activation must not verify artifacts")
+
+        self.controller.artifact_verifier = reject  # type: ignore[attr-defined]
+        self.controller.switch("qwen-vision")
+
+        self.assertEqual(self.controller.state()["profile"], "qwen-vision")
+        self.assertEqual(self.controller.state()["phase"], "active")
+
+    def test_failed_start_verifies_artifacts_after_cleanup(self) -> None:
+        unit = self.controller.unit_name("main-27b")
+        self.harness.command_failures.add(("systemctl", "--user", "start", unit))
+
+        def reject(_profile: FakeProfile) -> None:
+            self.assertEqual(self.harness.commands[-1], ("systemctl", "--user", "stop", unit))
             raise ConfigurationError("artifact digest mismatch")
 
         self.controller.artifact_verifier = reject  # type: ignore[attr-defined]
@@ -591,13 +920,9 @@ class BackendControllerTest(unittest.TestCase):
         with self.assertRaises(SwitchError) as caught:
             self.controller.switch("main-27b")
 
-        self.assertIsInstance(caught.exception.__cause__, ConfigurationError)
-        self.assertIn("artifact digest mismatch", str(caught.exception))
-
-        self.assertNotIn(
-            ("systemctl", "--user", "start", self.controller.unit_name("main-27b")),
-            self.harness.commands,
-        )
+        self.assertIn("injected command failure", str(caught.exception))
+        self.assertEqual(self.controller.state()["artifact_verification"],
+                         {"status": "failed", "error": "artifact digest mismatch"})
 
     def test_successful_switch_persists_concrete_running_build_identity(self) -> None:
         profile = replace(
@@ -706,6 +1031,28 @@ class BackendControllerTest(unittest.TestCase):
         self.assertIn("ram_available_mib", " ".join(decision["violations"]))
         self.assertEqual(self.read_state()["phase"], "failed")
 
+    def test_unknown_vram_fails_closed_when_vram_admission_is_required(self) -> None:
+        self.controller.resource_probe = lambda: ResourceSnapshot(
+            ram_available_mib=24_000,
+            swap_used_mib=0,
+            vram_total_mib=None,
+            vram_free_mib=None,
+        )
+
+        with self.assertRaises(SwitchError) as raised:
+            self.controller.switch("main-27b")
+
+        self.assertIsInstance(raised.exception.cause, AdmissionError)
+        self.assertEqual(self.harness.commands, [])
+        decision = next(
+            event for event in self.harness.events
+            if event.get("event") == "resource_admission"
+        )
+        self.assertEqual(decision["decision"], "deny")
+        violations = str(decision.get("violations", ""))
+        self.assertIn("vram_total_mib unavailable", violations)
+        self.assertIn("vram_free_mib unavailable", violations)
+
     def test_resource_probe_failure_fails_closed_and_is_logged(self) -> None:
         self.harness.resource_probe_error = OSError("qualification probe unavailable")
 
@@ -755,6 +1102,33 @@ class BackendControllerTest(unittest.TestCase):
         self.assertEqual(state, initial)
         self.assertEqual(self.harness.commands, [])
         self.assertEqual(self.harness.probes, [("main-27b", 90.0)])
+
+    def test_load_crashed_current_profile_restarts_before_waiting_for_readiness(self) -> None:
+        self.controller.switch("main-27b")
+        unit = self.controller.unit_name("main-27b")
+        self.harness.service_states[unit] = ServiceStateSnapshot(
+            active_state="failed", sub_state="failed", main_pid=0, control_pid=0,
+        )
+        self.harness.commands.clear()
+        self.harness.probes.clear()
+
+        def probe(alias: str, timeout: float) -> bool:
+            self.assertEqual(
+                self.harness.service_state(unit).active_state,
+                "active",
+                "a crashed unit must restart before spending its startup timeout",
+            )
+            return self.harness.probe(alias, timeout)
+
+        self.controller.readiness_probe = probe
+        state = self.controller.switch("main-27b")
+
+        self.assertEqual(self.harness.commands, [
+            ("systemctl", "--user", "stop", unit),
+            ("systemctl", "--user", "start", unit),
+        ])
+        self.assertEqual(self.harness.probes, [("main-27b", 90.0)])
+        self.assertEqual(state, {"generation": 2, "profile": "main-27b", "phase": "active"})
 
     def test_stop_all_stops_every_profile_and_marks_inactive(self) -> None:
         self.controller.switch("main-27b")
@@ -1304,6 +1678,207 @@ class BackendControllerTest(unittest.TestCase):
         self.assertIsNone(state["profile"])
         self.assertEqual(state["stale_profile"], "main-27b")
         self.assertEqual(self.harness.probes, [("main-27b", 0.25)])
+
+
+class BackendPreemptionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.harness = Harness()
+        self.main = FakeProfile(
+            id="main-27b",
+            alias="main-27b",
+            display_name="Main 27B",
+            server_binary="/opt/llama-server",
+            model_path="/models/main.gguf",
+        )
+        self.vision = FakeProfile(
+            id="qwen-vision",
+            alias="qwen-vision",
+            display_name="Qwen vision",
+            server_binary="/opt/llama-server",
+            model_path="/models/qwen.gguf",
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def make_controller(self, **overrides: object) -> BackendController:
+        options: dict[str, object] = {
+            "profiles": {profile.id: profile for profile in (self.main, self.vision)},
+            "state_path": self.root / "state.json",
+            "systemd_dir": self.root / "systemd",
+            "service_prefix": "llama-broker-profile",
+            "command_runner": self.harness.run,
+            "readiness_probe": self.harness.probe,
+            "resource_probe": None,
+            "event_logger": self.harness.log_event,
+            "service_state_probe": self.harness.service_state,
+        }
+        options.update(overrides)
+        return BackendController(**options)  # type: ignore[arg-type]
+
+    def unit(self, controller: BackendController, profile_id: str) -> str:
+        return controller.unit_name(profile_id)
+
+    def test_preempted_activation_stops_target_and_records_inactive_state(self) -> None:
+        controller = self.make_controller()
+        controller.switch("main-27b")
+
+        def preempted_probe(alias: str, timeout: float) -> bool:
+            self.assertTrue(controller.preempt_activation())
+            return False
+
+        controller.readiness_probe = preempted_probe
+        with self.assertRaises(SwitchError) as caught:
+            controller.switch("qwen-vision")
+
+        self.assertIsInstance(caught.exception.__cause__, ActivationPreemptedError)
+        vision_unit = self.unit(controller, "qwen-vision")
+        self.assertEqual(
+            self.harness.commands[-1],
+            ("systemctl", "--user", "stop", vision_unit),
+        )
+        state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["phase"], "inactive")
+        self.assertIsNone(state["profile"])
+        self.assertEqual(state["preempted_profile"], "qwen-vision")
+        self.assertTrue(self.harness.service_state(vision_unit).is_quiescent)
+        self.assertFalse(controller.preempt_activation())
+
+        controller.readiness_probe = self.harness.probe
+        state = controller.switch("main-27b")
+
+        self.assertEqual(state["profile"], "main-27b")
+        self.assertEqual(
+            self.harness.commands[-1],
+            ("systemctl", "--user", "start", self.unit(controller, "main-27b")),
+        )
+
+    def test_preempt_without_switch_in_progress_is_ignored(self) -> None:
+        controller = self.make_controller()
+
+        self.assertFalse(controller.preempt_activation())
+        state = controller.switch("main-27b")
+
+        self.assertEqual(state["profile"], "main-27b")
+
+
+class BackendHandoffTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.harness = Harness()
+        self.main = FakeProfile("main-27b", "main-27b", "Main", "/opt/server", "/models/main.gguf")
+        self.target = FakeProfile("target", "target", "Target", "/opt/server", "/models/target.gguf")
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def controller(self, readings: list[int], **overrides: object) -> BackendController:
+        options: dict[str, object] = {
+            "profiles": {self.main.id: self.main, self.target.id: self.target},
+            "state_path": self.root / "state.json",
+            "systemd_dir": self.root / "systemd",
+            "service_prefix": "llama-broker-profile",
+            "command_runner": self.harness.run,
+            "readiness_probe": self.harness.probe,
+            "resource_probe": None,
+            "event_logger": self.harness.log_event,
+            "service_state_probe": self.harness.service_state,
+            "vram_probe": lambda: readings.pop(0) if len(readings) > 1 else readings[0],
+            "endpoint_probe": lambda: False,
+            "handoff_window_samples": 3,
+            "handoff_poll_interval": 0.001,
+            "handoff_timeout": 0.05,
+        }
+        options.update(overrides)
+        return BackendController(**options)  # type: ignore[arg-type]
+
+    def test_supported_sustained_rise_starts_target_before_prior_exit(self) -> None:
+        controller = self.controller([1000, 1080, 1200, 1300])
+        controller.switch("main-27b")
+        prior = controller.unit_name("main-27b")
+        self.harness.quiesce_on_stop.add(prior)
+        original_run = self.harness.run
+
+        def observed_run(command: tuple[str, ...]) -> None:
+            if command == ("systemctl", "--user", "start", controller.unit_name("target")):
+                self.assertEqual(self.harness.service_state(prior).active_state, "deactivating")
+                self.assertGreater(self.harness.service_state(prior).main_pid, 0)
+            original_run(command)
+
+        controller.command_runner = observed_run
+        controller.switch("target")
+        commands = self.harness.commands[1:]
+        start = ("systemctl", "--user", "start", controller.unit_name("target"))
+        assert commands.index(("systemctl", "--user", "--no-block", "stop", prior)) < commands.index(start)
+        assert commands.index(start) < commands.index(("systemctl", "--user", "stop", prior))
+        assert any(event.get("decision") == "early_start" for event in self.harness.events)
+
+    def test_different_device_namespace_does_not_use_wrong_gpu_release_signal(self) -> None:
+        controller = self.controller([1000, 1400, 1500, 1600])
+        controller.switch("main-27b")
+        controller.profiles["target"] = replace(
+            self.target, environment={**self.target.environment, "CUDA_VISIBLE_DEVICES": "different-device"}
+        )
+        controller.switch("target")
+        self.assertFalse(any("--no-block" in command for command in self.harness.commands))
+        self.assertTrue(any(event.get("decision") == "device_namespace_mismatch" for event in self.harness.events))
+
+    def test_outgoing_alias_is_allowed_only_with_matching_systemd_identity(self) -> None:
+        controller = self.controller([1000, 1080, 1200, 1300])
+        controller.switch("main-27b")
+        prior = controller.unit_name("main-27b")
+        self.harness.quiesce_on_stop.add(prior)
+        original_probe = self.harness.service_state
+
+        def alias_probe(unit: str) -> ServiceStateSnapshot:
+            if unit == "llama-server.service":
+                return replace(original_probe(prior), unit_id=prior)
+            return replace(original_probe(unit), unit_id=unit)
+
+        controller.service_state_probe = alias_probe
+        state = controller.switch("target")
+        self.assertEqual(state["profile"], "target")
+        self.assertTrue(any(event.get("decision") == "early_start" for event in self.harness.events))
+
+    def test_independent_or_unproven_legacy_identity_blocks_early_start(self) -> None:
+        for identity in ("llama-server.service", None, "other.service"):
+            with self.subTest(identity=identity):
+                controller = self.controller([1000, 1080, 1200, 1300])
+                controller.switch("main-27b")
+                prior = controller.unit_name("main-27b")
+                self.harness.quiesce_on_stop.add(prior)
+                original_probe = self.harness.service_state
+
+                def legacy_probe(unit: str) -> ServiceStateSnapshot:
+                    if unit == "llama-server.service":
+                        return ServiceStateSnapshot("deactivating", "stop-sigterm", 4343, 0, unit_id=identity)
+                    return replace(original_probe(unit), unit_id=unit)
+
+                controller.service_state_probe = legacy_probe
+                self.harness.commands.clear()
+                with self.assertRaises(SwitchError):
+                    controller.switch("target")
+                self.assertNotIn(
+                    ("systemctl", "--user", "start", controller.unit_name("target")),
+                    self.harness.commands,
+                )
+                self.harness.commands.clear()
+                # Each subcase starts from an independent inactive state.
+                (self.root / "state.json").unlink()
+
+    def test_noise_without_sustained_window_falls_back_to_exit(self) -> None:
+        controller = self.controller([1000, 1250, 1100, 1250], handoff_timeout=0.01)
+        controller.switch("main-27b")
+        prior = controller.unit_name("main-27b")
+        self.harness.quiesce_on_stop.add(prior)
+        controller.switch("target")
+        commands = self.harness.commands[1:]
+        start = ("systemctl", "--user", "start", controller.unit_name("target"))
+        assert commands.index(("systemctl", "--user", "stop", prior)) < commands.index(start)
+        assert not any(event.get("decision") == "early_start" for event in self.harness.events)
 
 
 if __name__ == "__main__":

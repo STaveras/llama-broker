@@ -66,7 +66,14 @@ def inspect_manifest(
 ) -> tuple[dict[str, Any], tuple[ProfileInspection, ...]]:
     """Parse profiles independently, optionally verifying their artifacts."""
 
-    payload = load_manifest(path)
+    try:
+        payload = load_manifest(path)
+    except ProfileError as error:
+        if not Path(path).exists():
+            raise ProfileError(
+                f"No profile configuration yet at {path}. Run `brokerctl setup` to discover and select one."
+            ) from error
+        raise
     raw_profiles = payload.get("profiles")
     if not isinstance(raw_profiles, list):
         raise ProfileError("profile manifest must contain a profiles list")

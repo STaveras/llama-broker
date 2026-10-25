@@ -10,6 +10,7 @@ import re
 import subprocess
 
 PRIVATE_PATH_PATTERNS = (
+    re.compile(r'^docs/basalt-(?:production-stage/|(?:packaged-tls-parent|cache-budget-tuning|candidate-(?:catalog|profile|stagingprofiles-manifest)|packaged-tls-qualification)\.json$|r[56]-(?:deployment-report|final-qualification)\.md$)'),
     re.compile(r"^candidate/(?:.*\.json|.*\.service)$"),
     re.compile(r"(?:^|/)(?:profiles\.json(?:\.bak-.*)?|catalog\.json|security\.json|state\.json|api-keys|AGENTS\.md|DESIGN\.md|\.env(?:\..*)?)$"),
     re.compile(r"\.(?:pem|key|p12|pfx)$"),

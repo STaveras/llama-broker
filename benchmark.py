@@ -183,7 +183,17 @@ def benchmark_model(model_key: str, no_switch: bool) -> list[Result]:
                     json_valid = False
                     success = False
                     error = f"invalid json: {exc}"
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, RuntimeError, KeyError) as exc:
+        except urllib.error.HTTPError as exc:
+            # Preserve the upstream/bridge body; status alone cannot establish
+            # whether a failure was a length stop, validator rejection, or
+            # transport error.
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:2000]
+            except Exception:
+                detail = "<unreadable HTTP error body>"
+            success = False
+            error = f"HTTP {exc.code} {exc.reason}: {detail}"
+        except (urllib.error.URLError, TimeoutError, RuntimeError, KeyError) as exc:
             success = False
             error = repr(exc)
 

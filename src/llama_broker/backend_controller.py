@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .broker_profiles import launch_environment
+from .gpu_memory import probe_gpu_memory
+from .state_store import StateFileError, StateFileStore, atomic_write_text
 
 
 class Profile(Protocol):
@@ -58,14 +60,14 @@ ArtifactVerifier = Callable[[Profile], None]
 
 @dataclass(frozen=True)
 class ResourceSnapshot:
-    """Linux host and primary-GPU capacity sampled at one transition boundary."""
+    """Host capacity and optional GPU memory data at one transition boundary."""
 
     ram_available_mib: int
     swap_used_mib: int
-    vram_total_mib: int
-    vram_free_mib: int
+    vram_total_mib: int | None = None
+    vram_free_mib: int | None = None
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | None]:
         return {
             "ram_available_mib": self.ram_available_mib,
             "swap_used_mib": self.swap_used_mib,
@@ -75,6 +77,8 @@ class ResourceSnapshot:
 
 
 ResourceProbe = Callable[[], ResourceSnapshot]
+GpuMemoryProbe = Callable[[], tuple[int, int]]
+VramProbe = Callable[[], int]
 EventLogger = Callable[[dict[str, object]], None]
 CancellationProbe = Callable[[], bool]
 
@@ -82,20 +86,14 @@ CancellationProbe = Callable[[], bool]
 def linux_resource_snapshot(
     proc_meminfo: str | os.PathLike[str] = "/proc/meminfo",
     *,
-    nvidia_smi: str = "nvidia-smi",
-    timeout: float = 5.0,
+    gpu_memory_probe: GpuMemoryProbe | None = None,
 ) -> ResourceSnapshot:
-    """Sample host RAM/swap and primary-GPU capacity using Linux-native probes.
+    """Read host RAM/swap and optionally accept a platform-provided GPU probe.
 
-    The probe intentionally fails closed when either `/proc/meminfo` or the
-    primary NVIDIA device cannot be read; callers convert that failure into a
-    denied profile transition instead of starting a model without a safety
-    snapshot. Available RAM is rounded down and swap usage is rounded up so
-    admission never overstates usable capacity.
+    Linux has no portable interface for reading free GPU memory. Without an
+    injected provider, VRAM values are unknown; admission checks that require
+    them must fail closed. RAM is rounded down and swap usage is rounded up.
     """
-
-    if timeout <= 0:
-        raise ValueError("resource probe timeout must be positive")
 
     meminfo = Path(proc_meminfo).read_text(encoding="utf-8")
     values_kib: dict[str, int] = {}
@@ -121,30 +119,23 @@ def linux_resource_snapshot(
     if values_kib["SwapFree"] > values_kib["SwapTotal"]:
         raise ValueError("/proc/meminfo reports SwapFree above SwapTotal")
 
-    result = subprocess.run(
-        (
-            nvidia_smi,
-            "-i",
-            "0",
-            "--query-gpu=memory.total,memory.free",
-            "--format=csv,noheader,nounits",
-        ),
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    line = next((candidate.strip() for candidate in result.stdout.splitlines() if candidate.strip()), "")
-    fields = [field.strip() for field in line.split(",")]
-    if len(fields) != 2:
-        raise ValueError("nvidia-smi returned no primary-GPU memory pair")
-    try:
-        vram_total_mib = int(fields[0])
-        vram_free_mib = int(fields[1])
-    except ValueError as error:
-        raise ValueError("nvidia-smi returned non-numeric primary-GPU memory") from error
-    if vram_total_mib <= 0 or vram_free_mib < 0 or vram_free_mib > vram_total_mib:
-        raise ValueError("nvidia-smi returned an invalid primary-GPU memory pair")
+    vram_total_mib = vram_free_mib = None
+    if gpu_memory_probe is None:
+        detected = probe_gpu_memory()
+        if detected is not None:
+            vram_total_mib, vram_free_mib = detected
+    else:
+        vram_total_mib, vram_free_mib = gpu_memory_probe()
+        if (
+            isinstance(vram_total_mib, bool)
+            or not isinstance(vram_total_mib, int)
+            or isinstance(vram_free_mib, bool)
+            or not isinstance(vram_free_mib, int)
+            or vram_total_mib <= 0
+            or vram_free_mib < 0
+            or vram_free_mib > vram_total_mib
+        ):
+            raise ValueError("GPU memory provider returned an invalid total/free memory pair")
 
     def floor_mib(kib: int) -> int:
         return kib // 1024
@@ -168,6 +159,7 @@ class ServiceStateSnapshot:
     sub_state: str
     main_pid: int
     control_pid: int
+    unit_id: str | None = None
 
     @property
     def is_quiescent(self) -> bool:
@@ -187,8 +179,142 @@ class ServiceStateSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class BackendExit:
+    """How a backend unit's last main process ended, for crash diagnostics."""
+
+    result: str
+    exit_status: str
+    detail: tuple[str, ...] = ()
+
+    @property
+    def crashed(self) -> bool:
+        return self.result != "success"
+
+    def summary(self) -> str:
+        text = f"{self.result} ({self.exit_status})"
+        if self.detail:
+            text += ": " + "; ".join(self.detail)
+        return text
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "result": self.result,
+            "exit_status": self.exit_status,
+            "detail": list(self.detail),
+        }
+
+
 ServiceStateProbe = Callable[[str], ServiceStateSnapshot]
 ServiceInventoryProbe = Callable[[str], Sequence[str]]
+# Returns None while the unit is still running or stopping.
+BackendExitProbe = Callable[[str], "BackendExit | None"]
+
+_LOG_LEVEL_PREFIX = re.compile(r"^\d+(?:\.\d+)+ ([A-Z]) ")
+_ERROR_WORDS = re.compile(
+    # No leading boundary on error/exception, so RuntimeError: and the like match.
+    r"(?:error|exception)\b|\b(?:fatal|out of memory|assert(?:ion)?|abort(?:ed)?|"
+    r"segmentation fault|terminate called|traceback)\b",
+    re.IGNORECASE,
+)
+_MAX_EXIT_DETAIL_LINES = 3
+_MAX_EXIT_DETAIL_CHARS = 240
+
+
+def backend_error_lines(lines: Iterable[str]) -> tuple[str, ...]:
+    """Pick the first few error lines a backend printed before it died.
+
+    llama.cpp tags its own log lines with a level letter, so ``E`` lines win;
+    otherwise fall back to generic error words, skipping gdb backtrace noise.
+    """
+
+    tagged: list[str] = []
+    worded: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(("#", "[New LWP", "[Thread", "[Inferior")):
+            continue
+        match = _LOG_LEVEL_PREFIX.match(line)
+        if match is not None:
+            if match.group(1) == "E":
+                tagged.append(line[match.end():].strip())
+            continue
+        if _ERROR_WORDS.search(line) and "warning:" not in line:
+            worded.append(line)
+    picked = tagged or worded
+    return tuple(
+        line[: _MAX_EXIT_DETAIL_CHARS - 3] + "..." if len(line) > _MAX_EXIT_DETAIL_CHARS else line
+        for line in picked[:_MAX_EXIT_DETAIL_LINES]
+    )
+
+
+def _exit_status_text(code: str, status: str) -> str:
+    # ExecMainCode is the CLD_* code from waitid(): 1 exited, 2 killed, 3 dumped.
+    if code in {"2", "3"}:
+        try:
+            name = signal.Signals(int(status)).name
+        except ValueError:
+            name = f"signal {status}"
+        return f"{name}, core dumped" if code == "3" else name
+    return f"exit {status}"
+
+
+def systemd_backend_exit_probe(unit_name: str) -> BackendExit | None:
+    """Describe a stopped unit's last exit and the errors it logged."""
+
+    result = subprocess.run(
+        (
+            "systemctl",
+            "--user",
+            "show",
+            unit_name,
+            "--no-pager",
+            "--property=ActiveState",
+            "--property=Result",
+            "--property=ExecMainCode",
+            "--property=ExecMainStatus",
+            "--property=InvocationID",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    if values.get("ActiveState") not in {"inactive", "failed"}:
+        return None
+    detail: tuple[str, ...] = ()
+    invocation = values.get("InvocationID", "")
+    if re.fullmatch(r"[0-9a-f]{32}", invocation):
+        try:
+            journal = subprocess.run(
+                (
+                    "journalctl",
+                    "--user",
+                    f"_SYSTEMD_INVOCATION_ID={invocation}",
+                    "--no-pager",
+                    "--output=cat",
+                    "--lines=400",
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            detail = backend_error_lines(journal.stdout.splitlines())
+        except (OSError, subprocess.SubprocessError):
+            detail = ()
+    return BackendExit(
+        result=values.get("Result") or "unknown",
+        exit_status=_exit_status_text(
+            values.get("ExecMainCode", ""), values.get("ExecMainStatus", "")
+        ),
+        detail=detail,
+    )
 
 
 def systemd_service_state_probe(unit_name: str) -> ServiceStateSnapshot:
@@ -201,6 +327,7 @@ def systemd_service_state_probe(unit_name: str) -> ServiceStateSnapshot:
             "show",
             unit_name,
             "--no-pager",
+            "--property=Id",
             "--property=ActiveState",
             "--property=SubState",
             "--property=MainPID",
@@ -239,6 +366,7 @@ def systemd_service_state_probe(unit_name: str) -> ServiceStateSnapshot:
         sub_state=values["SubState"],
         main_pid=main_pid,
         control_pid=control_pid,
+        unit_id=values.get("Id") or None,
     )
 
 
@@ -268,6 +396,10 @@ class QuiescenceError(BackendControllerError):
 
 class LifecycleCancelledError(BackendControllerError):
     """A start or admission step was cancelled before model activation."""
+
+
+class ActivationPreemptedError(LifecycleCancelledError):
+    """A newer inference request preempted an idle backend activation."""
 
 
 class ServiceOwnershipError(BackendControllerError):
@@ -373,32 +505,9 @@ def _unit_quote(value: str, *, escape_dollar: bool = False) -> str:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """Durably replace *path* using a temporary file in the same directory."""
+    """Durably replace *path* using the shared same-directory writer."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary_path, 0o644)
-        os.replace(temporary_path, path)
-
-        # Persist the directory entry where the platform supports directory fsync.
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_write_text(path, text)
 
 
 def _replace_option(args: list[str], option: str, value: str) -> list[str]:
@@ -444,6 +553,7 @@ class BackendController:
         event_logger: EventLogger,
         service_state_probe: ServiceStateProbe | None = None,
         service_inventory_probe: ServiceInventoryProbe | None = None,
+        exit_probe: BackendExitProbe | None = None,
         cancellation_probe: CancellationProbe | None = None,
         endpoint_probe: EndpointProbe | None = None,
         backend_listen_host: str | None = None,
@@ -451,6 +561,12 @@ class BackendController:
         managed_args: Sequence[str] | Mapping[str, Sequence[str]] = (),
         verify_command: VerifyCommand | None = None,
         artifact_verifier: ArtifactVerifier | None = None,
+        vram_probe: VramProbe | None = None,
+        preemption_event: threading.Event | None = None,
+        handoff_min_vram_rise_mib: int = 256,
+        handoff_window_samples: int = 3,
+        handoff_timeout: float = 30.0,
+        handoff_poll_interval: float = 0.25,
     ) -> None:
         if not profiles:
             raise ConfigurationError("at least one profile is required")
@@ -461,6 +577,7 @@ class BackendController:
 
         self.profiles = dict(profiles)
         self.state_path = Path(state_path)
+        self.state_store = StateFileStore(self.state_path)
         self.systemd_dir = Path(systemd_dir)
         self.service_prefix = service_prefix
         self.command_runner = command_runner
@@ -469,6 +586,7 @@ class BackendController:
         self.event_logger = event_logger
         self.service_state_probe = service_state_probe
         self.service_inventory_probe = service_inventory_probe
+        self.exit_probe = exit_probe
         self.cancellation_probe = cancellation_probe
         self.endpoint_probe = endpoint_probe
         if backend_listen_port is not None and backend_listen_port <= 0:
@@ -477,6 +595,20 @@ class BackendController:
         self.backend_listen_port = backend_listen_port
         self.verify_command = verify_command
         self.artifact_verifier = artifact_verifier
+        if handoff_min_vram_rise_mib <= 0 or handoff_window_samples < 2:
+            raise ConfigurationError("handoff rise must be positive and window must have at least two samples")
+        if handoff_timeout < 0 or handoff_poll_interval <= 0:
+            raise ConfigurationError("handoff timings must be positive")
+        self.vram_probe = vram_probe
+        self.handoff_min_vram_rise_mib = handoff_min_vram_rise_mib
+        self.handoff_window_samples = handoff_window_samples
+        self.handoff_timeout = handoff_timeout
+        self.handoff_poll_interval = handoff_poll_interval
+        self._released_units: set[str] = set()
+        self._handoff_baseline_mib: int | None = None
+        self._preempt_event = preemption_event or threading.Event()
+        self._activation_guard = threading.Lock()
+        self._activation_target: str | None = None
         if isinstance(managed_args, Mapping):
             self.managed_args = {
                 runtime: tuple(args) for runtime, args in managed_args.items()
@@ -712,6 +844,7 @@ class BackendController:
             "[Service]",
             f"Type={service.service_type}",
             f"MemoryMax={service.memory_max_mib}M",
+            *([f"MemoryHigh={service.memory_high_mib}M"] if service.memory_high_mib is not None else []),
             f"MemorySwapMax={service.memory_swap_max_mib}M",
             f"TasksMax={service.tasks_max}",
             f"KillSignal={service.kill_signal}",
@@ -883,9 +1016,46 @@ class BackendController:
         profile_id: str,
         *,
         force_restart: bool = False,
+        commit_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        """Switch to *profile_id*, restoring the prior profile on any failure."""
+        """Switch to a profile while exposing a cancellable activation window."""
+        with self._lock:
+            with self._activation_guard:
+                self._activation_target = profile_id
+                self._preempt_event.clear()
+            try:
+                return self._switch_transaction(
+                    profile_id,
+                    force_restart=force_restart,
+                    commit_callback=commit_callback,
+                )
+            finally:
+                with self._activation_guard:
+                    self._activation_target = None
+                    self._preempt_event.clear()
 
+    def preempt_activation(self) -> bool:
+        """Request cooperative cancellation of the current target activation."""
+        with self._activation_guard:
+            target = self._activation_target
+            if target is None:
+                return False
+            self._preempt_event.set()
+        self._emit(
+            "profile_transition",
+            decision="preempt_requested",
+            target_profile=target,
+        )
+        return True
+
+    def _switch_transaction(
+        self,
+        profile_id: str,
+        *,
+        force_restart: bool = False,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Perform a transactional switch while holding the controller lock."""
         with self._lock:
             self._require_not_cancelled("switch")
             target = self._profile(profile_id)
@@ -932,14 +1102,40 @@ class BackendController:
             self._write_state(switching_state)
 
             target_start_attempted = False
+            commit_called = False
             try:
-                if prior_id is not None and (
+                target_requires_activation = (
                     prior_id != profile_id
                     or prior_state["phase"] != "active"
                     or restart_current
-                ):
-                    self._stop(prior_id)
+                )
+                lingering: set[str] = set()
+                if prior_id is not None and target_requires_activation:
+                    if commit_callback is not None:
+                        commit_callback()
+                    commit_called = True
+                    if prior_id == profile_id:
+                        self._stop(prior_id)
+                    else:
+                        # Broker telemetry must observe the same CUDA namespace
+                        # as both units; otherwise a rise could belong to another GPU.
+                        selectors = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "LLAMA_BROKER_GPU_DEVICE")
+                        namespaces_match = all(
+                            str(self._profile(unit_profile).environment.get(key, os.environ.get(key, "")))
+                            == os.environ.get(key, "")
+                            for unit_profile in (prior_id, profile_id)
+                            for key in selectors
+                        )
+                        if namespaces_match:
+                            self._release_unit(self.unit_name(prior_id))
+                            lingering = self._await_handoff(stage=f"pre_start:{profile_id}")
+                        else:
+                            self._emit("backend_handoff", decision="device_namespace_mismatch")
+                            self._stop(prior_id)
                 pre_start_snapshot = self._admit_pre_start(target)
+                if not commit_called and commit_callback is not None:
+                    commit_callback()
+                    commit_called = True
                 self._emit(
                     "profile_transition",
                     decision="target_starting",
@@ -948,7 +1144,8 @@ class BackendController:
                     generation=generation,
                 )
                 target_start_attempted = True
-                self._start(profile_id)
+                self._start(profile_id, lingering=lingering)
+                self._finish_handoff(lingering, target_profile=profile_id)
                 self._probe_owned(profile_id, target)
                 self._admit_post_ready(target, pre_start_snapshot)
                 self._emit(
@@ -958,6 +1155,28 @@ class BackendController:
                     target_profile=profile_id,
                     generation=generation,
                 )
+            except LifecycleCancelledError as cancellation_error:
+                if commit_called or target_start_attempted:
+                    # Once destructive work begins, even an activation preemption
+                    # must stop the target before publishing an inactive state.
+                    self._handle_failed_switch(
+                        profile_id=profile_id,
+                        prior_id=prior_id,
+                        generation=generation,
+                        target_error=cancellation_error,
+                        cleanup_target=target_start_attempted,
+                    )
+                    raise AssertionError("failed switch handler must raise")
+                self._write_state(prior_state)
+                self._update_alias(prior_id)
+                self._emit(
+                    "profile_transition",
+                    decision="cancelled_before_commit",
+                    prior_profile=prior_id,
+                    target_profile=profile_id,
+                    generation=generation,
+                )
+                raise
             except Exception as target_error:
                 self._emit(
                     "profile_transition",
@@ -968,6 +1187,19 @@ class BackendController:
                     error_type=type(target_error).__name__,
                     error=str(target_error),
                 )
+                if not commit_called and prior_id is not None and prior_state["phase"] == "active":
+                    try:
+                        self._write_state(prior_state)
+                    except Exception:
+                        self._handle_failed_switch(
+                            profile_id=profile_id,
+                            prior_id=prior_id,
+                            generation=generation,
+                            target_error=target_error,
+                            cleanup_target=target_start_attempted,
+                        )
+                        raise AssertionError("failed switch handler must raise")
+                    raise SwitchError(profile_id, target_error) from target_error
                 self._handle_failed_switch(
                     profile_id=profile_id,
                     prior_id=prior_id,
@@ -998,10 +1230,19 @@ class BackendController:
             )
             return active_state
 
-    def restart(self, profile_id: str) -> dict[str, Any]:
+    def restart(
+        self,
+        profile_id: str,
+        *,
+        commit_callback: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         """Restart a profile even when its alias is currently healthy."""
 
-        return self.switch(profile_id, force_restart=True)
+        return self.switch(
+            profile_id,
+            force_restart=True,
+            commit_callback=commit_callback,
+        )
 
     def state(self) -> dict[str, Any]:
         """Return a validated snapshot of the durable controller state."""
@@ -1039,7 +1280,33 @@ class BackendController:
             )
             return failure_state
 
-    def stop_all(self) -> dict[str, Any]:
+    def describe_exit(
+        self,
+        profile_id: str,
+        *,
+        settle_timeout: float = 3.0,
+        poll_interval: float = 0.1,
+    ) -> BackendExit | None:
+        """Report how a profile's backend exited, or None if it is still running.
+
+        A crashing llama-server can close its socket before systemd records the
+        exit (a backtrace dump runs in between), so this waits briefly for the
+        unit to settle. It takes no controller lock: it only reads systemd.
+        """
+
+        if self.exit_probe is None:
+            return None
+        unit_name = self.unit_name(profile_id)
+        deadline = time.monotonic() + max(0.0, settle_timeout)
+        while True:
+            backend_exit = self.exit_probe(unit_name)
+            if backend_exit is not None or time.monotonic() >= deadline:
+                return backend_exit
+            time.sleep(poll_interval)
+
+    def stop_all(
+        self, *, commit_callback: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
         """Cooperatively stop every broker unit without ever starting a model."""
 
         with self._lock:
@@ -1056,6 +1323,8 @@ class BackendController:
             profile_units = {
                 self.unit_name(profile_id) for profile_id in self.profiles
             }
+            if commit_callback is not None:
+                commit_callback()
             for unit_name in sorted(profile_units | discovered_units):
                 try:
                     self._stop_unit(unit_name)
@@ -1221,6 +1490,138 @@ class BackendController:
             )
             return failed_state
 
+    def reconcile_from_runtime(
+        self,
+        *,
+        active_probe_timeout: float = 0.5,
+    ) -> dict[str, Any]:
+        """Rebuild corrupt durable state from observed units without starting/stopping."""
+        if active_probe_timeout <= 0:
+            raise ValueError("active_probe_timeout must be positive")
+        with self._lock:
+            if self.service_state_probe is None:
+                raise ConfigurationError(
+                    "runtime-state reconstruction requires a service-state probe"
+                )
+            unit_to_profile = {
+                self.unit_name(profile_id): profile_id for profile_id in self.profiles
+            }
+            errors: list[str] = []
+            try:
+                discovered = self._inventory_unit_names()
+            except Exception as error:
+                discovered = set()
+                errors.append(f"service inventory failed: {error}")
+            units = set(unit_to_profile) | discovered | {_LEGACY_SERVICE_UNIT}
+            observed: dict[str, ServiceStateSnapshot] = {}
+            for unit_name in sorted(units):
+                try:
+                    snapshot = self.service_state_probe(unit_name)
+                    if not isinstance(snapshot, ServiceStateSnapshot):
+                        raise TypeError("service state probe returned an invalid snapshot")
+                    observed[unit_name] = snapshot
+                except Exception as error:
+                    errors.append(f"{unit_name}: {error}")
+
+            active_profiles: list[str] = []
+            unknown_active_units: list[str] = []
+            for unit_name, snapshot in observed.items():
+                if snapshot.is_quiescent:
+                    continue
+                profile_id = unit_to_profile.get(unit_name)
+                if (
+                    profile_id is not None
+                    and snapshot.active_state == "active"
+                    and snapshot.sub_state == "running"
+                    and snapshot.main_pid > 0
+                    and snapshot.control_pid == 0
+                ):
+                    active_profiles.append(profile_id)
+                else:
+                    unknown_active_units.append(unit_name)
+
+            profile_id: str | None = None
+            phase = "stale"
+            recovery: dict[str, Any] = {
+                "action": "state_file_reconstruction",
+                "errors": errors,
+                "unknown_active_units": sorted(unknown_active_units),
+                "observed_active_profiles": sorted(active_profiles),
+            }
+            if not errors and not unknown_active_units and len(active_profiles) == 1:
+                candidate = active_profiles[0]
+                profile = self._profile(candidate)
+                try:
+                    ready = bool(
+                        self.readiness_probe(profile.alias, active_probe_timeout)
+                    )
+                except Exception as error:
+                    ready = False
+                    recovery["readiness_error"] = str(error)
+                if ready:
+                    profile_id = candidate
+                    phase = "active"
+                else:
+                    recovery["readiness_error"] = "exact alias readiness probe failed"
+            elif not errors and not unknown_active_units and not active_profiles:
+                if self.endpoint_probe is not None:
+                    try:
+                        endpoint_active = bool(self.endpoint_probe())
+                    except Exception as error:
+                        endpoint_active = True
+                        recovery["endpoint_probe_error"] = str(error)
+                    if not endpoint_active:
+                        phase = "inactive"
+                    else:
+                        recovery["error"] = "private endpoint active without an owned unit"
+                else:
+                    recovery["error"] = "endpoint absence could not be proven"
+            elif len(active_profiles) > 1:
+                recovery["error"] = "multiple managed backend units are active"
+            elif unknown_active_units:
+                recovery["error"] = "an active unit could not be mapped to a profile"
+
+            state: dict[str, Any] = {
+                "generation": 0,
+                "profile": profile_id,
+                "phase": phase,
+                "recovery": recovery,
+            }
+            if phase == "active" and profile_id is not None:
+                active_profile = self._profile(profile_id)
+                runtime_build = getattr(active_profile, "runtime_build", None)
+                server_sha256 = getattr(active_profile, "server_sha256", None)
+                if isinstance(runtime_build, str) and runtime_build:
+                    state["runtime_build"] = runtime_build
+                if isinstance(server_sha256, str) and server_sha256:
+                    state["server_sha256"] = server_sha256
+            try:
+                self._write_state(state)
+            except (ConfigurationError, StateFileError):
+                state.setdefault("recovery", {})
+                if isinstance(state["recovery"], dict):
+                    state["recovery"]["warning"] = (
+                        "durable state was corrupt; queued requests were discarded and must be resubmitted"
+                    )
+                self.state_store.backup_and_replace(
+                    state,
+                    {
+                        "schema_version": 1,
+                        "queue": [],
+                        "restart_queue": [],
+                        "stop_queue": [],
+                        "running_execution_id": None,
+                        "restart_coalesced_id": None,
+                        "reconciliation_required": True,
+                        "executions": {},
+                        "requests": {},
+                        "history": [],
+                    },
+                )
+            if phase in {"active", "inactive"}:
+                self._update_alias(profile_id)
+            return state
+
     def _handle_failed_switch(
         self,
         *,
@@ -1231,6 +1632,11 @@ class BackendController:
         cleanup_target: bool,
     ) -> None:
         cleanup_error: BaseException | None = None
+        if self._released_units:
+            try:
+                self._finish_handoff(self._released_units, target_profile=profile_id)
+            except Exception as error:
+                cleanup_error = error
         if cleanup_target:
             try:
                 self._stop(profile_id)
@@ -1253,22 +1659,46 @@ class BackendController:
                     error=str(error),
                 )
 
-        failed_state = {
-            "generation": generation,
-            "profile": None,
-            "phase": "failed",
-            "prior_profile": prior_id,
-            "target_profile": profile_id,
-            "error": str(target_error),
-            "restore": "not_attempted",
-        }
+        preempted = isinstance(target_error, ActivationPreemptedError)
+        if preempted and cleanup_error is None:
+            failed_state = {
+                "generation": generation,
+                "profile": None,
+                "phase": "inactive",
+                "preempted_profile": profile_id,
+            }
+        else:
+            failed_state = {
+                "generation": generation,
+                "profile": None,
+                "phase": "failed",
+                "prior_profile": prior_id,
+                "target_profile": profile_id,
+                "error": str(target_error),
+                "restore": "not_attempted",
+            }
         if cleanup_error is not None:
             failed_state["cleanup_error"] = str(cleanup_error)
         self._write_state(failed_state)
         self._update_alias(None)
+        if (
+            cleanup_target
+            and not isinstance(target_error, LifecycleCancelledError)
+            and self.artifact_verifier is not None
+        ):
+            self._emit("artifact_verification", profile=profile_id, decision="started")
+            try:
+                self.artifact_verifier(self._profile(profile_id))
+            except Exception as error:
+                verification = {"status": "failed", "error": str(error)}
+            else:
+                verification = {"status": "passed"}
+            failed_state["artifact_verification"] = verification
+            self._write_state(failed_state)
+            self._emit("artifact_verification", profile=profile_id, **verification)
         self._emit(
             "profile_transition",
-            decision="failed",
+            decision="preempted" if preempted and cleanup_error is None else "failed",
             prior_profile=prior_id,
             target_profile=profile_id,
             generation=generation,
@@ -1295,8 +1725,18 @@ class BackendController:
             self.profiles = dict(profiles)
             try:
                 self._validate_profiles()
+                refresh_readiness_profiles = getattr(
+                    self.readiness_probe, "replace_profiles", None
+                )
+                if callable(refresh_readiness_profiles):
+                    refresh_readiness_profiles(self.profiles)
             except BaseException:
                 self.profiles = old_profiles
+                refresh_readiness_profiles = getattr(
+                    self.readiness_probe, "replace_profiles", None
+                )
+                if callable(refresh_readiness_profiles):
+                    refresh_readiness_profiles(old_profiles)
                 raise
 
     def _emit(self, event: str, **fields: object) -> None:
@@ -1308,18 +1748,45 @@ class BackendController:
             pass
 
     def _require_not_cancelled(self, stage: str) -> None:
-        if self.cancellation_probe is None:
-            return
-        try:
-            cancelled = bool(self.cancellation_probe())
-        except Exception as error:
-            raise LifecycleCancelledError(
-                f"lifecycle cancellation probe failed at {stage}: {error}"
-            ) from error
-        if cancelled:
-            raise LifecycleCancelledError(
-                f"backend activation cancelled at {stage}"
+        if self.cancellation_probe is not None:
+            try:
+                cancelled = bool(self.cancellation_probe())
+            except Exception as error:
+                raise LifecycleCancelledError(
+                    f"lifecycle cancellation probe failed at {stage}: {error}"
+                ) from error
+            if cancelled:
+                raise LifecycleCancelledError(
+                    f"backend activation cancelled at {stage}"
+                )
+        if self._preempt_event.is_set():
+            raise ActivationPreemptedError(
+                f"backend activation preempted at {stage}"
             )
+
+    @staticmethod
+    def _vram_violations(
+        snapshot: ResourceSnapshot,
+        *,
+        min_total_vram_mib: int,
+        min_free_vram_mib: int,
+    ) -> list[str]:
+        violations: list[str] = []
+        if min_total_vram_mib > 0:
+            if snapshot.vram_total_mib is None:
+                violations.append("vram_total_mib unavailable")
+            elif snapshot.vram_total_mib < min_total_vram_mib:
+                violations.append(
+                    f"vram_total_mib {snapshot.vram_total_mib} < {min_total_vram_mib}"
+                )
+        if min_free_vram_mib > 0:
+            if snapshot.vram_free_mib is None:
+                violations.append("vram_free_mib unavailable")
+            elif snapshot.vram_free_mib < min_free_vram_mib:
+                violations.append(
+                    f"vram_free_mib {snapshot.vram_free_mib} < {min_free_vram_mib}"
+                )
+        return violations
 
     def _admit_pre_start(self, profile: Profile) -> ResourceSnapshot | None:
         self._require_not_cancelled(f"pre_start_admission:{profile.id}")
@@ -1344,16 +1811,13 @@ class BackendController:
                 "swap_used_mib "
                 f"{snapshot.swap_used_mib} > {admission.max_swap_used_mib}"
             )
-        if snapshot.vram_total_mib < admission.min_total_vram_mib:
-            violations.append(
-                "vram_total_mib "
-                f"{snapshot.vram_total_mib} < {admission.min_total_vram_mib}"
+        violations.extend(
+            self._vram_violations(
+                snapshot,
+                min_total_vram_mib=admission.min_total_vram_mib,
+                min_free_vram_mib=admission.min_free_vram_before_start_mib,
             )
-        if snapshot.vram_free_mib < admission.min_free_vram_before_start_mib:
-            violations.append(
-                "vram_free_mib "
-                f"{snapshot.vram_free_mib} < {admission.min_free_vram_before_start_mib}"
-            )
+        )
 
         self._emit(
             "resource_admission",
@@ -1401,16 +1865,13 @@ class BackendController:
                 "swap_growth_mib "
                 f"{swap_growth_mib} > {admission.max_swap_growth_mib}"
             )
-        if snapshot.vram_total_mib < admission.min_total_vram_mib:
-            violations.append(
-                "vram_total_mib "
-                f"{snapshot.vram_total_mib} < {admission.min_total_vram_mib}"
+        violations.extend(
+            self._vram_violations(
+                snapshot,
+                min_total_vram_mib=admission.min_total_vram_mib,
+                min_free_vram_mib=admission.post_ready_min_free_vram_mib,
             )
-        if snapshot.vram_free_mib < admission.post_ready_min_free_vram_mib:
-            violations.append(
-                "vram_free_mib "
-                f"{snapshot.vram_free_mib} < {admission.post_ready_min_free_vram_mib}"
-            )
+        )
 
         self._emit(
             "resource_admission",
@@ -1438,11 +1899,16 @@ class BackendController:
             invalid = [
                 name
                 for name, value in values.items()
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0
+                if value is not None
+                and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
             ]
-            if snapshot.vram_total_mib <= 0:
+            if snapshot.vram_total_mib is not None and snapshot.vram_total_mib <= 0:
                 invalid.append("vram_total_mib")
-            if snapshot.vram_free_mib > snapshot.vram_total_mib:
+            if (
+                snapshot.vram_free_mib is not None
+                and snapshot.vram_total_mib is not None
+                and snapshot.vram_free_mib > snapshot.vram_total_mib
+            ):
                 invalid.append("vram_free_mib")
             if invalid:
                 raise ValueError(
@@ -1462,18 +1928,142 @@ class BackendController:
             ) from error
         return snapshot
 
-    def _start(self, profile_id: str) -> None:
-        profile = self._profile(profile_id)
+    def _start(self, profile_id: str, *, lingering: Iterable[str] = ()) -> None:
+        self._profile(profile_id)
         self._require_not_cancelled(f"start:{profile_id}")
-        self._require_all_quiescent(stage=f"pre_start:{profile_id}")
+        stopping = set(lingering)
+        # Names alone are not identities: systemd may expose the outgoing unit
+        # through the compatibility alias (or another loaded alias).
+        canonical_stopping: set[str] = set()
+        if self.service_state_probe is not None:
+            for unit_name in sorted(stopping & self._released_units):
+                snapshot = self.service_state_probe(unit_name)
+                if (
+                    isinstance(snapshot, ServiceStateSnapshot)
+                    and isinstance(snapshot.unit_id, str)
+                    and snapshot.unit_id.endswith(".service")
+                    and _UNIT_COMPONENT.fullmatch(snapshot.unit_id)
+                ):
+                    canonical_stopping.add(snapshot.unit_id)
+        for unit_name in sorted(self._all_backend_unit_names() - stopping):
+            if canonical_stopping and self.service_state_probe is not None:
+                # Failed or missing identity never grants an exemption; the
+                # ordinary quiescence check below still decides safety.
+                try:
+                    snapshot = self.service_state_probe(unit_name)
+                except Exception:
+                    snapshot = None
+                if (
+                    isinstance(snapshot, ServiceStateSnapshot)
+                    and snapshot.unit_id in canonical_stopping
+                    and unit_name != self.unit_name(profile_id)
+                ):
+                    self._emit(
+                        "service_quiescence", unit=unit_name,
+                        canonical_unit=snapshot.unit_id, stage=f"pre_start:{profile_id}",
+                        decision="outgoing_alias",
+                    )
+                    continue
+            self._require_unit_quiescent(unit_name, stage=f"pre_start:{profile_id}")
         self._require_endpoint_absent(stage=f"pre_start:{profile_id}")
         self._require_not_cancelled(f"pre_command_start:{profile_id}")
-        if self.artifact_verifier is not None:
-            self.artifact_verifier(profile)
         self._run("systemctl", "--user", "start", self.unit_name(profile_id))
 
     def _stop(self, profile_id: str) -> None:
         self._stop_unit(self.unit_name(profile_id))
+
+    def _handoff_enabled(self) -> bool:
+        return self.vram_probe is not None and self.service_state_probe is not None
+
+    def _sample_vram_free(self) -> int | None:
+        if self.vram_probe is None:
+            return None
+        try:
+            value = self.vram_probe()
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"invalid free VRAM reading: {value!r}")
+            return value
+        except Exception as error:
+            self._emit("backend_handoff", decision="vram_probe_error", error_type=type(error).__name__, error=str(error))
+            return None
+
+    def _unit_is_quiescent(self, unit_name: str) -> bool:
+        if self.service_state_probe is None:
+            return True
+        try:
+            return self.service_state_probe(unit_name).is_quiescent
+        except Exception:
+            return False
+
+    def _release_unit(self, unit_name: str) -> None:
+        if not self._handoff_enabled():
+            self._stop_unit(unit_name)
+            return
+        if not self._released_units:
+            self._handoff_baseline_mib = self._sample_vram_free()
+        if self._handoff_baseline_mib is None:
+            self._stop_unit(unit_name)
+            return
+        try:
+            self._run("systemctl", "--user", "--no-block", "stop", unit_name)
+        except Exception as error:
+            self._emit("backend_handoff", unit=unit_name, decision="no_block_stop_failed", error_type=type(error).__name__, error=str(error))
+            self._stop_unit(unit_name)
+            return
+        self._released_units.add(unit_name)
+        self._emit("backend_handoff", unit=unit_name, decision="stop_requested", baseline_vram_free_mib=self._handoff_baseline_mib)
+
+    def _await_handoff(self, *, stage: str) -> set[str]:
+        if not self._released_units:
+            return set()
+        baseline = self._handoff_baseline_mib
+        samples: list[tuple[float, int]] = []
+        deadline = time.monotonic() + self.handoff_timeout
+        while True:
+            self._require_not_cancelled(stage)
+            self._released_units = {unit for unit in self._released_units if not self._unit_is_quiescent(unit)}
+            if not self._released_units:
+                self._handoff_baseline_mib = None
+                self._emit("backend_handoff", stage=stage, decision="prior_exited")
+                return set()
+            reading = self._sample_vram_free()
+            now = time.monotonic()
+            if reading is None:
+                samples.clear()
+            if reading is not None and baseline is not None:
+                samples.append((now, reading))
+                samples = samples[-self.handoff_window_samples:]
+                if len(samples) >= self.handoff_window_samples:
+                    sustained = all(samples[i][1] >= samples[i - 1][1] for i in range(1, len(samples)))
+                    material = samples[-1][1] - baseline >= self.handoff_min_vram_rise_mib
+                    if sustained and material and self._endpoint_is_absent():
+                        self._emit("backend_handoff", stage=stage, decision="early_start", units=sorted(self._released_units), baseline_vram_free_mib=baseline, vram_free_mib=samples[-1][1], window_samples=len(samples), observed_duration_sec=samples[-1][0] - samples[0][0])
+                        return set(self._released_units)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(self.handoff_poll_interval)
+        self._emit("backend_handoff", stage=stage, decision="wait_for_exit", units=sorted(self._released_units))
+        for unit_name in sorted(self._released_units):
+            self._stop_unit(unit_name)
+        self._released_units.clear()
+        self._handoff_baseline_mib = None
+        return set()
+
+    def _endpoint_is_absent(self) -> bool:
+        if self.endpoint_probe is None:
+            return False
+        try:
+            return not bool(self.endpoint_probe())
+        except Exception:
+            return False
+
+    def _finish_handoff(self, lingering: Iterable[str], *, target_profile: str) -> None:
+        for unit_name in sorted(lingering):
+            self._stop_unit(unit_name)
+            self._released_units.discard(unit_name)
+            self._emit("backend_handoff", unit=unit_name, target_profile=target_profile, decision="prior_exited_after_start")
+        if not self._released_units:
+            self._handoff_baseline_mib = None
 
     def _stop_unit(self, unit_name: str) -> None:
         try:
@@ -1702,13 +2292,17 @@ class BackendController:
 
     def _probe(self, profile: Profile) -> None:
         self._require_not_cancelled(f"readiness:{profile.id}")
-        if not self.readiness_probe(profile.alias, float(profile.startup_timeout)):
+        ready = self.readiness_probe(profile.alias, float(profile.startup_timeout))
+        self._require_not_cancelled(f"readiness:{profile.id}")
+        if not ready:
             raise ReadinessError(
                 f"profile {profile.id!r} did not serve exact alias {profile.alias!r} "
                 f"within {profile.startup_timeout:g}s"
             )
 
     def _probe_owned(self, profile_id: str, profile: Profile) -> None:
+        # A crashed process cannot become ready without being started again.
+        self._require_running(profile_id, stage="pre_readiness")
         self._probe(profile)
         self._require_running(profile_id, stage="post_readiness")
 
@@ -1729,15 +2323,9 @@ class BackendController:
 
     def _read_state(self) -> dict[str, Any]:
         try:
-            raw = self.state_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return {"generation": 0, "profile": None, "phase": "inactive"}
-        try:
-            state = json.loads(raw)
-        except (json.JSONDecodeError, TypeError) as error:
-            raise ConfigurationError(f"invalid controller state: {error}") from error
-        if not isinstance(state, dict):
-            raise ConfigurationError("controller state must be a JSON object")
+            state = self.state_store.read()
+        except StateFileError as error:
+            raise ConfigurationError(str(error)) from error
         generation = state.get("generation")
         profile_id = state.get("profile")
         phase = state.get("phase")
@@ -1750,8 +2338,7 @@ class BackendController:
         return state
 
     def _write_state(self, state: Mapping[str, Any]) -> None:
-        payload = json.dumps(dict(state), indent=2, sort_keys=True) + "\n"
-        _atomic_write(self.state_path, payload)
+        self.state_store.replace_backend_state(state)
 
 
 def subprocess_command_runner(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:

@@ -5,6 +5,32 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 
+def _replace_extra_arg(extra_args: Sequence[str], flag: str, value: str | None) -> list[str]:
+    """Replace or remove one flag/value pair without depending on the TUI."""
+    if not isinstance(extra_args, (list, tuple)) or not all(
+        isinstance(item, str) and item for item in extra_args
+    ):
+        raise ValueError("extra_args must be a JSON string list")
+    updated: list[str] = []
+    replaced = False
+    index = 0
+    while index < len(extra_args):
+        token = extra_args[index]
+        if token != flag:
+            updated.append(token)
+            index += 1
+            continue
+        if value is not None and not replaced:
+            updated.extend((flag, value))
+            replaced = True
+        index += 1
+        if index < len(extra_args) and not extra_args[index].startswith("--"):
+            index += 1
+    if value is not None and not replaced:
+        updated.extend((flag, value))
+    return updated
+
+
 def _without_endpoint_args(args: Sequence[str]) -> tuple[str, ...]:
     result: list[str] = []
     index = 0
@@ -23,8 +49,11 @@ class LlamaCppRuntime:
 
     name = "llamacpp"
     binaries = ("llama-server",)
-    capabilities = ("text", "vision", "tools", "fit", "speculative")
+    capabilities = ("text", "vision", "tools", "reasoning", "fit", "speculative")
     editable_fields = frozenset()
+
+    def sync_capability_edit(self, draft, extra_args, capabilities):
+        return _replace_extra_arg(extra_args, "--reasoning", "on" if "reasoning" in capabilities else None)
 
     def build_args(
         self,
@@ -83,9 +112,21 @@ class LlamaCppRuntime:
         if effective_draft is not None:
             args.extend(["-md", str(effective_draft)])
 
-        effective_extra_args = getattr(profile, "effective_extra_args", profile.extra_args)
+        effective_extra_args = list(
+            getattr(profile, "effective_extra_args", profile.extra_args)
+        )
+        if profile.chat_template:
+            # llama.cpp needs Jinja enabled before the external template is
+            # selected. Treat --jinja as broker-managed in this case so a
+            # profile that already declares it does not add the flag twice.
+            args.append("--jinja")
+            args.extend(["--chat-template-file", str(profile.chat_template)])
+            effective_extra_args = [
+                arg for arg in effective_extra_args if arg != "--jinja"
+            ]
         args.extend(effective_extra_args)
-        if "tools" in profile.capabilities:
+        # Function-call support does not imply built-in server tools are compiled in.
+        if "tools" in profile.capabilities and getattr(profile, "builtin_tools_available", True):
             args.extend(["--tools", "all"])
 
         args.extend(["--host", host, "--port", str(port)])

@@ -1,61 +1,68 @@
-<!-- retrospective-release:start -->
-## Retrospective version: 0.7.1
+# Llama-Broker
 
-**Current workflow documentation** — source checkpoint 7e72f29b40b5 (2026-09-26).
+Llama-Broker gives local AI tools one OpenAI-compatible address for models on a
+Linux machine. This checkout is **0.8.0.dev0**. It manages saved model
+profiles, validates them before use, and switches one generation backend at a
+time after active requests drain.
+
+<!-- retrospective-release:start -->
+## Retrospective version: 0.6.16
+
+**Profile editor row and dirty-state fixes** — source checkpoint c34c5e8fba6f (2026-08-27).
 
 Assigned retrospectively during release preparation; this is not evidence of a historical publication. [Cumulative release notes](CHANGELOG.md) describe this checkpoint and all earlier assigned versions.
 
 The README below is historical text with portable examples. During a second preparation pass, private deployment snapshots were removed, machine-specific examples and migration defaults were sanitized, package versions were aligned, and release workflows were made explicitly manual. These are preparation changes, not evidence of historical package publication.
 <!-- retrospective-release:end -->
 
-# Llama-Broker
+The current development snapshot is not a stable or published release. See
+[docs/RELEASING.md](docs/RELEASING.md) for release qualification.
 
-Llama-Broker gives local AI tools one OpenAI-compatible address for models on a
-Linux machine. It manages starting the model server and switching between saved
-model profiles. A profile records which model to run and its server settings.
+## Install from a development checkout
 
-Only one model server can be active at a time. Its configured slots determine
-how many requests it can handle together, regardless of how many client apps
-connect. A request can name a profile ID or alias; when that profile differs
-from the active one, the broker waits for current responses to finish, including
-streams, before switching. If a request omits the model, the active profile is
-used.
-
-## Install
-
-You need Linux with systemd user services, Python 3.11+, `uv`, and an installed
-`llama-server` with a model file.
+You need Linux with systemd user services, Python 3.11+, `uv`, an installed
+runtime, and model files. This checkout workflow uses the package's actual
+console entry point:
 
 ```bash
-uv tool install llama-broker
+uv venv
+source .venv/bin/activate
+uv pip install --editable .
+brokerctl setup --check
 ```
 
-The broker finds existing runtimes and model files. It does not download or
-install them.
-
-## Start the broker
+The broker does not download or install runtimes or models. `setup --check` is
+read-only. To create profiles and install the broker's user services, run:
 
 ```bash
 brokerctl setup
 brokerctl integrate install
 brokerctl profile list
+```
+
+Profiles are saved in `~/.config/llama-broker/profiles.json` by default;
+`LLAMA_BROKER_PROFILES` overrides that path. Use
+`brokerctl integrate --dry-run` to review integration changes before applying
+them.
+
+## Start and switch the broker
+
+```bash
 brokerctl load <profile-id>
+brokerctl operation wait <request-id>
 brokerctl status
 ```
 
-Setup finds runtimes and model files already on the machine, then asks which
-ones to add as profiles. It does not download models or runtimes.
-`brokerctl integrate install` installs the broker's systemd user services.
-`load` starts the chosen profile, and `status` confirms what is active. Use
-`brokerctl setup --check` to scan without making changes. Run
-`brokerctl integrate --dry-run` to preview integration changes. Profiles are
-saved in `~/.config/llama-broker/profiles.json` by default; set
-`LLAMA_BROKER_PROFILES` to use another file.
+`load` is asynchronous: its acknowledgement means the operation was accepted,
+not that generation is ready. Wait for the terminal result before sending
+inference or cleaning up. A profile switch drains active responses, including
+streams. Do not start or stop profile units directly with `systemctl`.
 
 ## Model and runtime files
 
-These are the default locations for broker-managed files. Setup can also find
-models and runtimes already installed elsewhere on the machine.
+Setup can discover files outside these defaults. `brokerctl model list` is a
+read-only artifact listing; it does not create profile IDs or select a model.
+Use `brokerctl profile list` for canonical client model names and load targets.
 
 | Files | Default location | Override |
 | --- | --- | --- |
@@ -63,85 +70,114 @@ models and runtimes already installed elsewhere on the machine.
 | Runtime bundles | `~/.local/share/runtimes/<id>/` | `LLAMA_BROKER_RUNTIMES_DIR` |
 | Runtime catalog | `~/.local/share/runtimes/catalog.json` | `LLAMA_BROKER_RUNTIME_CATALOG` |
 
-The defaults follow `XDG_DATA_HOME` when it is set. The runtime catalog is in
-the runtime directory unless `LLAMA_BROKER_RUNTIME_CATALOG` points elsewhere.
-
-To configure Hermes to use a profile:
-
-```bash
-brokerctl integrate configure hermes --model <profile-id>
-```
-
-For other supported clients, see `brokerctl integrate configure --help`.
+`model list --json` reports schema-2 artifact bundles, including incomplete or
+missing files. Artifact status does not assert model integrity, tokenizer
+validity, runtime compatibility, or serving readiness.
 
 ## Connect a client
 
-The local API address is `http://127.0.0.1:11434/v1`. Requests need an API key
-as a bearer token. The default key file is
-`~/.config/llama-broker/api-keys`; `brokerctl integrate configure` can save the
-address and key in supported clients. In an OpenAI-compatible client, set its
-base URL to that address, use the broker API key, and select a profile ID or
-alias as the model. Multiple clients can share the same address and key.
+The local API is `http://127.0.0.1:11434/v1`. Requests use an API key as a
+bearer token. The default key file is
+`~/.config/llama-broker/api-keys`. In an OpenAI-compatible client, set the base
+URL, use the broker key, and select a profile ID or alias as the model.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /v1/models` | List healthy model profiles clients can use. |
-| `GET /v1/models/{model}` | Show details for one profile. |
-| `POST /v1/chat/completions` | Send a chat request; supports streaming. |
-| `POST /v1/completions` | Send a text completion request. |
-| `POST /v1/audio/transcriptions` | Transcribe an audio file. |
+| `GET /v1/models` | List healthy callable generation profiles. Resident decision profiles are intentionally hidden. |
+| `GET /v1/models/{model}` | Show verified profile metadata. |
+| `POST /v1/chat/completions` | Chat generation; `stream: true` supports SSE. |
+| `POST /v1/completions` | Text completion; supports SSE. |
+| `POST /v1/audio/transcriptions` | Bounded authenticated multipart transcription upload. |
+| `POST /v1/decisions` | OpenAI-compatible Decisions API backed by the separate d1 system 1 backend. |
+| `POST /v1/systemone` | Ask d1 directly without switching the generation backend. |
 
-For basic monitoring, `GET /health` and `GET /healthz` are available without an
-API key.
+`GET /health` and `GET /healthz` are minimal unauthenticated probes. Every
+response has an `X-Request-ID`; errors use an OpenAI-compatible `error` object.
+Streaming failures are terminal SSE errors, not a synthetic `[DONE]`.
+
+### System 1 and automatic routing
+
+System 1 is a separate optional d1 backend, normally configured as a resident
+profile. It stays beside the active generation profile and is not loaded,
+unloaded, or advertised by `GET /v1/models`. It remains visible to
+`brokerctl profile list` and can be named for `/v1/decisions` or
+`/v1/systemone`. See [docs/system1.md](docs/system1.md).
+
+Automatic routing is not enabled merely by configuring d1. Set
+`system1.json`'s `routing.enabled` to `true` to allow the `auto` alias to ask
+d1 to choose among generation profiles. Without that explicit opt-in, use a
+profile ID or alias, or omit the model to use the active generation profile.
 
 ## Manage models and services
 
 | Command | Purpose |
 | --- | --- |
-| `brokerctl status` | Show the active profile and broker health. |
-| `brokerctl profile list` | Show saved profiles and their IDs. |
-| `brokerctl model list` | List model names that clients can request. |
-| `brokerctl runtime list` | List registered runtimes. |
-| `brokerctl load <profile-id>` | Start or switch to a profile. |
-| `brokerctl restart` / `brokerctl unload` | Restart or stop the active model server. |
+| `brokerctl status` | Show broker and active-backend state. |
+| `brokerctl profile list` | Show saved profiles, including resident profiles. |
+| `brokerctl model list` | List on-disk artifacts, not loadable profile IDs. |
+| `brokerctl runtime list` | List registered runtimes and selected profiles. |
+| `brokerctl load <profile-id>` | Queue a start or profile switch. |
+| `brokerctl operation wait <request-id>` | Wait for an asynchronous lifecycle result. |
+| `brokerctl restart` / `brokerctl unload` | Restart or stop the active generation backend. |
 | `brokerctl profile edit [profile-id]` | Edit a saved profile. |
-| `brokerctl profile render <profile-id>` | Preview a service definition. |
-| `brokerctl verify` | Check model and runtime files against their saved hashes. |
+| `brokerctl verify` | Check pinned runtime, model, and projector hashes. |
+| `brokerctl security rotate` / `revoke` | Rotate or revoke API keys. |
 
-Use `brokerctl` to change profiles so active requests finish before a switch.
-Do not start or stop profile services directly with `systemctl`.
-Inspect the broker service with `systemctl --user status llama-broker`; view its
-logs with `journalctl --user -u llama-broker`.
+For a missing or failing profile, run `brokerctl setup --check`, then
+`brokerctl verify` and inspect `journalctl --user -u llama-broker`.
 
-If a profile is missing or will not start, run `brokerctl setup --check` to
-rescan installed files and `brokerctl verify` to check the files recorded in
-the profile. Use the service logs to see startup errors.
+### Live profile reload
 
-### API keys
+By default the broker watches `~/.config/llama-broker/profiles.json` and, when
+its content changes, re-validates and hot-swaps the profile catalog — without
+restarting the generation backend, so in-flight requests keep serving on their
+existing profile snapshot. This makes "I added or edited a profile" a live
+change; you no longer need `systemctl --user restart llama-broker` for it.
+The reload reuses the same non-disruptive path as the manual
+`profile add/set/remove` mutations, so it inherits its guards: a reload that
+would remove the active profile is refused, and a failed swap rolls back to
+the previous registry.
 
-The broker stores configuration under `~/.config/llama-broker/` by default.
-`security.json` stores certificate and key file paths; API keys are kept in the
-private `api-keys` file. Rotate keys with:
+The watcher polls every 2 seconds (the manifest is small and the change is
+detected by a content fingerprint, not a timestamp, so atomic rewrites are
+handled). A malformed or mid-write file is logged and skipped, then retried on
+the next tick — it never aborts the daemon.
+
+To turn the watcher off (manual reload only), set
+`LLAMA_BROKER_MANIFEST_RELOAD_INTERVAL=0`. A full `systemctl --user restart
+llama-broker` is still the right tool when you *want* to drop in-flight state
+or change the runtime itself.
+
+## Security and runtimes
+
+The default API binding is loopback. LAN access requires TLS and an API key;
+plaintext non-loopback binding is rejected. Provision local material with:
 
 ```bash
-brokerctl security rotate
+brokerctl security init --ip <lan-ip> --hostname <lan-name>
 ```
 
-Normal rotation keeps existing keys valid so clients can be updated. Use
-`--replace` to remove the old keys immediately, or revoke one key with
-`brokerctl security revoke <key>`.
+Never put real API keys, private paths, or deployment-specific hashes in
+README examples. The broker keeps request bodies out of normal operational logs,
+uses bounded request/queue/backend deadlines, and validates profile hashes and
+resource limits fail-closed. The detailed reliability and context contracts
+are documented in [CONTEXT.md](CONTEXT.md) and [SETUP_GUIDE.md](SETUP_GUIDE.md).
 
-## Security and supported runtimes
-
-The API listens on this machine only by default. LAN access requires TLS and an
-API key; plain HTTP on a LAN address is rejected. Create certificates and key
-files with `brokerctl security init --ip <lan-ip> --hostname <lan-name>`, then
-set `LLAMA_BROKER_HOST` to the LAN address.
-
-llama.cpp is the supported runtime. vLLM is experimental.
+llama.cpp is the qualified first-release runtime. vLLM and Strata are
+experimental and require explicit selection. Basalt is also experimental; its
+[acceptance contract](docs/basalt-acceptance.md) describes operator checks and
+does not claim deployment, hardware, or runtime qualification.
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test instructions.
-See [SETUP_GUIDE.md](SETUP_GUIDE.md) for manual setup and service details.
-The project is licensed under [MIT](LICENSE).
+```bash
+uv run --extra dev pytest -q --ignore=tests/test_local_production_manifest.py
+uv run python tools/check_public_tree.py
+uv run python tools/check_release.py --development
+```
+
+The suite is offline and must not depend on a machine's private
+`profiles.json`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development
+rules, [SETUP_GUIDE.md](SETUP_GUIDE.md) for manual service details, and
+[docs/RELEASING.md](docs/RELEASING.md) for release gates. The project is
+licensed under [MIT](LICENSE).

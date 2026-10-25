@@ -59,3 +59,14 @@ runtime-provenance-index.json
 *.pem
 *.p12
 *.pfx
+
+# Private Basalt operator artifacts; source and portable fixtures remain visible.
+/docs/basalt-packaged-tls-parent.json
+/docs/basalt-cache-budget-tuning.json
+/docs/basalt-candidate-catalog.json
+/docs/basalt-candidate-profile.json
+/docs/basalt-candidate-stagingprofiles-manifest.json
+/docs/basalt-packaged-tls-qualification.json
+/docs/basalt-r5-deployment-report.md
+/docs/basalt-r6-final-qualification.md
+/docs/basalt-production-stage/

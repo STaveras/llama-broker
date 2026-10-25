@@ -15,45 +15,100 @@ lifecycle first. Multi-instance residency is a later phase, not a requirement
 for the first deepening.
 
 The preferred architecture is a pure orchestration core with injected adapters.
-Adapters provide filesystem locking, manifest persistence, process control,
-status inspection, readiness, and live reload behavior. No adapter may re-enter
-the lock owner while that lock is held.
+The core exclusively owns the cross-process lifecycle lock for each transition.
+Adapters provide manifest persistence, process control, status inspection,
+readiness, and live reload behavior under that ownership; none may reacquire or
+re-enter the lock owner while it is held.
 
 New callers are explicitly asynchronous. `brokerctl`, the TUI, HTTP callers,
 and a future browser view receive an operation identity and observe durable
-progress rather than relying on a long blocking request. The existing HTTP
-`wait=true` mode remains as an explicit blocking compatibility path; new
-callers use `wait=false` and operation status. The command-line experience may
-add an explicit wait operation later, but transition execution remains
-asynchronous by default.
+progress rather than relying on a long blocking request. HTTP operation submission
+and status use broker-native admin routes, not OpenAI inference routes. HTTP
+callers may cancel their own queued request through an authenticated admin route,
+subject to the shared pre-commit cancellation rules. Existing HTTP
+`/admin/switch` keeps its current `wait=true` default; `/admin/restart` and
+`/admin/stop` gain the same blocking default for backward compatibility. Setting
+`wait=false` opts into async and returns a durable operation ID.
+New callers use `wait=false` and operation status. The CLI exposes explicit
+`brokerctl operation list|status|wait|cancel` commands and an interactive
+`brokerctl operation tui`; the curses TUI also refreshes its profile choices
+when the catalog changes.
 
-Operation state persists across broker restarts. Target failure is fail-closed
-with no automatic restoration. Duplicate queued targets coalesce; distinct
-queued targets remain strict FIFO, and an in-flight transition is never
-superseded. Each caller receives a request identity linked to the one shared
-execution for a coalesced target. A caller may stop waiting or cancel its own
-queued request without cancelling shared work another caller still wants.
+Operation state persists across broker restarts. Post-commit target failure is
+fail-closed with no automatic restoration; pre-commit validation failure
+preserves the proven prior backend. Duplicate queued targets coalesce; distinct
+queued targets remain strict FIFO. Explicit operations and transient restores are
+never preempted. The one exception is a request-driven load with no active leases
+or queued transition: when `LLAMA_BROKER_PREEMPT_IDLE_LOADS` is enabled, a request
+for another profile may cancel that idle load and reserve the next transition
+slot. The preempted request waits behind the newer one and retries without
+preempting another load. A bounded window of material, nondecreasing free-VRAM
+readings may allow the next backend to start while the old one tears down, after
+its endpoint is released. The old unit must be reaped before readiness and
+active-state publication; unavailable telemetry falls back to waiting for exit. Each caller receives a
+caller-specific `request_id` and the shared `execution_id` for a coalesced
+target; `request_id` addresses status and cancellation, and status exposes the
+linked execution. A caller may stop waiting or cancel its own queued request
+without cancelling shared work another caller still wants.
 Cancellation is allowed while queued and, at most, before destructive work
 begins. Once draining commits to stopping or starting a backend, the transition
 finishes safely and publishes a terminal result. After a broker restart, safe
 queued work may be replayed; interrupted in-flight work is failed and the
 actual backend state is reconciled before new work is accepted. Ordinary load
-of the active profile is idempotent and completes without a backend restart;
-explicit restart is a forced transition even when the requested profile is
-already active. A transient profile's automatic restoration is conditional: if
-no newer explicit target is queued, restore the prior profile; if a newer target
-is queued, skip the automatic restore and transition directly to that target.
+of the active profile is idempotent only when no earlier queued operation will
+change the active profile; if A is active, B is queued, then A is requested, the
+second A remains queued behind B. Explicit restart is a forced transition even
+when the requested profile is already active. A transient profile's automatic
+restoration is conditional: if no newer explicit lifecycle operation is queued,
+restore the prior profile; if a newer load, restart, or unload/stop is queued,
+skip the automatic restore and run that operation at its normal queue priority.
 Once restoration has begun draining or stopping a backend, it finishes before
 later queued work runs. Only one transient context is supported initially; a
 future restore stack may support nested transient contexts. A queued execution
 uses the immutable profile/catalog snapshot captured when it was requested. It
-must recheck that snapshot's pinned artifacts and safety facts before destructive
-work, but it never silently re-resolves to newer profile data. Durable request
-and execution records extend the existing versioned `state.json`, while
-profiles/catalog remain the configuration authorities. Retain the most recent
-32 completed transition operations. Keep existing `brokerctl load`, `start`, and
-`restart` command names, but have them return request/execution identities;
-waiting is explicit through a separate operation wait/status command. A
+must recheck that snapshot's configuration, artifact availability, and safety facts
+before destructive work, but it never silently re-resolves to newer profile data.
+Artifact content hashing runs after failed backend activation or an explicit
+`brokerctl verify`; ordinary requests, model listing, and switches do not hash
+model weights or runtime artifacts. Verification uses
+deterministic in-memory adapters for orchestration-core tests, with separate
+contract tests for persistence and process-control adapters; tests must never
+operate on the live broker or model. Focused tests cover ordinary
+load/switch/cancellation, strict FIFO, duplicate-target coalescing, the fixed
+three-pending cap, priority restart/stop, transient restoration, immutable
+snapshot rejection, and corrupt-state recovery. Exhaustive crash/fault injection
+remains a separate test-hardening phase.
+Durable request and execution records extend the existing `state.json` with a
+versioned `operations` namespace, while profiles/catalog remain the configuration
+authorities. A shared durable-state adapter atomically preserves the existing
+top-level backend fields and a
+namespaced `operations` section under one serialization lock; independent
+whole-file writers must not overwrite each other. A request is acknowledged
+only after its request/execution records are atomically persisted; persistence
+failure rejects acceptance. On startup,
+unreadable state or an unsupported state schema is preserved as a backup; the
+broker reconciles actual services and rebuilds minimal state automatically
+rather than starting from an assumed inactive state. During this recovery,
+pending operations are failed rather than replayed and must be resubmitted;
+interrupted work is reconciled against actual services. Request identities are
+broker-generated; submissions do not require caller-supplied idempotency keys or
+add nonstandard fields to OpenAI-compatible inference payloads. Equivalent queued
+targets still coalesce. Retain the 32 most recent completed shared executions,
+including every attached request outcome; evict each execution and its requests
+together. Evicted request IDs return a generic not-found/expired result; retain no
+tombstones beyond the history. Allow at most three
+queued executions awaiting start; the currently executing transition is not
+counted, and coalesced requests share one queued execution. When full, reject new
+distinct normal submissions rather than discard accepted work. Explicit restart
+and unload/stop bypass queued loads and run immediately after any
+non-interruptible in-flight transition; they do not consume normal queue slots.
+Unload/stop outranks restart and cancels any restart that has not begun. Restart
+still outranks ordinary queued loads. Keep existing
+`brokerctl load`, `start`, and `restart` command names, but have them return
+request/execution identities; waiting is explicit through a separate operation
+wait/status command. Status exposes `queued → preflight → committed/running →
+terminal`, making the irreversible cancellation point visible. Cancellation is
+allowed only before commit; afterward it only stops the caller from waiting. A
 coalesced execution continues while at least one attached request remains; if
 all attached requests cancel before draining starts, the shared execution is
 removed from the queue. Profile and catalog reloads are ordered operations in
@@ -61,9 +116,8 @@ the same FIFO queue, so configuration changes cannot race a queued snapshot or
 an in-flight backend lifecycle operation. Explicit restart is a priority
 execution: it may move ahead of queued loads, but it never interrupts an
 in-flight drain or process start; its force semantics still bypass active-load
-idempotence only. Duplicate restart requests coalesce while an equivalent
-restart remains queued or in flight; a later request after that execution has
-completed is a new forced execution. Cancellation remains possible through
+idempotence only. Duplicate explicit restart requests coalesce until the entire
+transition queue is empty. Cancellation remains possible through
 preflight—snapshot and revision validation, lock acquisition, and quiescence
 checks—with an irreversible commit marker immediately before stopping the old
 backend. After that marker, cancellation means only that a caller stops waiting.
@@ -76,4 +130,34 @@ existing leases drain under the bounded drain policy before destructive work
 begins.
 
 These decisions were confirmed during the profile transition grilling
-conversation.
+conversation. Source transcript: `@session:default/20260906_184533_16627d`.
+
+## Inference connection admission
+
+HTTP inference has a separate, authenticated FIFO admission queue with bounded
+connections, raw body bytes, and waiting time. It waits through worker saturation
+and temporary profile transitions without holding a model lease. The coordinator
+continues to reject lease acquisition while a lifecycle operation is pending;
+the HTTP admission layer waits for that gate to open. Administrative worker
+reservations remain separate from inference.
+Admission for another profile waits for active generations to finish before
+initiating a switch, under the inference queue deadline rather than the shorter
+lifecycle drain deadline.
+
+FIFO HTTP admission retains the head request's position through profile
+activation. Later HTTP requests wait for that activation to settle; the
+coordinator's optional idle-load preemption remains available to direct lease
+callers. HTTP requests preserve their validated profile facts across waiting and
+fail closed if a reload changes those facts before dispatch. Generation is
+dispatched at most once. Disconnected or expired callers cancel their own
+waiting/transport work; committed lifecycle work finishes safely and releases a
+late lease without dispatching generation for the cancelled caller.
+
+Validated streaming completion requests receive early HTTP 200 SSE headers and
+comment heartbeats through admission, activation, upstream header wait, prefill,
+and idle streaming. A single handler owns downstream writes; a bounded reader
+handoff owns upstream HTTP reads. Later failures are terminal SSE error events,
+so HTTP 200 acknowledges admission and clients must inspect the stream's outcome.
+JSON, audio transcription, and other routes retain their ordinary response
+contracts. Disposable fixtures verify this policy without real models or service
+control; real HTTP/TLS fixture verification requires a socket-enabled test host.

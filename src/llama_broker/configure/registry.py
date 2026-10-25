@@ -94,8 +94,12 @@ class ToolRegistry:
                 api_key = keys[-1]
         self.api_key = api_key
         self._raw_profiles = self._load_profiles()
+        # Resident decision profiles answer /v1/systemone only, so client
+        # model catalogs never list them.
         self.profiles = [
-            ToolProfile.from_broker(p) for p in self._raw_profiles
+            ToolProfile.from_broker(p)
+            for p in self._raw_profiles
+            if p.get("role") != "resident"
         ]
 
     def _resolve_profiles_path(self, explicit: str | None) -> Path:

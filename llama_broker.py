@@ -9,7 +9,9 @@ installation. Installed users import the real ``src/llama_broker`` package.
 from __future__ import annotations
 
 import importlib
+from importlib.metadata import PackageNotFoundError, version as _installed_version
 import sys
+import tomllib
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent / "src"
@@ -27,6 +29,13 @@ if __name__ == "__main__":
 # forward its public symbols to the implementation package so imports such as
 # ``import llama_broker`` continue to work in an uninstalled checkout.
 __path__ = [str(_PACKAGE_DIR)]
+
+try:
+    __version__ = _installed_version("llama-broker")
+except PackageNotFoundError:
+    with (_SRC.parent / "pyproject.toml").open("rb") as _handle:
+        __version__ = str(tomllib.load(_handle)["project"]["version"])
+
 _daemon = importlib.import_module(f"{__name__}.daemon")
 for _name, _value in vars(_daemon).items():
     if not _name.startswith("__"):
