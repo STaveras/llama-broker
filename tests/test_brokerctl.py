@@ -4,6 +4,7 @@ import io
 import json
 import shutil
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -24,7 +25,10 @@ class BrokerctlStatusTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 brokerctl.build_parser().parse_args(["--version"])
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue().strip(), "llama-broker 0.8.0.dev0")
+        project = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+        )
+        self.assertEqual(output.getvalue().strip(), f"llama-broker {project['project']['version']}")
 
     def test_setup_referenced_paths_accepts_absent_profiles_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
