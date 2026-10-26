@@ -3563,6 +3563,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         batch_size=profile.batch_size or 1,
                         ubatch_size=profile.ubatch_size or 1,
                     )
+                    if path in {"/v1/chat/completions", "/v1/completions"}:
+                        rewritten = apply_sampling_defaults(
+                            rewritten, profile.sampling_defaults or {}, runtime=profile.runtime
+                        )
                 except ValueError:
                     rejected_metadata = reasoning_policy_metadata(
                         payload, payload, runtime=profile.runtime

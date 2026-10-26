@@ -19,6 +19,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .sampling import validate_sampling_defaults
 from .runtimes import get_runtime, get_runtime_info
 from .runtimes.registry import RuntimeError as RuntimeRegistryError
 from .runtime_builds import (
@@ -612,6 +613,7 @@ class Profile:
     model_draft: Path | None
     moe_cache_slots_limit: int
     max_output_tokens: int | None = None
+    sampling_defaults: Mapping[str, Mapping[str, float | int]] | None = None
     autotune: Mapping[str, Any] | None = None
     bundle_root: Path | None = None
     source_repository: Path | None = None
@@ -1591,6 +1593,10 @@ def _parse_profile(
     profile_id = str(_required(record, "id")).strip()
     if not PROFILE_ID_RE.fullmatch(profile_id):
         raise ProfileError(f"invalid profile id: {profile_id!r}")
+    try:
+        sampling_defaults = validate_sampling_defaults(record.get("sampling_defaults", {}))
+    except ValueError as error:
+        raise ProfileError(f"invalid sampling defaults for {profile_id!r}: {error}") from error
     alias = str(_required(record, "alias")).strip()
     if not alias:
         raise ProfileError(f"alias is empty for profile {profile_id!r}")
@@ -2178,6 +2184,7 @@ def _parse_profile(
         model_draft=model_draft,
         moe_cache_slots_limit=moe_cache_slots_limit,
         max_output_tokens=max_output_tokens,
+        sampling_defaults=sampling_defaults,
         autotune=autotune,
         bundle_root=build.bundle_root if build is not None else None,
         source_repository=build.source_repository if build is not None else None,

@@ -94,6 +94,7 @@ _BASE_FIELDS = frozenset(
 
 _LLAMACPP_FIELDS = _BASE_FIELDS | frozenset(
     {
+        "sampling_defaults",
         "mmproj_path",
         "mmproj_sha256",
         "context_size",

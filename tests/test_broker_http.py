@@ -678,6 +678,71 @@ class BrokerHttpTests(unittest.TestCase):
         )
         self.broker_thread.start()
 
+    def _set_sampling_defaults(self, profile_id="main", defaults=None):
+        from llama_broker.sampling import qwen27b_sampling_defaults
+        manifest = json.loads(self.profiles_path.read_text())
+        record = next(record for record in manifest["profiles"] if record["id"] == profile_id)
+        record["sampling_defaults"] = qwen27b_sampling_defaults() if defaults is None else defaults
+        self.profiles_path.write_text(json.dumps(manifest))
+        status, response = self._post({"wait": True}, "/admin/autotune/reload")
+        self.assertEqual(status, 200, response)
+
+    def test_sampling_defaults_follow_effective_reasoning_over_http(self):
+        self._set_sampling_defaults()
+        for extra, temperature, penalty in [
+            ({}, 0.7, 1.5),
+            ({"reasoning_effort": "high"}, 1.0, 0.0),
+            ({"reasoning_effort": "high", "thinking_budget_tokens": 0}, 0.7, 1.5),
+            ({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": False}}, 0.7, 1.5),
+        ]:
+            with self.subTest(extra=extra):
+                status, _ = self._post({"model": "main", "messages": [], **extra})
+                self.assertEqual(status, 200)
+                forwarded = self.backend.seen_payloads[-1]
+                self.assertEqual(forwarded.get("temperature"), temperature)
+                self.assertEqual(forwarded.get("presence_penalty"), penalty)
+                self.assertEqual(forwarded.get("repeat_penalty"), 1.0)
+                self.assertEqual(forwarded.get("top_k"), 20)
+                self.assertNotIn("repetition_penalty", forwarded)
+        self.assertEqual(self.controller.transitions, [])
+        self.assertEqual(self.controller.stops, 0)
+
+    def test_sampling_defaults_preserve_explicit_zero_and_partial_overrides_over_http(self):
+        self._set_sampling_defaults()
+        status, _ = self._post({"model": "main", "messages": [], "temperature": 0,
+                               "presence_penalty": 0, "repetition_penalty": 1.2})
+        self.assertEqual(status, 200)
+        forwarded = self.backend.seen_payloads[-1]
+        self.assertEqual(forwarded.get("temperature"), 0)
+        self.assertEqual(forwarded.get("presence_penalty"), 0)
+        self.assertEqual(forwarded.get("top_p"), 0.8)
+        self.assertEqual(forwarded.get("repeat_penalty"), 1.2)
+        status, _ = self._post({"model": "main", "messages": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.backend.seen_payloads[-1].get("temperature"), 0.7)
+
+    def test_sampling_defaults_apply_to_text_completions(self):
+        self._set_sampling_defaults()
+        status, _ = self._post({"model": "main", "prompt": "hello"}, "/v1/completions")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.backend.seen_payloads[-1].get("temperature"), 0.7)
+
+    def test_sampling_defaults_reload_changes_future_requests_without_restart(self):
+        self._set_sampling_defaults()
+        self._set_sampling_defaults(defaults={"instruct": {"temperature": 0.25}})
+        status, _ = self._post({"messages": []})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.backend.seen_payloads[-1].get("temperature"), 0.25)
+        self.assertNotIn("top_k", self.backend.seen_payloads[-1])
+        self.assertEqual(self.controller.transitions, [])
+        self.assertEqual(self.controller.stops, 0)
+
+    def test_sampling_defaults_do_not_leak_when_profile_switches(self):
+        self._set_sampling_defaults()
+        status, _ = self._post({"model": "qwen3.5-9b-vision", "messages": []})
+        self.assertEqual(status, 200)
+        self.assertNotIn("temperature", self.backend.seen_payloads[-1])
+
     def test_llamacpp_reasoning_policy_is_forwarded_to_backend(self) -> None:
         status, _ = self._post(
             {
