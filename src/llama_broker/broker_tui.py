@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .manifest_resolution import resolve_manifest_inheritance
 from .sampling import (
     SAMPLING_FIELDS, SAMPLING_MODES, qwen27b_sampling_defaults, validate_sampling_defaults,
 )
@@ -642,6 +643,8 @@ class TUIModel:
         for field in EDITOR_FIELDS:
             if runtime == "strata" and field.key == "environment":
                 continue
+            if field.key == "sampling_preset" and current.get("extends"):
+                field = replace(field, options=(*field.options, "Inherit parent"))
             if field.key == "runtime_family":
                 field = replace(field, options=self._family_options())
             elif field.key == "runtime_build":
@@ -693,16 +696,26 @@ class TUIModel:
         self._publish(updated)
         return updated
 
+    def _effective_sampling_defaults(self) -> dict[str, Any]:
+        current = self.current or {}
+        effective = resolve_manifest_inheritance(self.manifest)
+        record = next((item for item in effective.get("profiles", [])
+                       if isinstance(item, Mapping) and item.get("id") == current.get("id")), {})
+        return copy.deepcopy(record.get("sampling_defaults", {}))
+
     def field_value(self, key: str) -> Any:
         current = self.current or {}
         if key == "sampling_preset":
-            defaults = current.get("sampling_defaults", {})
+            if (current.get("extends") and current.get("sampling_defaults_inherit", True)
+                    and not current.get("sampling_defaults")):
+                return "Inherit parent"
+            defaults = self._effective_sampling_defaults()
             if not defaults:
                 return "Runtime defaults"
             return "Qwen 27B" if defaults == qwen27b_sampling_defaults() else "Custom"
         if key in _SAMPLING_EDITOR_FIELDS:
             _, mode, name = key.split(".")
-            return current.get("sampling_defaults", {}).get(mode, {}).get(name, "")
+            return self._effective_sampling_defaults().get(mode, {}).get(name, "")
         if key == "aliases":
             alias = str(current.get("alias", ""))
             aliases = [str(item) for item in current.get("aliases", []) if str(item) != alias]
@@ -942,6 +955,7 @@ class TUIModel:
 
         if str(draft.get("runtime", "llamacpp")).strip().lower() != "llamacpp":
             draft.pop("sampling_defaults", None)
+            draft.pop("sampling_defaults_inherit", None)
         self._publish(draft)
         return draft
 
@@ -954,7 +968,14 @@ class TUIModel:
         if key not in _SAMPLING_EDITOR_FIELDS:
             raise ValueError(f"unknown sampling field: {key}")
         draft = clone_record(current)
-        defaults = draft.get("sampling_defaults", {})
+        defaults = self._effective_sampling_defaults()
+        if key == "sampling_preset" and value == "Inherit parent":
+            if not current.get("extends"):
+                raise ValueError("this profile has no parent")
+            draft.pop("sampling_defaults", None)
+            draft.pop("sampling_defaults_inherit", None)
+            self._publish(draft)
+            return draft
         if key == "sampling_preset":
             if value == "Custom":
                 return current
@@ -977,7 +998,12 @@ class TUIModel:
             if not settings:
                 defaults.pop(mode, None)
         validate_sampling_defaults(defaults)
-        if defaults:
+        if current.get("extends"):
+            # Pin the visible sampling snapshot, without flattening unrelated
+            # inherited model/runtime fields. Empty really means runtime defaults.
+            draft["sampling_defaults_inherit"] = False
+            draft["sampling_defaults"] = defaults
+        elif defaults:
             draft["sampling_defaults"] = defaults
         else:
             draft.pop("sampling_defaults", None)

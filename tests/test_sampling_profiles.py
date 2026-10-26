@@ -62,6 +62,34 @@ class SamplingProfileTests(unittest.TestCase):
         self.assertEqual(registry.get("other").sampling_defaults["thinking"]["temperature"], 1.0)
         self.assertEqual(registry.get("main").sampling_defaults["instruct"]["temperature"], 0.7)
 
+    def test_cleared_inherited_defaults_stay_cleared_after_save_and_reload(self):
+        from llama_broker.broker_tui import TUIModel
+        from llama_broker.profile_config import write_manifest_atomically, load_manifest_source
+        self.record["sampling_defaults"] = DEFAULTS
+        # Validation uses real disposable artifacts; no runtime is executed.
+        server = self.root / "llama-server"
+        server.write_bytes(b"offline binary")
+        server.chmod(0o755)
+        (self.root / "model.gguf").write_bytes(b"offline model")
+        child = {"id": "other", "alias": "other", "aliases": ["other"], "extends": "main"}
+        self.registry([self.record, child])
+        model = TUIModel(load_manifest_source(self.path))
+        model.move(1)
+        model.set_field("sampling.instruct.temperature", "")
+        write_manifest_atomically(self.path, model.manifest)
+        parsed = ProfileRegistry.from_path(self.path).get("other")
+        self.assertNotIn("temperature", parsed.sampling_defaults["instruct"])
+        self.assertEqual(parsed.sampling_defaults["thinking"]["temperature"], 1.0)
+        model.set_field("sampling_preset", "Runtime defaults")
+        write_manifest_atomically(self.path, model.manifest)
+        self.assertFalse(ProfileRegistry.from_path(self.path).get("other").sampling_defaults)
+        self.assertEqual(load_manifest_source(self.path)["profiles"][1]["extends"], "main")
+
+    def test_sampling_inheritance_flag_requires_a_boolean(self):
+        self.record["sampling_defaults_inherit"] = "false"
+        with self.assertRaises(ProfileError):
+            self.registry()
+
     def test_one_profile_does_not_inherit_another_profiles_defaults(self):
         self.record["sampling_defaults"] = DEFAULTS
         other = make_profile_record("other", "other", self.root / "other.gguf")

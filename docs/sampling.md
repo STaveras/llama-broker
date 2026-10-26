@@ -31,6 +31,24 @@ saving your draft.
 No preset is applied automatically based on a model's name or filename.
 Profiles without sampling defaults keep their existing behavior.
 
+## Inherited profiles
+
+If a profile extends another, the editor shows its effective sampling values,
+including values inherited from the parent. **Inherit parent** keeps that link
+for sampling settings. Child JSON overrides continue to merge with the parent
+unless you turn sampling inheritance off.
+
+Editing a sampling field or choosing a preset saves a separate sampling setup
+for that child, starting from the values you can see. Other model and runtime
+settings still inherit normally. Clearing a field then really leaves it to the
+runtime; it does not bring back the parent's value. **Runtime defaults** clears
+both modes, while **Inherit parent** discards the child's sampling overrides
+and follows the parent again.
+
+In JSON, `"sampling_defaults_inherit": false` disables inheritance for sampling
+only. An empty `"sampling_defaults": {}` alongside it means runtime defaults.
+The editor manages this flag for you.
+
 ## Qwen 27B preset
 
 | Setting | Instruct | Thinking |

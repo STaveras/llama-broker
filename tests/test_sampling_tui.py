@@ -110,6 +110,51 @@ class SamplingTUITests(unittest.TestCase):
             result = broker_tui._curses_prompt(window, "Temperature", 0, allow_empty=True)
         self.assertEqual(result, "0")
 
+    def inherited_model(self):
+        self.manifest["profiles"][0]["sampling_defaults"] = qwen27b_sampling_defaults()
+        self.manifest["profiles"][1]["extends"] = "main"
+        model = TUIModel(self.manifest)
+        model.move(1)
+        return model
+
+    def resolved_sampling(self, model):
+        from llama_broker.manifest_resolution import resolve_manifest_inheritance
+        resolved = resolve_manifest_inheritance(model.manifest)
+        return resolved["profiles"][1].get("sampling_defaults", {})
+
+    def test_inherited_values_are_shown_in_the_editor(self):
+        model = self.inherited_model()
+        self.assertEqual(model.field_value("sampling.instruct.temperature"), 0.7)
+        self.assertEqual(model.field_value("sampling.thinking.temperature"), 1.0)
+        self.assertEqual(model.field_value("sampling_preset"), "Inherit parent")
+
+    def test_clearing_inherited_value_suppresses_parent_and_preserves_siblings(self):
+        model = self.inherited_model()
+        model.set_field("sampling.instruct.temperature", "")
+        defaults = self.resolved_sampling(model)
+        self.assertNotIn("temperature", defaults["instruct"])
+        self.assertEqual(defaults["instruct"]["top_p"], 0.8)
+        self.assertEqual(defaults["thinking"]["temperature"], 1.0)
+        self.assertEqual(model.current["extends"], "main")
+        self.assertEqual(model.manifest["profiles"][0], self.manifest["profiles"][0])
+
+    def test_clearing_inherited_presets_is_not_the_same_as_inheriting(self):
+        model = self.inherited_model()
+        model.set_field("sampling_preset", "Runtime defaults")
+        self.assertEqual(self.resolved_sampling(model), {})
+        self.assertEqual(model.field_value("sampling_preset"), "Runtime defaults")
+        model.set_field("sampling_preset", "Inherit parent")
+        self.assertEqual(self.resolved_sampling(model), qwen27b_sampling_defaults())
+        self.assertEqual(model.field_value("sampling_preset"), "Inherit parent")
+        self.assertFalse(model.dirty)
+
+    def test_editing_inherited_defaults_pins_only_sampling_not_other_profile_fields(self):
+        model = self.inherited_model()
+        model.set_field("sampling.instruct.temperature", "0.3")
+        model.manifest["profiles"][0]["sampling_defaults"]["thinking"]["temperature"] = 0.9
+        self.assertEqual(self.resolved_sampling(model)["thinking"]["temperature"], 1.0)
+        self.assertEqual(model.current["extends"], "main")
+
     def test_cancelled_preset_selection_does_not_change_draft(self):
         self.model.field_index = next(i for i, f in enumerate(self.model.visible_fields) if f.key == "sampling_preset")
         with patch.object(broker_tui, "_curses_select", return_value=("Qwen 27B", True)):

@@ -743,6 +743,18 @@ class BrokerHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn("temperature", self.backend.seen_payloads[-1])
 
+    def test_sampling_defaults_follow_automatic_routing_target(self):
+        from llama_broker.system1 import RouteDecision
+        self._set_sampling_defaults()
+        self._set_sampling_defaults("vision", {"instruct": {"temperature": 0.25}})
+        with patch.object(self.broker.application, "system1_route",
+                          return_value=RouteDecision("vision", "offline fixture routing")):
+            status, _ = self._post({"model": "auto", "messages": []})
+        self.assertEqual(status, 200)
+        forwarded = self.backend.seen_payloads[-1]
+        self.assertEqual(forwarded.get("temperature"), 0.25)
+        self.assertNotIn("top_p", forwarded)
+
     def test_llamacpp_reasoning_policy_is_forwarded_to_backend(self) -> None:
         status, _ = self._post(
             {
