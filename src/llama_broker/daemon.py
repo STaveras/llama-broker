@@ -82,6 +82,7 @@ from .system1 import (
     load_system1_config,
 )
 from .autotune import MaintenanceLease
+from .sampling import apply_sampling_defaults
 from .profile_config import sha256_file
 from .paths import (
     CONFIG_DIR as XDG_CONFIG_DIR,
