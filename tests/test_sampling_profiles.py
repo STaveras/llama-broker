@@ -47,6 +47,21 @@ class SamplingProfileTests(unittest.TestCase):
         self.assertEqual(old.get("main").command(host="127.0.0.1", port=10000),
                          new.get("main").command(host="127.0.0.1", port=10000))
 
+    def test_unsupported_runtimes_reject_the_profile_setting(self):
+        self.record["runtime"] = "vllm"
+        self.record["sampling_defaults"] = DEFAULTS
+        with self.assertRaisesRegex(ProfileError, "sampling_defaults"):
+            self.registry()
+
+    def test_inherited_profiles_can_override_one_mode_without_changing_parent(self):
+        self.record["sampling_defaults"] = DEFAULTS
+        child = {"id": "other", "alias": "other", "aliases": ["other"], "extends": "main",
+                 "sampling_defaults": {"instruct": {"temperature": 0.4}}}
+        registry = self.registry([self.record, child])
+        self.assertEqual(registry.get("other").sampling_defaults["instruct"]["temperature"], 0.4)
+        self.assertEqual(registry.get("other").sampling_defaults["thinking"]["temperature"], 1.0)
+        self.assertEqual(registry.get("main").sampling_defaults["instruct"]["temperature"], 0.7)
+
     def test_one_profile_does_not_inherit_another_profiles_defaults(self):
         self.record["sampling_defaults"] = DEFAULTS
         other = make_profile_record("other", "other", self.root / "other.gguf")
