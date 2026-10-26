@@ -45,6 +45,7 @@ from .backend_controller import (
     systemd_service_inventory_probe,
     systemd_service_state_probe,
 )
+from .backend_errors import MAX_BACKEND_ERROR_BYTES, backend_error
 from .crash_loop import CrashLoopGuard
 from .connection_reliability import AdmissionError, BackendPipe, InferenceAdmission
 from .gpu_memory import GpuTelemetryError, probe_gpu_memory
@@ -3124,6 +3125,12 @@ class _ClientDisconnectedError(Exception):
 class _BackendResponseError(http.client.HTTPException):
     """An upstream status or stream contract cannot follow early SSE headers."""
 
+    def __init__(self, message: str, *, upstream_status: int | None = None,
+                 error: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.upstream_status = upstream_status
+        self.error = error
+
 
 class _HeaderDeadlineReader:
     def __init__(self, reader: Any, connection: socket.socket, timeout: float):
@@ -3685,6 +3692,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 f"[broker] backend proxy failure for {profile.id} "
                 f"(request {self._request_id()}): {type(error).__name__}"
             )
+            if isinstance(error, _BackendResponseError) and error.error is not None:
+                self._diagnostic("backend_rejection", profile=profile.id,
+                                 upstream_status=error.upstream_status)
+                try:
+                    self._send_json(error.upstream_status or HTTPStatus.BAD_GATEWAY, {
+                        "error": {**error.error, "request_id": self._request_id(), "profile": profile.id},
+                    })
+                except OSError:
+                    pass
+                return
             if not isinstance(error, _BackendResponseError):
                 self.application.coordinator.invalidate_when_idle(profile.id)
             backend_exit = self.application.diagnose_backend_failure(profile.id)
@@ -4085,6 +4102,21 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     # getresponse() can detach connection.sock for Connection:
                     # close. Retain the transport solely to interrupt a read.
                     response = connection.getresponse()
+                    if streaming and 400 <= response.status < 600:
+                        # Headers/heartbeats have already gone downstream. Read a
+                        # bounded error body under the same request deadline, then
+                        # preserve its recovery fields in a terminal SSE error.
+                        error_body = bytearray()
+                        while len(error_body) <= MAX_BACKEND_ERROR_BYTES:
+                            chunk = response.read1(min(8192, MAX_BACKEND_ERROR_BYTES + 1 - len(error_body)))
+                            if not chunk:
+                                break
+                            error_body.extend(chunk)
+                        raise _BackendResponseError(
+                            f"backend rejected request (HTTP {response.status})",
+                            upstream_status=response.status,
+                            error=backend_error(response.status, bytes(error_body)),
+                        )
                     if streaming and not (
                         200 <= response.status < 300
                         and response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
