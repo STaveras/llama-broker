@@ -1,20 +1,33 @@
 # Llama-Broker
 
-Run your local models behind one OpenAI-compatible API. Llama-Broker manages
-model profiles and switches between them without changing your client settings.
-It waits for active responses to finish before loading another model.
+Llama-Broker puts one OpenAI-compatible address in front of your local models.
+Your tools keep the same URL. The broker handles starting a model, switching to
+another, and letting a response finish before anything gets unloaded.
+
+If you already have the model files and a runtime command you're happy with,
+that's the part this project is for. Save the setup as a profile and use it
+from your clients without starting and stopping processes by hand.
 
 [Download v0.8.0](https://github.com/STaveras/llama-broker/releases/tag/v0.8.0)
 · [Setup guide](SETUP_GUIDE.md) · [Changelog](CHANGELOG.md)
 
-## Features
+## Why a broker?
 
-- Chat and text completions with streaming support.
-- Saved profiles for different models and runtime settings.
-- Model switching from the command line or through client requests.
-- Profile updates without restarting the broker.
-- API-key authentication and TLS for access from other devices.
-- Optional [System 1 routing](docs/system1.md) to help choose a model for a request.
+This started with two setups for the same model: one with more room for text
+and coding, another with vision enabled and a smaller context. Switching meant
+unloading one and loading the other. Keeping the heavier setup loaded all the
+time wasn't a good trade.
+
+The useful part was being able to make that switch without changing every tool
+that talked to the model. Profiles are how the broker remembers each setup:
+model files, runtime settings, and a name your client can ask for.
+
+## What it handles
+
+- Chat and text completions, including streaming responses.
+- Loading and switching between saved model profiles.
+- Picking up profile edits without restarting the broker.
+- API keys for client access and HTTPS for connections from other devices.
 
 ## Requirements
 
