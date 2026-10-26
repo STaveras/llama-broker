@@ -7,7 +7,6 @@ import json
 import os
 import pty
 import select
-import signal
 import struct
 import subprocess
 import sys
@@ -25,11 +24,16 @@ from tests.test_manifest_watcher import make_profile_record
 
 class EditorSession:
     def __init__(self, path, env):
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            code = "import sys;from llama_broker.broker_tui import run_tui;sys.exit(run_tui(sys.argv[1], 'main'))"
-            os.execve(sys.executable, [sys.executable, "-c", code, str(path)], env)
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        self.fd, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        code = "import sys;from llama_broker.broker_tui import run_tui;sys.exit(run_tui(sys.argv[1], 'main'))"
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-c", code, str(path)], env=env,
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+            )
+        finally:
+            os.close(slave)
         self.buffer = b""
         self.cursor = 0
         self.status = None
@@ -58,9 +62,9 @@ class EditorSession:
     def finish(self):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            found, status = os.waitpid(self.pid, os.WNOHANG)
-            if found:
-                self.status = os.waitstatus_to_exitcode(status)
+            status = self.process.poll()
+            if status is not None:
+                self.status = status
                 if self.status != 0:
                     raise AssertionError(f"Editor exit {self.status}: {self.buffer[-2000:]!r}")
                 return
@@ -68,12 +72,10 @@ class EditorSession:
         raise AssertionError("Editor failed to exit")
 
     def close(self):
-        if self.status is None:
-            found, _ = os.waitpid(self.pid, os.WNOHANG)
-            if not found:
-                # Only the disposable editor child created above, never a service.
-                os.kill(self.pid, signal.SIGTERM)
-                os.waitpid(self.pid, 0)
+        if self.process.poll() is None:
+            # Only the disposable editor child created above, never a service.
+            self.process.terminate()
+            self.process.wait(timeout=5)
         os.close(self.fd)
 
 
