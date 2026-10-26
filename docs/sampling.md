@@ -123,4 +123,5 @@ if both spellings are present, `repeat_penalty` wins.
 
 This feature currently supports llama.cpp profiles only. Other runtimes do
 not accept the profile setting. Changing a profile to another runtime in the
-editor removes the now-inapplicable sampling defaults from the draft.
+editor removes the now-inapplicable sampling defaults from the draft. Inherited
+llama.cpp sampling defaults do not carry across that runtime change either.

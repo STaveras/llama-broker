@@ -640,7 +640,10 @@ class TUIModel:
         inferred = self._current_runtime_build(current)
         family = inferred.runtime if inferred is not None else "(custom/manual)"
         fields = []
+        sampling_supported = str(self._effective_profile().get("runtime", "llamacpp")).strip().lower() == "llamacpp"
         for field in EDITOR_FIELDS:
+            if field.key in _SAMPLING_EDITOR_FIELDS and not sampling_supported:
+                continue
             if runtime == "strata" and field.key == "environment":
                 continue
             if field.key == "sampling_preset" and current.get("extends"):
@@ -696,12 +699,14 @@ class TUIModel:
         self._publish(updated)
         return updated
 
-    def _effective_sampling_defaults(self) -> dict[str, Any]:
+    def _effective_profile(self) -> dict[str, Any]:
         current = self.current or {}
         effective = resolve_manifest_inheritance(self.manifest)
-        record = next((item for item in effective.get("profiles", [])
-                       if isinstance(item, Mapping) and item.get("id") == current.get("id")), {})
-        return copy.deepcopy(record.get("sampling_defaults", {}))
+        return next((item for item in effective.get("profiles", [])
+                     if isinstance(item, dict) and item.get("id") == current.get("id")), {})
+
+    def _effective_sampling_defaults(self) -> dict[str, Any]:
+        return copy.deepcopy(self._effective_profile().get("sampling_defaults", {}))
 
     def field_value(self, key: str) -> Any:
         current = self.current or {}
@@ -963,7 +968,7 @@ class TUIModel:
         current = self.current
         if current is None:
             raise ValueError("no profile selected")
-        if str(current.get("runtime", "llamacpp")).strip().lower() != "llamacpp":
+        if str(self._effective_profile().get("runtime", "llamacpp")).strip().lower() != "llamacpp":
             raise ValueError("sampling defaults currently require llama.cpp")
         if key not in _SAMPLING_EDITOR_FIELDS:
             raise ValueError(f"unknown sampling field: {key}")

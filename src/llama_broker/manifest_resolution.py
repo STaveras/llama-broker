@@ -65,7 +65,11 @@ def resolve_manifest_inheritance(payload: Mapping[str, Any]) -> dict[str, Any]:
             parent = resolve(parent_name)
             # This is a directive on this child, not an inheritable model setting.
             parent.pop("sampling_defaults_inherit", None)
-            if not inherit_sampling:
+            target_runtime = str(raw.get("runtime", parent.get("runtime", "llamacpp"))).strip().lower()
+            # Defaults are adapter-specific. Do not resurrect inherited llama.cpp
+            # sampling when a child changes runtime; explicit child settings still
+            # reach the normal runtime allowlist and are rejected if unsupported.
+            if not inherit_sampling or target_runtime != "llamacpp":
                 parent.pop("sampling_defaults", None)
             merged = _merge(parent, raw)
         visiting.pop()

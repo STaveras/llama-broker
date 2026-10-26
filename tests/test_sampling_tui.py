@@ -155,6 +155,23 @@ class SamplingTUITests(unittest.TestCase):
         self.assertEqual(self.resolved_sampling(model)["thinking"]["temperature"], 1.0)
         self.assertEqual(model.current["extends"], "main")
 
+    def test_sampling_is_hidden_and_uneditable_when_runtime_is_inherited(self):
+        self.manifest["profiles"][0]["runtime"] = "vllm"
+        self.manifest["profiles"][1]["extends"] = "main"
+        self.manifest["profiles"][1].pop("runtime")
+        model = TUIModel(self.manifest)
+        model.move(1)
+        self.assertFalse(any(f.key.startswith("sampling") for f in model.visible_fields))
+        with self.assertRaises(ValueError):
+            model.set_field("sampling_preset", "Qwen 27B")
+
+    def test_runtime_change_does_not_restore_parent_sampling_defaults(self):
+        model = self.inherited_model()
+        model.set_field("sampling_preset", "Runtime defaults")
+        model.set_field("runtime", "vllm")
+        self.assertEqual(self.resolved_sampling(model), {})
+        self.assertEqual(model.current["extends"], "main")
+
     def test_cancelled_preset_selection_does_not_change_draft(self):
         self.model.field_index = next(i for i, f in enumerate(self.model.visible_fields) if f.key == "sampling_preset")
         with patch.object(broker_tui, "_curses_select", return_value=("Qwen 27B", True)):
