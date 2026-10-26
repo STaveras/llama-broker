@@ -36,7 +36,7 @@ def backend_error(status: int, body: bytes) -> dict[str, Any]:
     """
     fallback = {
         "message": f"backend returned HTTP {status} without a usable JSON error",
-        "type": "broker_proxy_error", "code": "broker_upstream_error",
+        "type": "broker_proxy_error", "code": "broker_proxy_error",
         "status_code": status,
     }
     if len(body) > MAX_BACKEND_ERROR_BYTES:
@@ -56,7 +56,7 @@ def backend_error(status: int, body: bytes) -> dict[str, Any]:
         "type": _text(error.get("type"), 256) or (
             "invalid_request_error" if status < 500 else "server_error"
         ),
-        "code": _text(error.get("code"), 256) or "broker_upstream_error",
+        "code": _text(error.get("code"), 256) or "broker_proxy_error",
         "status_code": status,
     }
     native_code = error.get("code")

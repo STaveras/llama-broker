@@ -47,7 +47,7 @@ can be compressed successfully.
 The broker reads at most 65,537 bytes to detect an error body exceeding its
 65,536-byte limit. Reads remain under the existing backend deadline and heartbeat
 behavior. Malformed, oversized, or non-JSON error bodies receive a safe
-`broker_upstream_error` without reflecting raw HTML or debug payloads. Only the
+`broker_proxy_error` without reflecting raw HTML or debug payloads. Only the
 listed recovery fields are copied; arbitrary backend objects are discarded.
 
 Non-streaming error bodies retain their existing HTTP status/body passthrough.

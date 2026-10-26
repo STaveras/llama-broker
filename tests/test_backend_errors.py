@@ -122,7 +122,7 @@ def test_unstructured_errors_are_safe_and_correlated(harness, monkeypatch, body)
     event = error_event(h.finished(h.request({"stream": True})))
     assert event["status"] == 503
     assert event["error"]["status_code"] == 503
-    assert event["error"]["code"] == "broker_upstream_error"
+    assert event["error"]["code"] == "broker_proxy_error"
     assert "SECRET" not in json.dumps(event)
 
 
@@ -130,7 +130,7 @@ def test_backend_error_body_read_is_bounded(harness, monkeypatch):
     h = harness()
     response = reject(monkeypatch, b'x' * 1000000, status=500)
     event = error_event(h.finished(h.request({"stream": True})))
-    assert event["error"]["code"] == "broker_upstream_error"
+    assert event["error"]["code"] == "broker_proxy_error"
     assert response.bytes_read <= 65537
     assert len(json.dumps(event)) < 1024
 
