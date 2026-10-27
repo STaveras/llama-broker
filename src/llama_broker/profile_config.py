@@ -162,7 +162,7 @@ def _load_manifest_payload(
         raw = manifest_path.read_bytes()
         identity = hashlib.sha256(raw).hexdigest()
         payload = json.loads(raw.decode("utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ProfileError(f"cannot read profile manifest {manifest_path}: {error}") from error
     if not isinstance(payload, dict):
         raise ProfileError("profile manifest must be a JSON object")
