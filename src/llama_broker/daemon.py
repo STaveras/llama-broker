@@ -1882,8 +1882,8 @@ class BrokerApplication:
         self._operation_worker_thread: threading.Thread | None = None
         self._manifest_watcher_stop = threading.Event()
         self._manifest_watcher_thread: threading.Thread | None = None
-        self._last_manifest_identity: str | None = None
-        self._manifest_reload_request_id: str | None = None
+        self._last_manifest_identity = getattr(self.registry, "manifest_identity", None)
+        self._pending_manifest_reload: RequestView | None = None
         state_store = getattr(controller, "state_store", None)
         if state_store is None:
             self.operation_queue: TransitionQueue | PersistentTransitionQueue = TransitionQueue()
@@ -2055,10 +2055,8 @@ class BrokerApplication:
                             error = snapshot_error
                             self._refresh_after_lifecycle(raise_on_error=False)
                     try:
-                        self.operation_queue.finish(
-                            execution.execution_id,
-                            error=str(error),
-                            error_type=type(error).__name__,
+                        self._finish_operation(
+                            execution, error=str(error), error_type=type(error).__name__,
                         )
                     except BaseException as persistence_error:
                         _log(
@@ -2073,7 +2071,7 @@ class BrokerApplication:
                         return
                 else:
                     try:
-                        self.operation_queue.finish(execution.execution_id)
+                        self._finish_operation(execution)
                     except BaseException as persistence_error:
                         _log(
                             f"[broker] failed to persist operation completion "
@@ -2090,6 +2088,27 @@ class BrokerApplication:
                         self.operation_queue.pending_transition_count
                     )
                 self._notify_operation_waiters()
+
+    def _finish_operation(
+        self, execution: ExecutionView, *, error: str | None = None,
+        error_type: str | None = None,
+    ) -> None:
+        """Publish terminal state and clear matching watcher bookkeeping.
+
+        Successful queue completion also reconciles the loaded baseline; actual
+        application publishes it at the registry swap even after a queue timeout.
+        Admission serialization prevents completion racing pending registration.
+        """
+        with self._operation_admission_lock:
+            finished = self.operation_queue.finish(
+                execution.execution_id, error=error, error_type=error_type,
+            )
+            if execution.operation_type == "reload":
+                if finished.status == "succeeded":
+                    self._last_manifest_identity = getattr(self.registry, "manifest_identity", None)
+                pending = self._pending_manifest_reload
+                if pending is not None and pending.execution_id == execution.execution_id:
+                    self._pending_manifest_reload = None
 
     def _notify_operation_waiters(self) -> None:
         with self._operation_condition:
@@ -2386,48 +2405,55 @@ class BrokerApplication:
         thread.start()
 
     def _seed_manifest_baseline(self) -> None:
-        """Use the bytes actually parsed, never a later read of the source file."""
-        self._last_manifest_identity = self.registry.manifest_identity
+        """Seed from the bytes actually loaded, never from a later disk read."""
+        with self._operation_admission_lock:
+            self._last_manifest_identity = getattr(self.registry, "manifest_identity", None)
 
     def _manifest_watcher_loop(self) -> None:
         while not self._manifest_watcher_stop.wait(MANIFEST_RELOAD_INTERVAL):
             try:
                 self._maybe_reload_manifest()
             except Exception:
-                _log("[broker] manifest reload check failed; retrying next tick")
+                _log("[broker] manifest watcher: unexpected error (continuing)")
 
     def _maybe_reload_manifest(self) -> None:
-        if self.coordinator.shutting_down:
-            return
         if self._profiles_path is None:
             return
-        if self._manifest_reload_request_id is not None:
-            operation = self.operation_status(self._manifest_reload_request_id)
-            if operation["status"] not in {"succeeded", "failed", "cancelled"}:
+        with self._operation_admission_lock:
+            if self.coordinator.shutting_down:
                 return
-            self._manifest_reload_request_id = None
-        # Only a successful registry swap changes this identity. Failed or
-        # cancelled requests leave it untouched and are retried on the next tick.
-        # A concurrent file edit after parsing is not mistaken for applied state.
-        self._last_manifest_identity = self.registry.manifest_identity
-        try:
-            current = _manifest_identity(self._profiles_path)
-        except Exception:
-            # Unreadable manifest (mid-write, malformed, or transient I/O error):
-            # leave the baseline untouched so the last good state is retried next tick.
-            _log("[broker] manifest unreadable; skipping this tick")
-            return
-        if current == self._last_manifest_identity:
-            return
-        try:
-            request = self.submit_profile_reload_operation()
-        except Exception as error:
-            _log(f"[broker] manifest reload submission failed; will retry: {error}")
-            return
-        # Track acceptance separately from application, and coalesce ticks until
-        # this exact request reaches a terminal state (no HTTP waiter required).
-        self._manifest_reload_request_id = request.request_id
-        _log("[broker] manifest changed; queued profile/catalog reload")
+            # Alternate application paths may swap the registry without updating
+            # watcher bookkeeping. Reconcile loaded bytes, never a fresh disk read,
+            # even while an existing execution still suppresses new submissions.
+            self._last_manifest_identity = getattr(self.registry, "manifest_identity", None)
+            pending = self._pending_manifest_reload
+            if pending is not None:
+                try:
+                    execution = self.operation_queue.get_execution(pending.execution_id)
+                except KeyError:
+                    # Retained history can expire while the watcher is stopped.
+                    execution = None
+                if execution is not None and execution.status in {"queued", "preflight", "committed"}:
+                    return
+                # Cancellation before worker dispatch has no completion callback.
+                # It must not permanently suppress retry of the same disk bytes.
+                self._pending_manifest_reload = None
+            try:
+                current = _manifest_identity(self._profiles_path)
+            except Exception as error:
+                _log(f"[broker] manifest watcher: cannot fingerprint manifest: {error}")
+                return
+            if current == self._last_manifest_identity:
+                return
+            try:
+                request = self.submit_profile_reload_operation()
+            except Exception as error:
+                _log(f"[broker] manifest reload submission failed; will retry: {error}")
+                return
+            # A changed file while this request waits is retried after its stale
+            # snapshot fails, rather than flooding the queue with every revision.
+            self._pending_manifest_reload = request
+            _log(f"[broker] manifest changed; queued profile/catalog reload ({request.request_id[:8]}…)")
 
     def _stop_manifest_watcher(self) -> None:
         self._manifest_watcher_stop.set()
@@ -3059,7 +3085,12 @@ class BrokerApplication:
                 f"profile/catalog reload failed; prior configuration restored: {error}"
             ) from error
 
-        self.registry = new_registry
+        # Publish the applied bytes even if the queue worker already timed out.
+        # Controller lifecycle locks have exited, and the coordinator invokes this
+        # callback without its condition held: admission locks before that condition.
+        with self._operation_admission_lock:
+            self.registry = new_registry
+            self._last_manifest_identity = getattr(new_registry, "manifest_identity", None)
         self._autotune_degraded_reason = None
         self._remember_controller_state(dict(self.controller.state()))
         return self.health()
