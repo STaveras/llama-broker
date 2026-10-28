@@ -2843,7 +2843,7 @@ class BrokerApplication:
         if not router.handles(requested) or self.registry.try_resolve(requested):
             return None
         active = self.coordinator.active_profile
-        decision = router.decide(
+        decision = self.system1.route(
             payload,
             self.registry.profiles,
             active_profile=active,
@@ -2987,6 +2987,16 @@ class BrokerApplication:
             )
         catalog_path = getattr(self.registry, "runtime_catalog_path", None)
         deployment_revision = getattr(self.registry, "deployment_revision", None)
+        # One immutable queue snapshot: executions, not coalesced callers.
+        executions = self.operation_queue.list_executions()
+        running = next((item for item in executions if item.status in {"preflight", "committed"}), None)
+        operations = {
+            "queued": sum(item.status == "queued" for item in executions),
+            "running": (
+                {"type": running.operation_type, "target": running.target_profile_id, "status": running.status}
+                if running is not None else None
+            ),
+        }
         return {
             "name": "Llama-Broker",
             "status": health_status,
@@ -2996,6 +3006,7 @@ class BrokerApplication:
             },
             "backend": backend_state,
             "leases": leases,
+            "activity": {"operations": operations},
             "crash_loops": crash_loops,
             "maintenance": {
                 "autotune": self._autotune_lease.status(),
@@ -4418,7 +4429,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            status, content_type, data = service.client.post_raw(body)
+            status, content_type, data = service.post_raw(body)
         except (OSError, http.client.HTTPException) as error:
             _log(f"[broker] system1 proxy failure: {error}")
             self._send_json(
@@ -4497,12 +4508,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            answers = service.client.decide(
+            result = service.decide(
                 state,
                 decisions.systemone_request(state, images, questions)["questions"],
                 images=images,
+                response_transform=lambda answers: decisions.decision_response(model, questions, answers),
             )
-            result = decisions.decision_response(model, questions, answers)
         except (System1Error, DecisionBackendError) as error:
             _log(f"[broker] decisions failure: {error}")
             self._send_json(

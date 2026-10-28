@@ -4010,6 +4010,107 @@ def _print_admin_state(state: dict[str, object], *, raw: bool) -> None:
         print(f"Endpoint:  {backend['host']}:{backend['port']}")
 
 
+def _status_count(value: object) -> int | None:
+    """Missing telemetry is unknown, never an invented zero."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _status_label(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "unknown"
+    return "".join(char if char.isprintable() else "?" for char in value[:120])
+
+
+def _system1_status_lines(live_state: dict[str, object]) -> list[str]:
+    service = live_state.get("system1")
+    if not isinstance(service, dict) or service.get("enabled") is not True:
+        return []
+    ready = service.get("ready")
+    availability = "available" if ready is True else "unavailable" if ready is False else "unknown"
+    routing = service.get("routing")
+    enabled = routing.get("enabled") if isinstance(routing, dict) else None
+    routing_label = "enabled" if enabled is True else "disabled" if enabled is False else "unknown"
+    model = _status_label(service.get("model") or service.get("profile"))
+    lines = [f"System 1:  {availability} — {model} (routing {routing_label})"]
+    metrics = service.get("metrics")
+    if not isinstance(metrics, dict):
+        return lines
+    direct = metrics.get("direct_requests")
+    route = metrics.get("routing")
+    direct = direct if isinstance(direct, dict) else {}
+    route = route if isinstance(route, dict) else {}
+
+    def count(group: dict, key: str) -> str:
+        value = _status_count(group.get(key))
+        return str(value) if value is not None else "unknown"
+
+    scope = "since broker start" if metrics.get("scope") == "since_broker_start" else "scope unknown"
+    lines.append(f"S1 usage:  {count(direct, 'total')} direct; {count(route, 'total')} routes ({scope})")
+    if any((_status_count(group.get("active")) or 0) > 0 for group in (direct, route)):
+        lines.append(f"S1 active: {count(direct, 'active')} direct; {count(route, 'active')} routes")
+    if any((_status_count(group.get(key)) or 0) > 0 for group, key in
+           ((direct, "errors"), (route, "errors"), (route, "fallbacks"))):
+        lines.append(f"S1 errors: {count(direct, 'errors')} direct; {count(route, 'errors')} routes; {count(route, 'fallbacks')} fallbacks")
+    latency = route.get("latency_ms")
+    if isinstance(latency, dict):
+        def milliseconds(value: object) -> str | None:
+            # The bounded comparison also rejects NaN and infinity.
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < float("inf"):
+                return f"{value:.1f} ms"
+            return None
+        last, mean = milliseconds(latency.get("last")), milliseconds(latency.get("mean"))
+        if last is not None or mean is not None:
+            lines.append(f"S1 timing: last {last or 'unknown'}; mean {mean or 'unknown'} (routing)")
+    targets = route.get("targets")
+    if isinstance(targets, dict):
+        ranked = sorted(((name, value) for name, value in targets.items()
+                         if isinstance(name, str) and (_status_count(value) or 0) > 0),
+                        key=lambda item: (-item[1], item[0]))
+        if ranked:
+            text = ", ".join(f"{_status_label(name)}={value}" for name, value in ranked[:3])
+            if len(ranked) > 3:
+                text += f" (+{len(ranked) - 3} more)"
+            lines.append(f"S1 targets: {text}")
+    return lines
+
+
+def _status_activity_lines(live_state: dict[str, object]) -> list[str]:
+    leases = live_state.get("leases")
+    leases = leases if isinstance(leases, dict) else {}
+    activity = live_state.get("activity")
+    operations = activity.get("operations") if isinstance(activity, dict) else None
+    operations = operations if isinstance(operations, dict) else {}
+    running = operations.get("running")
+    running = running if isinstance(running, dict) else {}
+    lines = []
+    active = _status_count(leases.get("inference_requests", leases.get("active_requests")))
+    if active:
+        lines.append(f"Activity:  {active} in-flight request{'s' if active != 1 else ''}")
+
+    def operation_label(kind: object, target: object) -> str:
+        names = {"switch": "switching", "restart": "restarting", "stop": "stopping", "reload": "reloading profiles"}
+        label = names.get(kind, _status_label(kind)) if isinstance(kind, str) else "transition"
+        if isinstance(target, str) and target and kind != "reload":
+            label += (" to " if kind == "switch" else " ") + _status_label(target)
+        return label
+
+    if leases.get("transitioning") is True:
+        label = operation_label(leases.get("transition") or running.get("type"),
+                                leases.get("transition_target"))
+        lines.append(f"Changing:  {label}")
+    elif running:
+        label = operation_label(running.get("type"), running.get("target"))
+        lines.append(f"Operation: {label} ({_status_label(running.get('status'))})")
+    queued = _status_count(operations.get("queued"))
+    if queued:
+        lines.append(f"Queue:     {queued} waiting operation{'s' if queued != 1 else ''}")
+    elif queued is None:
+        pending = _status_count(leases.get("queued_transitions"))
+        if pending:
+            lines.append(f"Queue:     {pending} pending transition{'s' if pending != 1 else ''}")
+    return lines
+
+
 def _crash_loop_lines(live_state: dict[str, object]) -> list[str]:
     """Describe profiles the broker's crash-loop guard is refusing or watching."""
     crash_loops = live_state.get("crash_loops")
@@ -4346,6 +4447,9 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"Target:    {state['target_profile']}")
                     if state.get("error"):
                         print(f"Error:     {state['error']}")
+
+            for line in (*_status_activity_lines(live_state), *_system1_status_lines(live_state)):
+                print(line)
 
             # JSON detail if requested. Include the live snapshot when one was
             # available so scripts can consume the same context shown above.
