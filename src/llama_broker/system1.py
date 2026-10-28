@@ -25,6 +25,9 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -507,6 +510,9 @@ class RouteDecision:
     reason: str
     confidence: float | None = None
     probabilities: Mapping[str, float] = field(default_factory=dict)
+    # Internal telemetry only; keep the public decision JSON unchanged.
+    error: bool = False
+    fallback: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -608,14 +614,14 @@ class System1Router:
             answers = self.client.decide(state or None, question)
             probabilities = choice_probabilities(answers.get(ROUTE_QUESTION))
         except System1Error as error:
-            return self._fallback(str(error), active_profile, candidates)
+            return self._fallback(str(error), active_profile, candidates, error=True)
         ids = {candidate.profile_id for candidate in candidates}
         probabilities = {
             label: value for label, value in probabilities.items() if label in ids
         }
         if not probabilities:
             return self._fallback(
-                "system1 answered with no known profile", active_profile, candidates
+                "system1 answered with no known profile", active_profile, candidates, error=True
             )
         best = max(probabilities, key=lambda label: probabilities[label])
         confidence = probabilities[best]
@@ -625,9 +631,7 @@ class System1Router:
                 active_profile,
                 candidates,
             )
-            return RouteDecision(
-                decision.profile_id, decision.reason, confidence, probabilities
-            )
+            return replace(decision, confidence=confidence, probabilities=probabilities)
         if (
             active_profile in probabilities
             and best != active_profile
@@ -646,20 +650,22 @@ class System1Router:
         reason: str,
         active_profile: str | None,
         candidates: Sequence[RouteCandidate],
+        *,
+        error: bool = False,
     ) -> RouteDecision:
         fallback = self.config.fallback
         ids = [candidate.profile_id for candidate in candidates]
         if fallback == "error":
-            return RouteDecision(None, reason)
+            return RouteDecision(None, reason, error=True)
         if fallback == "active":
             if active_profile is not None and active_profile in ids:
-                return RouteDecision(active_profile, f"fallback_active: {reason}")
+                return RouteDecision(active_profile, f"fallback_active: {reason}", error=error, fallback=True)
             if ids:
-                return RouteDecision(ids[0], f"fallback_first_candidate: {reason}")
-            return RouteDecision(None, reason)
+                return RouteDecision(ids[0], f"fallback_first_candidate: {reason}", error=error, fallback=True)
+            return RouteDecision(None, reason, error=True)
         if fallback in ids:
-            return RouteDecision(fallback, f"fallback_profile: {reason}")
-        return RouteDecision(None, reason)
+            return RouteDecision(fallback, f"fallback_profile: {reason}", error=error, fallback=True)
+        return RouteDecision(None, reason, error=True)
 
 
 class System1Sidecar:
@@ -798,6 +804,66 @@ class System1Sidecar:
         self.command_runner(("systemctl", "--user", "stop", self.unit_name))
 
 
+class _System1Metrics:
+    """Lifetime counters; no request content, errors or per-call history retained.
+
+    At most 128 distinct target labels are retained, first-seen since startup;
+    subsequent unseen targets accumulate in the reserved '[other]' bucket.
+    Routing errors (backend/invalid answer or no target) and selected fallbacks
+    can overlap. Low confidence alone is not an error when a target is selected.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._direct = {"total": 0, "active": 0, "errors": 0}
+        self._routing = {"total": 0, "active": 0, "errors": 0, "fallbacks": 0}
+        self._targets: dict[str, int] = {}
+        self._completed = 0
+        self._last: float | None = None
+        self._mean: float | None = None
+
+    @contextmanager
+    def operation(self, *, routing: bool = False):
+        counts = self._routing if routing else self._direct
+        started = time.monotonic() if routing else None
+        outcome: dict[str, Any] = {"error": True, "fallback": False, "target": None}
+        with self._lock:
+            counts["total"] += 1
+            counts["active"] += 1
+        try:
+            yield outcome
+        finally:
+            elapsed = (time.monotonic() - started) * 1000 if started is not None else None
+            with self._lock:
+                counts["active"] -= 1
+                counts["errors"] += int(outcome["error"])
+                if routing:
+                    self._routing["fallbacks"] += int(outcome["fallback"])
+                    target = outcome["target"]
+                    if target is not None:
+                        if target not in self._targets and len(self._targets) >= 128:
+                            target = "[other]"
+                        self._targets[target] = self._targets.get(target, 0) + 1
+                    assert elapsed is not None
+                    self._completed += 1
+                    self._last = elapsed
+                    self._mean = elapsed if self._mean is None else (
+                        self._mean + (elapsed - self._mean) / self._completed
+                    )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "scope": "since_broker_start",
+                "direct_requests": dict(self._direct),
+                "routing": {
+                    **self._routing,
+                    "targets": dict(self._targets),
+                    "latency_ms": {"last": self._last, "mean": self._mean},
+                },
+            }
+
+
 class System1Service:
     """What the broker application holds when system 1 is enabled."""
 
@@ -812,6 +878,58 @@ class System1Service:
         self.client = client or System1Client(config.url, timeout=config.timeout)
         self.router = System1Router(config.routing, self.client)
         self.sidecar = sidecar
+        self._metrics = _System1Metrics()
+
+    def post_raw(self, body: bytes) -> tuple[int, str, bytes]:
+        """Count one validated direct RPC without altering raw HTTP semantics."""
+        with self._metrics.operation() as outcome:
+            result = self.client.post_raw(body)
+            status, _, data = result
+            if 200 <= status < 300:
+                try:
+                    payload = json.loads(data)
+                    outcome["error"] = not (
+                        isinstance(payload, Mapping)
+                        and isinstance(payload.get("answers"), Mapping)
+                    )
+                except (ValueError, UnicodeDecodeError, RecursionError):
+                    pass
+            return result
+
+    def decide(
+        self,
+        state: str | None,
+        questions: Mapping[str, Any],
+        *,
+        images: Sequence[str] = (),
+        response_transform: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Any:
+        """Count one validated compatibility RPC, including response decoding."""
+        with self._metrics.operation() as outcome:
+            answers = self.client.decide(state, questions, images=images)
+            result = response_transform(answers) if response_transform else answers
+            outcome["error"] = False
+            return result
+
+    def route(
+        self,
+        payload: Mapping[str, Any],
+        profiles: Iterable[Any],
+        *,
+        active_profile: str | None,
+        available: Callable[[Any], bool],
+    ) -> RouteDecision:
+        """Measure the whole selection, not downstream inference or direct RPCs."""
+        with self._metrics.operation(routing=True) as outcome:
+            decision = self.router.decide(
+                payload, profiles, active_profile=active_profile, available=available
+            )
+            outcome.update(
+                error=decision.error or decision.profile_id is None,
+                fallback=decision.fallback and decision.profile_id is not None,
+                target=decision.profile_id,
+            )
+            return decision
 
     def routing_aliases(self) -> tuple[str, ...]:
         return self.config.routing.aliases if self.config.routing.enabled else ()
@@ -825,6 +943,7 @@ class System1Service:
             "managed": self.config.managed,
             "unit": self.sidecar.unit_name if self.sidecar else None,
             "ready": self.client.healthy(),
+            "metrics": self._metrics.snapshot(),
             "routing": {
                 "enabled": self.config.routing.enabled,
                 "aliases": list(self.routing_aliases()),
