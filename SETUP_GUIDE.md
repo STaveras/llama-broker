@@ -190,9 +190,11 @@ sequence. Cataloged profiles expose one `Serving backend` selector, such as
 `BeeLlama (llamacpp)` or `Atomic (llamacpp)`; the separate runtime field is shown
 only for custom/manual configurations. Enter opens a text box, dropdown, or checklist; Tab reveals runtime
 and model paths, hashes, fit controls, safety budgets, environment, and extra
-arguments. Save runs complete `ProfileRegistry` validation, regenerates units
-from the manifest, and restarts the control plane only when the active profile
-changed. Explicit `profiles edit MODEL --field value` flags remain available
+arguments. Save validates the profile configuration, regenerates units,
+and refreshes the broker's catalog without restarting the generation backend.
+The basic view also includes separate Instruct and Thinking sampling defaults
+and a Qwen 27B preset; see [Sampling defaults](docs/sampling.md).
+Explicit `profiles edit MODEL --field value` flags remain available
 for non-interactive callers. To select a concrete build without opening the TUI:
 
 ```bash
@@ -213,11 +215,10 @@ entry point for candidate inspection/import; there is no separate profile
 configuration command.
 
 Apply is transactional: it validates and atomically publishes the manifest,
-regenerates profile units, and restarts `llama-broker.service` only if the
-active profile changed. The broker control plane performs the drain and
-reconciliation. A failed install or restart restores the previous manifest and
-units, then attempts to restore the previous broker state; a failure is
-reported instead of leaving an unvalidated profile live.
+regenerates profile units, and refreshes the live catalog through the broker.
+A failed apply restores the previous manifest and units and attempts to restore
+the previous catalog. Changes to running backend settings still require a
+broker-managed restart or profile switch.
 
 ## Install or update the deployment
 

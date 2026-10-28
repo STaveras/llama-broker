@@ -49,6 +49,9 @@ def resolve_manifest_inheritance(payload: Mapping[str, Any]) -> dict[str, Any]:
         raw = by_id.get(profile_id)
         if raw is None:
             raise ValueError(f"unknown profile parent: {profile_id}")
+        inherit_sampling = raw.get("sampling_defaults_inherit", True)
+        if not isinstance(inherit_sampling, bool):
+            raise ValueError(f"sampling_defaults_inherit must be a boolean for {profile_id!r}")
         visiting.append(profile_id)
         parent_ref = raw.get("extends")
         if parent_ref is None:
@@ -59,7 +62,16 @@ def resolve_manifest_inheritance(payload: Mapping[str, Any]) -> dict[str, Any]:
             parent_name = parent_ref.strip()
             if "://" in parent_name or "/" in parent_name or "\\" in parent_name:
                 raise ValueError(f"remote or path profile parent is forbidden: {parent_name!r}")
-            merged = _merge(resolve(parent_name), raw)
+            parent = resolve(parent_name)
+            # This is a directive on this child, not an inheritable model setting.
+            parent.pop("sampling_defaults_inherit", None)
+            target_runtime = str(raw.get("runtime", parent.get("runtime", "llamacpp"))).strip().lower()
+            # Defaults are adapter-specific. Do not resurrect inherited llama.cpp
+            # sampling when a child changes runtime; explicit child settings still
+            # reach the normal runtime allowlist and are rejected if unsupported.
+            if not inherit_sampling or target_runtime != "llamacpp":
+                parent.pop("sampling_defaults", None)
+            merged = _merge(parent, raw)
         visiting.pop()
         resolved[profile_id] = merged
         return copy.deepcopy(merged)

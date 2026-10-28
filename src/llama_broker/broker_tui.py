@@ -11,6 +11,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .manifest_resolution import resolve_manifest_inheritance
+from .sampling import (
+    SAMPLING_FIELDS, SAMPLING_MODES, qwen27b_sampling_defaults, validate_sampling_defaults,
+)
 from .discovery import discover_backends
 from .profile_config import (
     SIMPLE_FIELDS,
@@ -51,6 +55,12 @@ class EditorField:
     options: tuple[str, ...] = ()
 
 
+_SAMPLING_EDITOR_FIELDS = frozenset(
+    {"sampling_preset"} | {
+        f"sampling.{mode}.{name}" for mode in SAMPLING_MODES for name in SAMPLING_FIELDS
+    }
+)
+
 EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("display_name", "Display name", "text"),
     EditorField("alias", "Primary alias", "text"),
@@ -60,6 +70,11 @@ EDITOR_FIELDS: tuple[EditorField, ...] = (
     EditorField("runtime_build", "Backend build", "select"),
     EditorField("runtime", "Serving runtime", "select", options=runtime_names()),
     EditorField("capabilities", "Capabilities", "multi", options=("text", "vision", "tools", "reasoning", "decision")),
+    EditorField("sampling_preset", "Sampling defaults", "select",
+                options=("Custom", "Qwen 27B", "Runtime defaults")),
+    *(EditorField(f"sampling.{mode}.{name}",
+                  f"{mode.capitalize()} {name.replace('_', ' ')}", "text")
+      for mode in SAMPLING_MODES for name in SAMPLING_FIELDS),
     EditorField("context_size", "Context size", "int"),
     EditorField("parallel", "Parallel slots", "int"),
     EditorField("batch_size", "Batch size", "int"),
@@ -625,9 +640,14 @@ class TUIModel:
         inferred = self._current_runtime_build(current)
         family = inferred.runtime if inferred is not None else "(custom/manual)"
         fields = []
+        sampling_supported = str(self._effective_profile().get("runtime", "llamacpp")).strip().lower() == "llamacpp"
         for field in EDITOR_FIELDS:
+            if field.key in _SAMPLING_EDITOR_FIELDS and not sampling_supported:
+                continue
             if runtime == "strata" and field.key == "environment":
                 continue
+            if field.key == "sampling_preset" and current.get("extends"):
+                field = replace(field, options=(*field.options, "Inherit parent"))
             if field.key == "runtime_family":
                 field = replace(field, options=self._family_options())
             elif field.key == "runtime_build":
@@ -638,7 +658,7 @@ class TUIModel:
             elif field.key == "runtime" and family != "(custom/manual)":
                 continue
             elif field.key not in runtime_info.editable_fields and not (
-                runtime == "llamacpp" and field.key in _SPECULATIVE_EDITOR_FIELDS
+                runtime == "llamacpp" and field.key in (_SPECULATIVE_EDITOR_FIELDS | _SAMPLING_EDITOR_FIELDS)
             ):
                 continue
             if field.advanced and not self.advanced:
@@ -679,8 +699,28 @@ class TUIModel:
         self._publish(updated)
         return updated
 
+    def _effective_profile(self) -> dict[str, Any]:
+        current = self.current or {}
+        effective = resolve_manifest_inheritance(self.manifest)
+        return next((item for item in effective.get("profiles", [])
+                     if isinstance(item, dict) and item.get("id") == current.get("id")), {})
+
+    def _effective_sampling_defaults(self) -> dict[str, Any]:
+        return copy.deepcopy(self._effective_profile().get("sampling_defaults", {}))
+
     def field_value(self, key: str) -> Any:
         current = self.current or {}
+        if key == "sampling_preset":
+            if (current.get("extends") and current.get("sampling_defaults_inherit", True)
+                    and not current.get("sampling_defaults")):
+                return "Inherit parent"
+            defaults = self._effective_sampling_defaults()
+            if not defaults:
+                return "Runtime defaults"
+            return "Qwen 27B" if defaults == qwen27b_sampling_defaults() else "Custom"
+        if key in _SAMPLING_EDITOR_FIELDS:
+            _, mode, name = key.split(".")
+            return self._effective_sampling_defaults().get(mode, {}).get(name, "")
         if key == "aliases":
             alias = str(current.get("alias", ""))
             aliases = [str(item) for item in current.get("aliases", []) if str(item) != alias]
@@ -721,6 +761,8 @@ class TUIModel:
         current = self.current
         if current is None:
             raise ValueError("no profile selected")
+        if key == "sampling_preset" or key.startswith("sampling."):
+            return self._set_sampling_field(key, value)
         current_value = self.field_value(key)
         if key not in {"runtime_build", *self._PATH_FIELDS} and (
             value == current_value
@@ -916,6 +958,60 @@ class TUIModel:
         else:
             draft[key] = value
 
+        if str(draft.get("runtime", "llamacpp")).strip().lower() != "llamacpp":
+            draft.pop("sampling_defaults", None)
+            draft.pop("sampling_defaults_inherit", None)
+        self._publish(draft)
+        return draft
+
+    def _set_sampling_field(self, key: str, value: Any) -> dict[str, Any]:
+        current = self.current
+        if current is None:
+            raise ValueError("no profile selected")
+        if str(self._effective_profile().get("runtime", "llamacpp")).strip().lower() != "llamacpp":
+            raise ValueError("sampling defaults currently require llama.cpp")
+        if key not in _SAMPLING_EDITOR_FIELDS:
+            raise ValueError(f"unknown sampling field: {key}")
+        draft = clone_record(current)
+        defaults = self._effective_sampling_defaults()
+        if key == "sampling_preset" and value == "Inherit parent":
+            if not current.get("extends"):
+                raise ValueError("this profile has no parent")
+            draft.pop("sampling_defaults", None)
+            draft.pop("sampling_defaults_inherit", None)
+            self._publish(draft)
+            return draft
+        if key == "sampling_preset":
+            if value == "Custom":
+                return current
+            if value == "Qwen 27B":
+                defaults = qwen27b_sampling_defaults()
+            elif value == "Runtime defaults":
+                defaults = {}
+            else:
+                raise ValueError(f"unknown sampling preset: {value}")
+        else:
+            _, mode, name = key.split(".")
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a number, not a boolean")
+            raw = "" if value is None else str(value).strip()
+            settings = defaults.setdefault(mode, {})
+            if raw:
+                settings[name] = int(raw) if name == "top_k" else float(raw)
+            else:
+                settings.pop(name, None)
+            if not settings:
+                defaults.pop(mode, None)
+        validate_sampling_defaults(defaults)
+        if current.get("extends"):
+            # Pin the visible sampling snapshot, without flattening unrelated
+            # inherited model/runtime fields. Empty really means runtime defaults.
+            draft["sampling_defaults_inherit"] = False
+            draft["sampling_defaults"] = defaults
+        elif defaults:
+            draft["sampling_defaults"] = defaults
+        else:
+            draft.pop("sampling_defaults", None)
         self._publish(draft)
         return draft
 
@@ -1032,7 +1128,7 @@ def _curses_prompt(
     row = max(height - 2, 0)
     max_width = max(width - 1, 1)
     prefix = f"{prompt}: "
-    original = str(current or "")
+    original = "" if current is None else str(current)
     buffer = list(original)
     cursor = len(buffer)
 
@@ -1262,7 +1358,7 @@ def _edit_current_field(stdscr: Any, model: TUIModel) -> None:
             stdscr,
             field.label,
             value,
-            allow_empty=field.key
+            allow_empty=field.key.startswith("sampling.") or field.key
             in {
                 "mmproj_path",
                 "model_draft",
@@ -1582,7 +1678,13 @@ def run_tui(
             help_text = "↑/↓ field  Enter edit  Tab advanced  [/] profile  s save  q quit"
             stdscr.addnstr(2, 0, help_text, max(width - 1, 1))
             mode = "advanced" if model.advanced else "serving"
-            stdscr.addnstr(3, 0, f"Editing {mode} fields; hashes update automatically when paths change.", max(width - 1, 1))
+            selected = model.current_field
+            detail = (
+                "Sampling: client values win; blank fields use runtime defaults."
+                if selected is not None and selected.key in _SAMPLING_EDITOR_FIELDS
+                else f"Editing {mode} fields; hashes update automatically when paths change."
+            )
+            stdscr.addnstr(3, 0, detail, max(width - 1, 1))
 
             viewport_height = max(height - 9, 1)
             start = max(0, min(model.field_index - viewport_height // 2, max(len(fields) - viewport_height, 0)))
