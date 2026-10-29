@@ -293,11 +293,19 @@ def apply_simple_fields(record: Mapping[str, Any], values: Mapping[str, Any]) ->
             value = list(value)
         elif field == "mmproj_path":
             value = str(value).strip() or None
+        elif field in {"batch_size", "ubatch_size"}:
+            # Editors accept integer text; typed drafts must not silently turn
+            # booleans/floats into valid manifest integers. Registry validation
+            # enforces positivity, representational range and batch ordering.
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                raise ProfileError(f"{field} must be an integer")
+            try:
+                value = int(value)
+            except ValueError as error:
+                raise ProfileError(f"{field} must be an integer") from error
         elif field in {
             "context_size",
             "parallel",
-            "batch_size",
-            "ubatch_size",
             "tensor_parallel_size",
         }:
             value = int(value)

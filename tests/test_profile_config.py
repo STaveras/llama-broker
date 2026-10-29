@@ -48,6 +48,53 @@ class ProfileConfigTests(unittest.TestCase):
         self.assertIn("vision", updated["capabilities"])
         self.assertEqual(len(updated["mmproj_sha256"]), 64)
 
+    def test_simple_batch_fields_do_not_coerce_booleans_or_floats(self) -> None:
+        original = self.data["profiles"][0]
+        for field in ("batch_size", "ubatch_size"):
+            for value in (True, False, 128.0, 128.5):
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    ValueError, field
+                ):
+                    apply_simple_fields(original, {field: value})
+
+    def test_large_batch_editor_transaction_round_trips_inheritance(self) -> None:
+        original = self.data["profiles"][0]
+        self.data["profiles"][0] = apply_simple_fields(
+            original, {"batch_size": "8192", "ubatch_size": "8192"}
+        )
+        self.data["profiles"].append({
+            "id": "large-child", "alias": "large-child", "aliases": ["large-child"],
+            "extends": original["id"],
+        })
+        restart = Mock()
+        result = apply_manifest_transaction(
+            self.manifest_path, self.data, active_profile=None,
+            install_units=Mock(), restart_broker=restart,
+        )
+        self.assertTrue(result.changed)
+        restart.assert_not_called()
+        profile = ProfileRegistry.from_path(self.manifest_path).get("large-child")
+        self.assertEqual((profile.batch_size, profile.ubatch_size), (8192, 8192))
+
+    def test_invalid_batch_transaction_leaves_manifest_untouched(self) -> None:
+        before = self.manifest_path.read_bytes()
+        install = Mock()
+        restart = Mock()
+        for changes in ({"batch_size": 2147483648}, {"ubatch_size": 2147483648},
+                        {"batch_size": True}, {"ubatch_size": "128"},
+                        {"batch_size": 1, "ubatch_size": 2}):
+            with self.subTest(changes=changes):
+                updated = json.loads(json.dumps(self.data))
+                updated["profiles"][0].update(changes)
+                with self.assertRaises(ValueError):
+                    apply_manifest_transaction(
+                        self.manifest_path, updated, active_profile=None,
+                        install_units=install, restart_broker=restart,
+                    )
+                self.assertEqual(self.manifest_path.read_bytes(), before)
+        install.assert_not_called()
+        restart.assert_not_called()
+
     def test_gguf_draft_is_pinned_and_keeps_broker_owned_runtime(self) -> None:
         model = self.root / "Imported-Q4.gguf"
         model.write_bytes(b"GGUF-not-a-full-model")

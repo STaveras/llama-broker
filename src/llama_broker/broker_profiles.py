@@ -44,8 +44,10 @@ ALLOWED_CACHE_TYPES = frozenset(
 # Profiles may request the full trained window, but the fail-closed single-slot,
 # fit, and memory controls below still apply.
 MAX_CONTEXT_SIZE = 262_144
-MAX_BATCH_SIZE = 512
-MAX_UBATCH_SIZE = 128
+# llama-server parses -b/-ub with std::stoi into common_params int32_t;
+# llama_context_params uses uint32_t, so the CLI's signed range is limiting.
+# This is a representational bound, not a hardware/tuning safety ceiling.
+LLAMACPP_BATCH_INT_MAX = (1 << 31) - 1
 QUALIFIED_LLAMPAMPERE_BUILD = "llamampere-v054-tls-sm120-fb389de8bf76"
 QUALIFIED_LLAMPAMPERE_SHA256 = "fb389de8bf76833ef01e4779daacc382609229d34c0e1d653e253831cf990168"
 QUALIFIED_LLAMPAMPERE_COMMIT = "e7093a5526aa82e3e271120358dc021ab222060a"
@@ -1826,11 +1828,12 @@ def _parse_profile(
     if runtime == "llamacpp":
         batch_size = _positive_int(record, "batch_size")
         ubatch_size = _positive_int(record, "ubatch_size")
-        if qualified_ampere:
-            if batch_size > 4096 or ubatch_size > 512:
-                raise ProfileError(f"batch/ubatch exceeds qualified llamAmpere limits for {profile_id!r}")
-        elif batch_size > MAX_BATCH_SIZE or ubatch_size > MAX_UBATCH_SIZE:
-            raise ProfileError(f"batch/ubatch exceeds safe limit for {profile_id!r}")
+        for field, value in (("batch_size", batch_size), ("ubatch_size", ubatch_size)):
+            if value > LLAMACPP_BATCH_INT_MAX:
+                raise ProfileError(
+                    f"{field} for {profile_id!r} exceeds llama-server signed 32-bit "
+                    f"integer range (maximum {LLAMACPP_BATCH_INT_MAX})"
+                )
         if ubatch_size > batch_size:
             raise ProfileError(f"ubatch_size cannot exceed batch_size for {profile_id!r}")
 
