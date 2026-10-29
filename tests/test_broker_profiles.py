@@ -129,7 +129,7 @@ class ProfileRegistryTests(unittest.TestCase):
             self.assertEqual(args[args.index(flag)+1], value)
 
     def test_ampere_profile_rejects_unqualified_settings(self):
-        for changes in ({"context_size": 131072}, {"parallel": 2}, {"batch_size": 4097}, {"ubatch_size": 513}, {"cache_type_v": "kvarn4"}, {"flash_attention": "off"}, {"extra_args": []}, {"environment": {"GGML_CUDA_PDL": "0"}}):
+        for changes in ({"context_size": 131072}, {"parallel": 2}, {"cache_type_v": "kvarn4"}, {"flash_attention": "off"}, {"extra_args": []}, {"environment": {"GGML_CUDA_PDL": "0"}}):
             with self.subTest(changes=changes), self.assertRaises(ProfileError):
                 self._ampere_registry(changes)
         for changes in ({"server_sha256": "3"*64}, {"source_commit": "incorrect"}):
@@ -166,10 +166,51 @@ class ProfileRegistryTests(unittest.TestCase):
             "llamampere-v054-tls-sm120-fb389de8bf76",
         )
 
-    def test_unqualified_large_batch_is_rejected(self) -> None:
-        profile = self._profile("ampere", "ampere", self.main_model, batch_size=4096, ubatch_size=512)
-        with self.assertRaisesRegex(ProfileError, "safe limit"):
-            ProfileRegistry.from_path(self._write([profile]))
+    def test_batch_values_are_general_not_artifact_qualified(self) -> None:
+        for batch, ubatch in ((1, 1), (128, 128), (513, 129), (4096, 512),
+                              (8192, 1024), (2147483647, 2147483647)):
+            for qualified in (False, True):
+                with self.subTest(batch=batch, ubatch=ubatch, qualified=qualified):
+                    if qualified:
+                        profile = self._ampere_registry(
+                            {"batch_size": batch, "ubatch_size": ubatch}
+                        ).get("ampere")
+                    else:
+                        record = self._profile("main", "main", self.main_model,
+                                               batch_size=batch, ubatch_size=ubatch)
+                        profile = ProfileRegistry.from_path(self._write([record])).get("main")
+                    args = profile.server_args(host="127.0.0.1", port=10000)
+                    self.assertEqual(args[args.index("-b") + 1], str(batch))
+                    self.assertEqual(args[args.index("-ub") + 1], str(ubatch))
+                    self.assertEqual(profile.safety.service.memory_max_mib, 20480)
+                    self.assertEqual(profile.safety.admission.min_ram_available_mib, 8192)
+
+    def test_batch_values_reject_invalid_types_and_runtime_overflow(self) -> None:
+        for field in ("batch_size", "ubatch_size"):
+            for value in (True, False, 1.0, 1.5, "128", None, 0, -1,
+                          2147483648, 4294967295, 10**100):
+                for qualified in (False, True):
+                    with self.subTest(field=field, value=value, qualified=qualified):
+                        # Legal peer values keep type/range diagnostics field-specific.
+                        changes = {"batch_size": 2147483647, "ubatch_size": 1, field: value}
+                        with self.assertRaisesRegex(ProfileError, field):
+                            if qualified:
+                                self._ampere_registry(changes)
+                            else:
+                                record = self._profile("main", "main", self.main_model, **changes)
+                                ProfileRegistry.from_path(self._write([record]))
+
+    def test_ubatch_cannot_exceed_batch_for_any_artifact(self) -> None:
+        for qualified in (False, True):
+            with self.subTest(qualified=qualified), self.assertRaisesRegex(
+                ProfileError, "ubatch_size cannot exceed batch_size"
+            ):
+                if qualified:
+                    self._ampere_registry({"batch_size": 128, "ubatch_size": 129})
+                else:
+                    record = self._profile("main", "main", self.main_model,
+                                           batch_size=128, ubatch_size=129)
+                    ProfileRegistry.from_path(self._write([record]))
 
     def test_profile_snapshot_identity_is_revision_bound_and_excludes_secrets(self) -> None:
         original = self._profile(

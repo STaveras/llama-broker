@@ -1339,6 +1339,31 @@ class BrokerctlProfileMutationTests(unittest.TestCase):
         parsed = ProfileRegistry.from_path(self.profiles).get("fixture-text-7b")
         self.assertNotIn("--fit", parsed.server_args(host="127.0.0.1", port=10000))
 
+    def test_profiles_edit_accepts_general_batch_values(self) -> None:
+        for batch, ubatch in ((128, 128), (8192, 1024), (2147483647, 2147483647)):
+            with self.subTest(batch=batch, ubatch=ubatch), redirect_stdout(io.StringIO()):
+                result = brokerctl.main([
+                    "--profiles", str(self.profiles), "profile", "edit", "fixture-text-7b",
+                    "--batch-size", str(batch), "--ubatch-size", str(ubatch),
+                ])
+                self.assertEqual(result, 0)
+                profile = ProfileRegistry.from_path(self.profiles).get("fixture-text-7b")
+                self.assertEqual((profile.batch_size, profile.ubatch_size), (batch, ubatch))
+
+    def test_profiles_edit_rejects_invalid_batch_without_mutation(self) -> None:
+        before = self.profiles.read_bytes()
+        for batch, ubatch in (("2147483648", "64"), ("512", "2147483648"),
+                              ("128", "129"), ("0", "1"), ("true", "64"),
+                              ("128.0", "64")):
+            with self.subTest(batch=batch, ubatch=ubatch), redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()):
+                result = brokerctl.main([
+                    "--profiles", str(self.profiles), "profile", "edit", "fixture-text-7b",
+                    "--batch-size", batch, "--ubatch-size", ubatch,
+                ])
+                self.assertEqual(result, 1)
+                self.assertEqual(self.profiles.read_bytes(), before)
+
     def test_profiles_edit_selects_cataloged_runtime_build(self) -> None:
         profile = next(
             item for item in self.data["profiles"] if item["id"] == "fixture-text-7b"

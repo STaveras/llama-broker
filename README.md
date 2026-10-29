@@ -99,6 +99,7 @@ See the [setup guide](SETUP_GUIDE.md) for network configuration.
 
 - [Setup guide](SETUP_GUIDE.md): installation, configuration, and troubleshooting.
 - [Status output](docs/status.md): model availability, current activity, and System 1 statistics.
+- [Batch sizing](docs/batch-sizing.md): integer ranges, micro-batch ordering, and resource safeguards.
 - [System 1](docs/system1.md): optional decision models and automatic routing.
 - [Report a bug](https://github.com/STaveras/llama-broker/issues).
 - [Contributing](CONTRIBUTING.md).
